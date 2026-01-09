@@ -179,7 +179,7 @@ def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, imag
     except: return False
 
 # =========================================================
-# --- 🧠 OCR ENGINE (Smart 3-Pass Strategy + Unsharp Mask) ---
+# --- 🧠 OCR ENGINE (Digital Multi-Line Optimized) ---
 # =========================================================
 def normalize_number_str(s: str, decimals: int = 0) -> str:
     if not s: return ""
@@ -193,7 +193,7 @@ def normalize_number_str(s: str, decimals: int = 0) -> str:
     return s
 
 def preprocess_text(text):
-    patterns = [r'IP\s*51', r'50\s*Hz', r'Class\s*2', r'3x220/380\s*V', r'Type', r'Mitsubishi', r'Electric', r'Wire', r'kWh', r'MH\s*[-]?\s*96', r'30\s*\(100\)\s*A', r'\d+\s*rev/kWh', r'WATT-HOUR\s*METER', r'Indoor\s*Use', r'Made\s*in\s*Thailand']
+    patterns = [r'IP\s*51', r'50\s*Hz', r'Class\s*2', r'3x220/380\s*V', r'Type', r'Mitsubishi', r'Electric', r'Wire', r'MH\s*[-]?\s*96', r'30\s*\(100\)\s*A', r'\d+\s*rev/kWh', r'WATT-HOUR\s*METER', r'Indoor\s*Use', r'Made\s*in\s*Thailand']
     for p in patterns: text = re.sub(p, '', text, flags=re.IGNORECASE)
     text = re.sub(r'\b10,000\b', '', text)
     text = re.sub(r'\b1,000\b', '', text)
@@ -237,24 +237,20 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
         mask = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
         img[mask > 0] = [255, 255, 255]
 
-    # Mode: Raw (for debugging or special cases)
     if variant == "raw":
         ok, encoded = cv2.imencode(".jpg", img)
         return encoded.tobytes() if ok else image_bytes
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Logic: Auto or Soft (for Digital/Difficult images)
-    # ✅ ปรับปรุง: ใช้ Unsharp Mask เพื่อให้อ่านจอ LCD ได้ดีขึ้น
     if variant == "soft" or (variant == "auto" and is_digital_meter(config)):
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         g = clahe.apply(gray)
         blur = cv2.GaussianBlur(g, (0, 0), 1.0)
-        # Unsharp Masking: เพิ่มความคมชัดขอบตัวเลข
+        # Unsharp Masking
         sharp = cv2.addWeighted(g, 1.7, blur, -0.7, 0)
         ok, encoded = cv2.imencode(".png", sharp)
     else:
-        # Analog: Thresholding (ดีกับมิเตอร์หมุน)
         gray = cv2.bilateralFilter(gray, 7, 50, 50)
         th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7)
         ok, encoded = cv2.imencode(".png", th)
@@ -274,16 +270,16 @@ def ocr_process(image_bytes, config):
     keyword = str(config.get('keyword', '') or '').strip()
     expected_digits = int(config.get('expected_digits', 0) or 0)
 
-    # ✅ Pass 1: Standard (ROI + Auto)
+    # 3-Pass Strategy
+    raw_full_text = ""
+    # Pass 1: Standard
     processed_bytes = preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto")
     raw_full_text = _vision_read_text(processed_bytes)
-
-    # ✅ Pass 2: Soft Mode (ROI + Sharpness) - ไม้ตายสำหรับจอ LCD จางๆ
+    # Pass 2: Soft
     if not raw_full_text:
         processed_bytes = preprocess_image_cv(image_bytes, config, use_roi=True, variant="soft")
         raw_full_text = _vision_read_text(processed_bytes)
-
-    # ✅ Pass 3: Full Image (No ROI + Soft) - กันเหนียวถ้า ROI ผิด
+    # Pass 3: Full Image
     has_roi = bool(config.get('roi_x2', 0)) and bool(config.get('roi_y2', 0))
     if not raw_full_text and has_roi:
         processed_bytes = preprocess_image_cv(image_bytes, config, use_roi=False, variant="soft")
@@ -292,24 +288,63 @@ def ocr_process(image_bytes, config):
     if not raw_full_text: return 0.0
 
     raw_full_text = raw_full_text.replace("\n", " ")
+    # ลบคำว่า kWh ออกจากข้อความเพื่อไม่ให้รบกวน แต่เก็บ keyword ไว้หา
     full_text = preprocess_text(raw_full_text)
 
-    # Keyword Hunter
-    if keyword:
-        kw = re.escape(keyword)
-        patterns = [kw + r"[^\d]*((?:\d|O|o|l|I|\|)+[\.,]?\d*)", r"((?:\d|O|o|l|I|\|)+[\.,]?\d*)[^\d]*" + kw]
-        for pat in patterns:
-            match = re.search(pat, raw_full_text, re.IGNORECASE)
-            if match:
-                val_str = match.group(1).replace("O", "0").replace("o", "0").replace("l", "1").replace("I", "1").replace("|", "1")
-                val_str = normalize_number_str(val_str, decimal_places)
-                try:
-                    val = float(val_str)
-                    if decimal_places > 0 and "." not in val_str: val = val / (10 ** decimal_places)
-                    return float(val)
-                except: pass
+    # --- 1. Keyword Hunter (Prioritize numbers near "kWh", "k", "W") ---
+    # ENTES Meter often shows "0335938.3 kWh". We look for numbers followed by k/W/h
+    meter_keywords = [re.escape(keyword)] if keyword else []
+    meter_keywords += [r'kWh', r'kW', r'k\s*W', r'W\s*h', r'\s+h\b']
+    
+    for kw in meter_keywords:
+        if not kw: continue
+        # Find number BEFORE keyword (e.g., 335938.3 kWh)
+        pat = r"((?:\d|O|o|l|I|\|)+[\.,]?\d*)\s*" + kw
+        match = re.search(pat, raw_full_text, re.IGNORECASE)
+        if match:
+            val_str = match.group(1).replace("O", "0").replace("o", "0").replace("l", "1").replace("I", "1").replace("|", "1")
+            val_str = normalize_number_str(val_str, decimal_places)
+            try:
+                val = float(val_str)
+                if decimal_places > 0 and "." not in val_str: val = val / (10 ** decimal_places)
+                return float(val)
+            except: pass
 
-    # Blacklist
+    # --- 2. Digital Meter Logic (Pick the Largest Number) ---
+    # If no keyword found, Digital meters usually display Voltage (220) and kWh (12345).
+    # We want the kWh, which is usually the larger number (more digits).
+    if is_digital_meter(config):
+        clean_txt = re.sub(r"[^\d\.]", " ", raw_full_text)
+        nums = re.findall(r"\d+\.\d+|\d+", clean_txt)
+        best_candidate = 0.0
+        max_digits = 0
+        
+        for n_str in nums:
+            n_clean = normalize_number_str(n_str, decimal_places)
+            if not n_clean: continue
+            try:
+                val = float(n_clean)
+                # Count digits (integers)
+                num_digits = len(str(int(val)))
+                
+                # Filter out obvious noise (year 2024, 2025 or small numbers < 50 for voltage noise)
+                if val > 2020 and val < 2030 and num_digits == 4: continue 
+                
+                # Preference: Match expected digits OR Pick largest number of digits
+                score = num_digits * 10
+                if expected_digits > 0 and num_digits == expected_digits: score += 100
+                elif expected_digits > 0 and abs(num_digits - expected_digits) <= 1: score += 50
+                
+                if score > max_digits:
+                    max_digits = score
+                    best_candidate = val
+            except: continue
+        
+        if best_candidate > 0:
+            return best_candidate
+
+    # --- 3. Standard Fallback ---
+    # Blacklist & Stitcher code...
     blacklisted = set()
     id_matches = re.finditer(r"(?i)(?:id|code|no\.?|serial|s\/n)[\D]{0,15}?(\d+(?:[\s-]+\d+)*)", full_text)
     for m in id_matches:
@@ -319,26 +354,10 @@ def ocr_process(image_bytes, config):
 
     def check_digits(val):
         if expected_digits == 0: return True
-        try: return len(str(int(float(val)))) in (expected_digits, expected_digits - 1)
+        try: return len(str(int(float(val)))) in (expected_digits, expected_digits - 1, expected_digits + 1) # Allow +/- 1 digit
         except: return False
 
     candidates = []
-    # Stitcher
-    analog_labels = [r"10\D?000", r"1\D?000", r"100", r"10", r"1"]
-    stitched_digits = {}
-    for idx, label in enumerate(analog_labels):
-        m = re.search(label + r"[^\d]{0,30}\s+(\d)\b", raw_full_text)
-        if m: stitched_digits[idx] = m.group(1)
-    if len(stitched_digits) >= 2:
-        sorted_keys = sorted(stitched_digits.keys())
-        final_str = "".join([stitched_digits[k] for k in sorted_keys])
-        try:
-            val = float(final_str)
-            if val not in blacklisted and check_digits(val):
-                candidates.append({"val": float(val), "score": 300 + len(final_str) * 10})
-        except: pass
-
-    # Standard
     clean_std = re.sub(r"\b202[0-9]\b|\b256[0-9]\b", "", full_text)
     nums = re.findall(r"-?\d+\.\d+|\d+", clean_std)
     for n_str in nums:
@@ -349,6 +368,8 @@ def ocr_process(image_bytes, config):
             if decimal_places > 0 and "." not in n_str2: val = val / (10 ** decimal_places)
             if val in blacklisted: continue
             if not check_digits(val): continue
+            
+            # Score calculation
             score = 100
             if decimal_places > 0 and "." in n_str2: score += 30
             candidates.append({"val": float(val), "score": score})
@@ -369,6 +390,7 @@ mode = st.sidebar.radio("🔧 เลือกโหมดการทำงา�
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
     st.markdown("### Water treatment Plant - Borthongindustrial")
+    st.caption("Version 5.3 (Digital Multi-Line Fixed)")
 
     if 'confirm_mode' not in st.session_state: st.session_state.confirm_mode = False
     if 'warning_msg' not in st.session_state: st.session_state.warning_msg = ""
@@ -411,16 +433,14 @@ if mode == "📝 พนักงานจดมิเตอร์":
     if not st.session_state.confirm_mode:
         if st.button("🚀 ตรวจสอบและบันทึก", type="primary"):
             if img_file and point_id:
-                with st.spinner("🤖 AI กำลังประมวลผล (3-Pass Strategy)..."):
+                with st.spinner("🤖 AI กำลังประมวลผล (Smart Digital Logic)..."):
                     try:
                         img_bytes = img_file.getvalue()
                         config = get_meter_config(point_id)
                         if not config: st.error("❌ ไม่พบ config"); st.stop()
 
-                        # อ่านค่า (3 รอบ)
                         ai_val = ocr_process(img_bytes, config)
                         
-                        # อัปโหลดรูปขึ้น Cloud Storage
                         filename = f"{point_id}_{get_thai_time().strftime('%Y%m%d_%H%M%S')}.jpg"
                         image_url = upload_image_to_storage(img_bytes, filename)
 
@@ -480,7 +500,6 @@ elif mode == "👮‍♂️ Admin Approval":
                     m_val = safe_float(item.get('Manual_Value'), 0.0)
                     a_val = safe_float(item.get('AI_Value'), 0.0)
                     
-                    # ✅ ส่วนที่ผมแก้ไขให้: ใส่ Mapping ให้ Admin ดูง่าย
                     options_map = {
                         f"👤 คนจด: {m_val}": m_val,
                         f"🤖 AI: {a_val}": a_val
