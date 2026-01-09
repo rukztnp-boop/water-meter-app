@@ -8,7 +8,7 @@ import numpy as np
 from google.oauth2 import service_account
 from google.cloud import vision
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload # ✅ เพิ่ม Download
 from datetime import datetime, timedelta, timezone
 import string
 
@@ -21,7 +21,6 @@ FIXED_FOLDER_ID = '1XH4gKYb73titQLrgp4FYfLT2jzYRgUpO'
 # --- 🕒 TIMEZONE HELPER ---
 # =========================================================
 def get_thai_time():
-    """คืนค่าเวลาปัจจุบันในโซนไทย (UTC+7)"""
     tz = timezone(timedelta(hours=7))
     return datetime.now(tz)
 
@@ -81,26 +80,40 @@ def upload_image_to_drive(image_bytes, file_name):
         media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype='image/jpeg')
         file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
         
-        permission = {'type': 'anyone', 'role': 'reader'}
-        drive_service.permissions().create(fileId=file.get('id'), body=permission).execute()
+        # Permission (เผื่อไว้)
+        try:
+            permission = {'type': 'anyone', 'role': 'reader'}
+            drive_service.permissions().create(fileId=file.get('id'), body=permission).execute()
+        except: pass
         
         return file.get('webViewLink')
     except Exception as e:
         return f"Error: {e}"
 
-def convert_drive_url(url):
-    """แปลง Google Drive Link (WebView) ให้เป็น Direct Image Link"""
-    if not url or url == '-': return None
-    # ดึง File ID ออกมาจาก URL
-    # รูปแบบ: https://drive.google.com/file/d/FILE_ID/view...
+# ✅ ฟังก์ชันใหม่: โหลดรูปด้วยกุญแจ (แก้ปัญหา Error 100%)
+def get_drive_image_bytes(url):
+    if not url or url == '-' or 'drive.google.com' not in url: return None
     try:
+        # แกะ File ID
         if '/d/' in url:
             file_id = url.split('/d/')[1].split('/')[0]
-            # ใช้ URL แบบ Thumbnail เพื่อให้โหลดเร็วและแสดงผลชัวร์
-            return f"https://drive.google.com/thumbnail?id={file_id}&sz=w800"
+        elif 'id=' in url:
+            file_id = url.split('id=')[1].split('&')[0]
+        else:
+            return None
+
+        # ใช้ Service Account โหลดตรงๆ
+        drive_service = build('drive', 'v3', credentials=creds)
+        request = drive_service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while done is False:
+            status, done = downloader.next_chunk()
+        
+        return fh.getvalue() # คืนค่าเป็นรูปภาพ (Bytes)
     except:
-        pass
-    return url
+        return None
 
 # =========================================================
 # --- SHEET HELPERS ---
@@ -333,7 +346,7 @@ mode = st.sidebar.radio("🔧 เลือกโหมดการทำงา�
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
     st.markdown("### Water treatment Plant - Borthongindustrial")
-    st.caption("Version 2.4 (Fix Image Display)")
+    st.caption("Version 2.5 (Robust Image Loader)")
 
     if 'confirm_mode' not in st.session_state: st.session_state.confirm_mode = False
     if 'warning_msg' not in st.session_state: st.session_state.warning_msg = ""
@@ -433,14 +446,15 @@ elif mode == "👮‍♂️ Admin Approval":
                     st.subheader(f"🚩 {item.get('point_id')}")
                     st.caption(f"Inspector: {item.get('inspector')}")
                     
-                    # ✅ แก้ไขตรงนี้: แปลงลิงก์ก่อนแสดงผล
+                    # ✅ แก้ไข: โหลดรูปตรงๆ ไม่ใช้ลิงก์
                     img_url = item.get('image_url')
                     if img_url and img_url != '-':
-                        direct_url = convert_drive_url(img_url)
-                        if direct_url:
-                            st.image(direct_url, width=220)
-                        else:
-                            st.warning("รูปภาพไม่สามารถแสดงได้")
+                        with st.spinner("Loading image..."):
+                            img_bytes = get_drive_image_bytes(img_url)
+                            if img_bytes:
+                                st.image(img_bytes, width=220)
+                            else:
+                                st.warning("❌ ไม่สามารถโหลดรูปได้")
 
                 with c_val:
                     m_val = safe_float(item.get('Manual_Value'), 0.0)
