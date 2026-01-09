@@ -2,7 +2,7 @@ streamlit
 gspread
 google-auth
 google-cloud-vision
+google-cloud-storage
 google-api-python-client
 opencv-python-headless
 numpy
-google-cloud-storage
