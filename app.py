@@ -15,7 +15,7 @@ import string
 # --- 📦 CONFIGURATION ---
 # =========================================================
 BUCKET_NAME = 'water-meter-images-watertreatmentplant'
-FIXED_FOLDER_ID = '1XH4gKYb73titQLrgp4FYfLT2jzYRgUpO'  # (kept for compatibility)
+FIXED_FOLDER_ID = '1XH4gKYb73titQLrgp4FYfLT2jzYRgUpO' 
 
 # =========================================================
 # --- 🕒 TIMEZONE HELPER ---
@@ -193,7 +193,7 @@ def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, imag
         return False
 
 # =========================================================
-# --- 🧠 OCR ENGINE (Robust 5-Pass + RAW fallback + Upscale) ---
+# --- 🧠 OCR ENGINE (Hybrid: Analog vs Digital) ---
 # =========================================================
 def normalize_number_str(s: str, decimals: int = 0) -> str:
     if not s:
@@ -227,11 +227,12 @@ def preprocess_text(text):
 
 def is_digital_meter(config):
     """
-    ✅ สำคัญ: อย่าถือว่า 'electric' = digital
-    Digital ให้ดูจาก digital/scada/decimals/keyword เป็นหลัก
+    Logic: ถ้ามีคำว่า digital, scada หรือมีจุดทศนิยม ให้ถือเป็น Digital
+    (ระวัง: Electric Analog มีอยู่จริง อย่าเหมารวม Electric เป็น Digital ทั้งหมด)
     """
     blob = f"{config.get('type','')} {config.get('name','')} {config.get('keyword','')}".lower()
-    return ("digital" in blob) or ("scada" in blob) or (int(config.get('decimals', 0) or 0) > 0) or (len(str(config.get('keyword','')).strip()) > 0)
+    has_decimal = int(config.get('decimals', 0) or 0) > 0
+    return ("digital" in blob) or ("scada" in blob) or has_decimal
 
 def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
     nparr = np.frombuffer(image_bytes, np.uint8)
@@ -240,10 +241,10 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
         return image_bytes
 
     H, W = img.shape[:2]
-    # keep decent resolution; don't shrink too aggressively
-    if W > 1600:
-        scale = 1600 / W
-        img = cv2.resize(img, (1600, int(H * scale)), interpolation=cv2.INTER_AREA)
+    # Resize: Standardize to 1280 (Good balance)
+    if W > 1280:
+        scale = 1280 / W
+        img = cv2.resize(img, (1280, int(H * scale)), interpolation=cv2.INTER_AREA)
         H, W = img.shape[:2]
 
     # ROI crop
@@ -251,7 +252,7 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
         x1, y1, x2, y2 = config.get('roi_x1', 0), config.get('roi_y1', 0), config.get('roi_x2', 0), config.get('roi_y2', 0)
         if x2 and y2:
             if 0 < x2 <= 1 and 0 < y2 <= 1:
-                x1, y1, x2, y2 = int(float(x1) * W), int(float(y1) * H), int(float(x2) * W), int(float(y2) * H)
+                x1, y1, x2, y2 = int(x1 * W), int(y1 * H), int(x2 * W), int(y2 * H)
             else:
                 x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
 
@@ -262,7 +263,7 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
                 img = img[y1:y2, x1:x2]
                 H, W = img.shape[:2]
 
-    # Remove red (water meters)
+    # Red Removal (For Water meters)
     if config.get('ignore_red', False):
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         lower_red1 = np.array([0, 70, 50]);  upper_red1 = np.array([10, 255, 255])
@@ -270,204 +271,163 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
         mask = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
         img[mask > 0] = [255, 255, 255]
 
-    # If ROI makes image small, upscale for OCR (very important for LCD digits)
-    if is_digital_meter(config) and min(img.shape[:2]) < 260:
-        img = cv2.resize(img, None, fx=2.8, fy=2.8, interpolation=cv2.INTER_CUBIC)
+    # === VARIANT LOGIC ===
+    
+    # 1. Analog Mode: (Standard Threshold) - ดีที่สุดสำหรับมิเตอร์หมุน/มิเตอร์น้ำเก่า
+    if variant == "analog":
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.bilateralFilter(gray, 7, 50, 50) # ลบรอยเปื้อน
+        # Adaptive Threshold ตัดเส้นดำให้ชัด พื้นขาว
+        th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7)
+        ok, encoded = cv2.imencode(".png", th)
+        return encoded.tobytes() if ok else image_bytes
 
-    if variant == "raw":
+    # 2. Digital/Upscale Mode: (High Res + Soft) - ดีที่สุดสำหรับ ENTES/SCADA
+    elif variant == "upscale":
+        # ขยายภาพเฉพาะ Digital
+        if min(H, W) < 400:
+            img = cv2.resize(img, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+        
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        g = clahe.apply(gray)
+        # ไม่ทำ Threshold แต่ใช้ Grayscale ที่ปรับ Contrast แล้ว
+        ok, encoded = cv2.imencode(".png", g)
+        return encoded.tobytes() if ok else image_bytes
+
+    # 3. Raw (Fallback)
+    else:
         ok, encoded = cv2.imencode(".jpg", img)
         return encoded.tobytes() if ok else image_bytes
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    if variant == "invert":
-        gray = 255 - gray
-
-    # Digital-friendly: CLAHE + sharpen
-    if variant in ("soft", "auto") and (variant == "soft" or is_digital_meter(config)):
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        g = clahe.apply(gray)
-        blur = cv2.GaussianBlur(g, (0, 0), 1.0)
-        sharp = cv2.addWeighted(g, 1.6, blur, -0.6, 0)
-        ok, encoded = cv2.imencode(".png", sharp)
-        return encoded.tobytes() if ok else image_bytes
-
-    # Analog-friendly: adaptive threshold
-    gray2 = cv2.bilateralFilter(gray, 7, 50, 50)
-    th = cv2.adaptiveThreshold(gray2, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7)
-    ok, encoded = cv2.imencode(".png", th)
-    return encoded.tobytes() if ok else image_bytes
-
 def _vision_read_text(processed_bytes):
-    """
-    Returns (text, error_message).
-    Tries text_detection first; if empty, tries document_text_detection.
-    """
     try:
         image = vision.Image(content=processed_bytes)
-        resp = VISION_CLIENT.text_detection(image=image)
-        if getattr(resp, "error", None) and resp.error.message:
-            return "", resp.error.message
-        if resp.text_annotations:
-            return (resp.text_annotations[0].description or ""), ""
-        # fallback
-        resp2 = VISION_CLIENT.document_text_detection(image=image)
-        if getattr(resp2, "error", None) and resp2.error.message:
-            return "", resp2.error.message
-        txt = ""
-        if resp2.full_text_annotation and resp2.full_text_annotation.text:
-            txt = resp2.full_text_annotation.text
-        return (txt or ""), ""
-    except Exception as e:
-        return "", str(e)
+        response = VISION_CLIENT.text_detection(image=image)
+        if not response.text_annotations: return ""
+        return response.text_annotations[0].description or ""
+    except: return ""
 
 def ocr_process(image_bytes, config, debug=False):
     decimal_places = int(config.get('decimals', 0) or 0)
     keyword = str(config.get('keyword', '') or '').strip()
     expected_digits = int(config.get('expected_digits', 0) or 0)
 
-    # Attempts: start from least-destructive for DIGITAL (raw), then enhanced
-    attempts = [
-        ("ROI_raw",   True,  "raw"),
-        ("ROI_auto",  True,  "auto"),
-        ("ROI_soft",  True,  "soft"),
-        ("ROI_inv",   True,  "invert"),
-        ("FULL_raw",  False, "raw"),
-        ("FULL_soft", False, "soft"),
-        ("FULL_inv",  False, "invert"),
-    ]
+    # ✅ STEP 1: Analog First (Standard Threshold)
+    # วิธีนี้ "ปลอดภัย" ที่สุดสำหรับรูปเก่าๆ ที่เคยอ่านได้ (ไม่เพิ่ม Noise)
+    processed_bytes = preprocess_image_cv(image_bytes, config, use_roi=True, variant="analog")
+    raw_full_text = _vision_read_text(processed_bytes)
+    
+    # ตรวจคำตอบรอบแรก: ถ้าได้เลขครบตามที่หวัง ก็จบเลย ไม่ต้องไปทำ Upscale ให้เสี่ยง
+    temp_text = preprocess_text(raw_full_text.replace("\n", " "))
+    temp_nums = re.findall(r'\d+', temp_text)
+    found_good_match = False
+    if expected_digits > 0:
+        for n in temp_nums:
+            if len(n) == expected_digits:
+                found_good_match = True
+                break
+    
+    # ✅ STEP 2: Digital/Upscale (ไม้ตาย)
+    # จะทำก็ต่อเมื่อ Step 1 อ่านไม่ออก หรือ Config ระบุชัดเจนว่าเป็น Digital Meter
+    should_retry = (not raw_full_text) or (expected_digits > 0 and not found_good_match)
+    
+    if should_retry or is_digital_meter(config):
+        # print("Trying Upscale Mode...")
+        processed_bytes = preprocess_image_cv(image_bytes, config, use_roi=True, variant="upscale")
+        raw_full_text_2 = _vision_read_text(processed_bytes)
+        # ถ้าอ่านรอบ 2 ได้ผลที่ดีกว่า (มีตัวหนังสือ) ให้ใช้ผลรอบ 2
+        if len(raw_full_text_2) > len(raw_full_text):
+            raw_full_text = raw_full_text_2
 
-    raw_full_text = ""
-    last_err = ""
-    for tag, use_roi, variant in attempts:
-        processed = preprocess_image_cv(image_bytes, config, use_roi=use_roi, variant=variant)
-        txt, err = _vision_read_text(processed)
-        if err:
-            last_err = err
-        if txt and txt.strip():
-            raw_full_text = txt.replace("\n", " ")
-            if debug:
-                print(f"[OCR] success {tag} variant={variant} roi={use_roi} text_snip={raw_full_text[:120]}")
-            break
-        else:
-            if debug:
-                print(f"[OCR] empty {tag} variant={variant} roi={use_roi} err={err}")
+    # ✅ STEP 3: Fallback (รูปเต็ม)
+    has_roi = bool(config.get('roi_x2', 0)) and bool(config.get('roi_y2', 0))
+    if not raw_full_text and has_roi:
+        processed_bytes = preprocess_image_cv(image_bytes, config, use_roi=False, variant="analog")
+        raw_full_text = _vision_read_text(processed_bytes)
 
-    if not raw_full_text:
-        if debug and last_err:
-            print(f"[OCR] Vision error (last): {last_err}")
-        return 0.0
+    if not raw_full_text: return 0.0
 
+    raw_full_text = raw_full_text.replace("\n", " ")
     full_text = preprocess_text(raw_full_text)
 
-    # 0) Auto-kWh capture even when keyword empty (very common)
-    auto_kw_patterns = [
-        r"(\d[\d,]*\.?\d*)\s*(?:kW\s*h|kWh)\b",
-        r"(?:kW\s*h|kWh)\s*([0-9][0-9,]*\.?[0-9]*)"
-    ]
-    for pat in auto_kw_patterns:
-        m = re.search(pat, raw_full_text, re.IGNORECASE)
-        if m:
-            val_str = m.group(1)
-            val_str = val_str.replace("O", "0").replace("o", "0").replace("l", "1").replace("I", "1").replace("|", "1")
-            norm = normalize_number_str(val_str, decimal_places)
+    # --- Extraction Logic ---
+
+    # 1. Keyword Hunter
+    meter_keywords = [re.escape(keyword)] if keyword else []
+    meter_keywords += [r'kWh', r'kW', r'k\s*W', r'W\s*h', r'\s+h\b']
+    for kw in meter_keywords:
+        if not kw: continue
+        pat = r"((?:\d|O|o|l|I|\|)+[\.,]?\d*)\s*" + kw
+        match = re.search(pat, raw_full_text, re.IGNORECASE)
+        if match:
+            val_str = match.group(1).replace("O", "0").replace("o", "0").replace("l", "1").replace("I", "1").replace("|", "1")
+            val_str = normalize_number_str(val_str, decimal_places)
             try:
-                val = float(norm)
-                if decimal_places > 0 and "." not in norm:
-                    val = val / (10 ** decimal_places)
+                val = float(val_str)
+                if decimal_places > 0 and "." not in val_str: val = val / (10 ** decimal_places)
                 return float(val)
-            except:
-                pass
+            except: pass
 
-    # 1) Keyword Hunter (supports number before/after keyword)
-    if keyword:
-        kw = re.escape(keyword)
-        patterns = [
-            kw + r"[^\d]*((?:\d|O|o|l|I|\|)+[\.,]?\d*)",
-            r"((?:\d|O|o|l|I|\|)+[\.,]?\d*)[^\d]*" + kw
-        ]
-        for pat in patterns:
-            match = re.search(pat, raw_full_text, re.IGNORECASE)
-            if match:
-                val_str = match.group(1).replace("O", "0").replace("o", "0").replace("l", "1").replace("I", "1").replace("|", "1")
-                val_str = normalize_number_str(val_str, decimal_places)
-                try:
-                    val = float(val_str)
-                    if decimal_places > 0 and "." not in val_str:
-                        val = val / (10 ** decimal_places)
-                    return float(val)
-                except:
-                    pass
+    # 2. Digital Logic (Pick largest number)
+    if is_digital_meter(config):
+        clean_txt = re.sub(r"[^\d\.]", " ", raw_full_text)
+        nums = re.findall(r"\d+\.\d+|\d+", clean_txt)
+        best_candidate = 0.0
+        max_digits = 0
+        for n_str in nums:
+            n_clean = normalize_number_str(n_str, decimal_places)
+            if not n_clean: continue
+            try:
+                val = float(n_clean)
+                num_digits = len(str(int(val)))
+                if val > 2020 and val < 2030 and num_digits == 4: continue 
+                
+                score = num_digits * 10
+                if expected_digits > 0 and num_digits == expected_digits: score += 100
+                elif expected_digits > 0 and abs(num_digits - expected_digits) <= 1: score += 50
+                
+                if score > max_digits:
+                    max_digits = score
+                    best_candidate = val
+            except: continue
+        if best_candidate > 0: return best_candidate
 
-    # 2) Blacklist IDs
+    # 3. Analog/Standard Logic
     blacklisted = set()
     id_matches = re.finditer(r"(?i)(?:id|code|no\.?|serial|s\/n)[\D]{0,15}?(\d+(?:[\s-]+\d+)*)", full_text)
     for m in id_matches:
         for p in re.split(r"[\s-]+", m.group(1)):
-            try:
-                blacklisted.add(float(p))
-            except:
-                pass
+            try: blacklisted.add(float(p))
+            except: pass
 
     def check_digits(val):
-        if expected_digits == 0:
-            return True
-        try:
-            return len(str(int(float(val)))) in (expected_digits, expected_digits - 1)
-        except:
-            return False
+        if expected_digits == 0: return True
+        try: return len(str(int(float(val)))) in (expected_digits, expected_digits - 1, expected_digits + 1)
+        except: return False
 
     candidates = []
-
-    # 3) Stitcher (analog dials)
-    analog_labels = [r"10\D?000", r"1\D?000", r"100", r"10", r"1"]
-    stitched_digits = {}
-    for idx, label in enumerate(analog_labels):
-        m = re.search(label + r"[^\d]{0,30}\s+(\d)\b", raw_full_text)
-        if m:
-            stitched_digits[idx] = m.group(1)
-    if len(stitched_digits) >= 2:
-        sorted_keys = sorted(stitched_digits.keys())
-        final_str = "".join([stitched_digits[k] for k in sorted_keys])
-        try:
-            val = float(final_str)
-            if val not in blacklisted and check_digits(val):
-                candidates.append({"val": float(val), "score": 350 + len(final_str) * 12})
-        except:
-            pass
-
-    # 4) Standard numbers (prefer longer integer part)
     clean_std = re.sub(r"\b202[0-9]\b|\b256[0-9]\b", "", full_text)
     nums = re.findall(r"-?\d+\.\d+|\d+", clean_std)
     for n_str in nums:
         n_str2 = normalize_number_str(n_str, decimal_places)
-        if not n_str2:
-            continue
+        if not n_str2: continue
         try:
             val = float(n_str2) if "." in n_str2 else float(int(n_str2))
-            if decimal_places > 0 and "." not in n_str2:
-                val = val / (10 ** decimal_places)
-            if val in blacklisted:
-                continue
-            if not check_digits(val):
-                continue
-
+            if decimal_places > 0 and "." not in n_str2: val = val / (10 ** decimal_places)
+            if val in blacklisted: continue
+            if not check_digits(val): continue
+            
             score = 100
-            int_part = str(int(abs(val)))
-            score += min(len(int_part), 8) * 12  # prefer longer readings
-            if decimal_places > 0 and "." in n_str2:
-                score += 20
+            if decimal_places > 0 and "." in n_str2: score += 30
             candidates.append({"val": float(val), "score": score})
-        except:
-            continue
+        except: continue
 
-    if candidates:
-        return float(max(candidates, key=lambda x: x["score"])["val"])
+    if candidates: return float(max(candidates, key=lambda x: x["score"])["val"])
     return 0.0
 
 def calc_tolerance(decimals: int) -> float:
-    if decimals <= 0:
-        return 0.5
+    if decimals <= 0: return 0.5 
     return 0.5 * (10 ** (-decimals))
 
 # =========================================================
@@ -485,37 +445,29 @@ mode = st.sidebar.radio("🔧 เลือกโหมดการทำงา�
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
     st.markdown("### Water treatment Plant - Borthongindustrial")
-    st.caption("Version 5.1 (Robust OCR: RAW fallback + Upscale + DocText fallback)")
+    st.caption("Version 5.5 (Hybrid Engine: Analog & Digital)")
 
-    if 'confirm_mode' not in st.session_state:
-        st.session_state.confirm_mode = False
-    if 'warning_msg' not in st.session_state:
-        st.session_state.warning_msg = ""
-    if 'last_manual_val' not in st.session_state:
-        st.session_state.last_manual_val = 0.0
+    if 'confirm_mode' not in st.session_state: st.session_state.confirm_mode = False
+    if 'warning_msg' not in st.session_state: st.session_state.warning_msg = ""
+    if 'last_manual_val' not in st.session_state: st.session_state.last_manual_val = 0.0
 
     all_meters = load_points_master()
-    if not all_meters:
-        st.stop()
+    if not all_meters: st.stop()
 
     col_type, col_insp = st.columns(2)
-    with col_type:
-        cat_select = st.radio("ประเภทมิเตอร์", ["💧 ประปา (Water)", "⚡️ ไฟฟ้า (Electric)"], horizontal=True)
-    with col_insp:
-        inspector = st.text_input("ชื่อผู้ตรวจ", "Admin")
+    with col_type: cat_select = st.radio("ประเภทมิเตอร์", ["💧 ประปา (Water)", "⚡️ ไฟฟ้า (Electric)"], horizontal=True)
+    with col_insp: inspector = st.text_input("ชื่อผู้ตรวจ", "Admin")
 
     filtered_meters = []
     for m in all_meters:
         m_type = (str(m.get('type', '')).lower() + " " + str(m.get('name', '')).lower())
         if "ประปา" in cat_select:
-            if any(x in m_type for x in ['น้ำ', 'water', 'ประปา']):
-                filtered_meters.append(m)
+            if any(x in m_type for x in ['น้ำ', 'water', 'ประปา']): filtered_meters.append(m)
         else:
-            if any(x in m_type for x in ['ไฟ', 'electric', 'scada']):
-                filtered_meters.append(m)
+            if any(x in m_type for x in ['ไฟ', 'electric', 'scada']): filtered_meters.append(m)
 
     option_map = {f"{m.get('point_id')} : {m.get('name')}": m for m in filtered_meters}
-
+    
     st.write("---")
     c1, c2 = st.columns([2, 1])
     with c1:
@@ -529,24 +481,21 @@ if mode == "📝 พนักงานจดมิเตอร์":
 
     tab_cam, tab_up = st.tabs(["📷 ถ่ายรูป", "📂 อัปโหลด"])
     img_file = tab_cam.camera_input("ถ่ายภาพมิเตอร์")
-    if not img_file:
-        img_file = tab_up.file_uploader("เลือกรูปภาพ", type=['jpg', 'png', 'jpeg'])
+    if not img_file: img_file = tab_up.file_uploader("เลือกรูปภาพ", type=['jpg', 'png', 'jpeg'])
 
     st.write("---")
 
     if not st.session_state.confirm_mode:
         if st.button("🚀 ตรวจสอบและบันทึก", type="primary"):
             if img_file and point_id:
-                with st.spinner("🤖 AI กำลังประมวลผล (Robust OCR)..."):
+                with st.spinner("🤖 AI กำลังประมวลผล (Hybrid Mode)..."):
                     try:
                         img_bytes = img_file.getvalue()
                         config = get_meter_config(point_id)
-                        if not config:
-                            st.error("❌ ไม่พบ config")
-                            st.stop()
+                        if not config: st.error("❌ ไม่พบ config"); st.stop()
 
                         ai_val = ocr_process(img_bytes, config, debug=debug_ocr)
-
+                        
                         filename = f"{point_id}_{get_thai_time().strftime('%Y%m%d_%H%M%S')}.jpg"
                         image_url = upload_image_to_storage(img_bytes, filename)
 
@@ -558,8 +507,7 @@ if mode == "📝 พนักงานจดมิเตอร์":
                                 st.balloons()
                                 st.success("✅ บันทึกสำเร็จ!")
                                 st.info(f"AI: {ai_val} | Manual: {manual_val}")
-                            else:
-                                st.error("Save Failed")
+                            else: st.error("Save Failed")
                         else:
                             st.session_state.confirm_mode = True
                             st.session_state.warning_msg = f"ไม่ตรงกัน! กรอก {manual_val} / AI {ai_val} (tol {tol})"
@@ -567,35 +515,28 @@ if mode == "📝 พนักงานจดมิเตอร์":
                             st.session_state.last_ai_val = ai_val
                             st.session_state.last_img_url = image_url
                             st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-            else:
-                st.warning("⚠️ กรุณาถ่ายรูปและเลือกจุดตรวจ")
+                    except Exception as e: st.error(f"Error: {e}")
+            else: st.warning("⚠️ กรุณาถ่ายรูปและเลือกจุดตรวจ")
     else:
         st.markdown(f"""<div class="status-box status-warning"><h4>⚠️ {st.session_state.warning_msg}</h4></div>""", unsafe_allow_html=True)
         col_conf1, col_conf2 = st.columns(2)
         if col_conf1.button("✅ ยืนยัน (ส่งให้ Admin)"):
             save_to_db(point_id, inspector, "Water", st.session_state.last_manual_val, st.session_state.last_ai_val, "FLAGGED", st.session_state.last_img_url)
-            st.success("✅ ส่งเรื่องแล้ว")
-            st.session_state.confirm_mode = False
-            st.rerun()
+            st.success("✅ ส่งเรื่องแล้ว"); st.session_state.confirm_mode = False; st.rerun()
         if col_conf2.button("❌ แก้ไข"):
-            st.session_state.confirm_mode = False
-            st.rerun()
+            st.session_state.confirm_mode = False; st.rerun()
 
 elif mode == "👮‍♂️ Admin Approval":
     st.title("👮‍♂️ Admin Dashboard")
     st.caption("ระบบอนุมัติผลการอ่านค่ามิเตอร์น้ำ/ไฟ")
-    if st.button("🔄 รีเฟรช"):
-        st.rerun()
+    if st.button("🔄 รีเฟรช"): st.rerun()
 
     sh = gc.open(DB_SHEET_NAME)
     ws = sh.worksheet("DailyReadings")
     data = ws.get_all_records()
     pending = [d for d in data if str(d.get('Status', '')).strip().upper() == 'FLAGGED']
 
-    if not pending:
-        st.success("✅ All Clear")
+    if not pending: st.success("✅ All Clear")
     else:
         for i, item in enumerate(pending):
             with st.container():
@@ -635,12 +576,7 @@ elif mode == "👮‍♂️ Admin Approval":
                                     config = get_meter_config(point_id)
                                     report_col = (config.get('report_col', '') if config else '')
                                     export_to_real_report(point_id, choice, str(item.get('inspector', '')), report_col)
-                                    updated = True
-                                    break
-                            if updated:
-                                st.success("Approved!")
-                                st.rerun()
-                            else:
-                                st.warning("หา row ไม่เจอ")
-                        except Exception as e:
-                            st.error(f"Error approve: {e}")
+                                    updated = True; break
+                            if updated: st.success("Approved!"); st.rerun()
+                            else: st.warning("หา row ไม่เจอ")
+                        except Exception as e: st.error(f"Error approve: {e}")
