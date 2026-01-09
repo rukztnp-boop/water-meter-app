@@ -55,7 +55,8 @@ if 'gcp_service_account' in st.secrets:
             key_dict, 
             scopes=[
                 "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/cloud-platform" # ✅ Scope ครอบคลุม Storage
+                "https://www.googleapis.com/auth/drive", # ✅ ต้องมีอันนี้ เพื่อให้หาไฟล์ Sheet เจอ
+                "https://www.googleapis.com/auth/cloud-platform"
             ]
         )
     except Exception as e:
@@ -64,7 +65,7 @@ if 'gcp_service_account' in st.secrets:
 else:
     st.error("❌ Secrets not found.")
     st.stop()
-
+    
 gc = gspread.authorize(creds)
 DB_SHEET_NAME = 'WaterMeter_System_DB'     
 REAL_REPORT_SHEET = 'TEST waterreport' 
