@@ -3,3 +3,5 @@ gspread
 google-auth
 google-cloud-vision
 google-api-python-client
+opencv-python-headless
+numpy
