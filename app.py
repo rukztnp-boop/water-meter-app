@@ -7,20 +7,21 @@ import cv2
 import numpy as np
 from google.oauth2 import service_account
 from google.cloud import vision
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload # ✅ เพิ่ม Download
+from google.cloud import storage # ✅ เพิ่มไลบรารี Storage
 from datetime import datetime, timedelta, timezone
 import string
 
 # =========================================================
-# --- 📁 CONFIGURATION (FOLDER ID) ---
+# --- 📦 CONFIGURATION (CLOUD STORAGE) ---
 # =========================================================
-FIXED_FOLDER_ID = '1XH4gKYb73titQLrgp4FYfLT2jzYRgUpO' 
+# ✅ ใส่ชื่อ Bucket ของคุณให้เรียบร้อยแล้วครับ
+BUCKET_NAME = 'water-meter-images-watertreatmentplant' 
 
 # =========================================================
 # --- 🕒 TIMEZONE HELPER ---
 # =========================================================
 def get_thai_time():
+    """คืนค่าเวลาปัจจุบันในโซนไทย (UTC+7)"""
     tz = timezone(timedelta(hours=7))
     return datetime.now(tz)
 
@@ -54,8 +55,7 @@ if 'gcp_service_account' in st.secrets:
             key_dict, 
             scopes=[
                 "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive",
-                "https://www.googleapis.com/auth/cloud-platform"
+                "https://www.googleapis.com/auth/cloud-platform" # ✅ Scope ครอบคลุม Storage
             ]
         )
     except Exception as e:
@@ -69,51 +69,23 @@ gc = gspread.authorize(creds)
 DB_SHEET_NAME = 'WaterMeter_System_DB'     
 REAL_REPORT_SHEET = 'TEST waterreport' 
 VISION_CLIENT = vision.ImageAnnotatorClient(credentials=creds)
+STORAGE_CLIENT = storage.Client(credentials=creds) # ✅ Client สำหรับ Storage
 
 # =========================================================
-# --- GOOGLE DRIVE HELPERS ---
+# --- CLOUD STORAGE HELPERS (NEW) ---
 # =========================================================
-def upload_image_to_drive(image_bytes, file_name):
+def upload_image_to_storage(image_bytes, file_name):
     try:
-        drive_service = build('drive', 'v3', credentials=creds)
-        file_metadata = {'name': file_name, 'parents': [FIXED_FOLDER_ID]}
-        media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype='image/jpeg')
-        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+        bucket = STORAGE_CLIENT.bucket(BUCKET_NAME)
+        blob = bucket.blob(file_name)
         
-        # Permission (เผื่อไว้)
-        try:
-            permission = {'type': 'anyone', 'role': 'reader'}
-            drive_service.permissions().create(fileId=file.get('id'), body=permission).execute()
-        except: pass
+        # Upload from RAM directly
+        blob.upload_from_string(image_bytes, content_type='image/jpeg')
         
-        return file.get('webViewLink')
+        # ✅ คืนค่า Public URL (เปิดดูได้เลย ไม่ต้องล็อกอิน)
+        return blob.public_url
     except Exception as e:
         return f"Error: {e}"
-
-# ✅ ฟังก์ชันใหม่: โหลดรูปด้วยกุญแจ (แก้ปัญหา Error 100%)
-def get_drive_image_bytes(url):
-    if not url or url == '-' or 'drive.google.com' not in url: return None
-    try:
-        # แกะ File ID
-        if '/d/' in url:
-            file_id = url.split('/d/')[1].split('/')[0]
-        elif 'id=' in url:
-            file_id = url.split('id=')[1].split('&')[0]
-        else:
-            return None
-
-        # ใช้ Service Account โหลดตรงๆ
-        drive_service = build('drive', 'v3', credentials=creds)
-        request = drive_service.files().get_media(fileId=file_id)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while done is False:
-            status, done = downloader.next_chunk()
-        
-        return fh.getvalue() # คืนค่าเป็นรูปภาพ (Bytes)
-    except:
-        return None
 
 # =========================================================
 # --- SHEET HELPERS ---
@@ -238,10 +210,10 @@ def preprocess_image_cv(image_bytes, config):
 
     x1, y1, x2, y2 = config.get('roi_x1', 0), config.get('roi_y1', 0), config.get('roi_x2', 0), config.get('roi_y2', 0)
     if x2 and y2:
-        if 0 < x2 <= 1 and 0 < y2 <= 1: # Ratio
+        if 0 < x2 <= 1 and 0 < y2 <= 1: 
             x1p, y1p = int(x1 * w), int(y1 * h)
             x2p, y2p = int(x2 * w), int(y2 * h)
-        else: # Pixel
+        else: 
             x1p, y1p, x2p, y2p = int(x1), int(y1), int(x2), int(y2)
         
         x1p, y1p = max(0, x1p), max(0, y1p)
@@ -346,7 +318,7 @@ mode = st.sidebar.radio("🔧 เลือกโหมดการทำงา�
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
     st.markdown("### Water treatment Plant - Borthongindustrial")
-    st.caption("Version 2.5 (Robust Image Loader)")
+    st.caption("Version 3.0 (Cloud Storage Enabled)")
 
     if 'confirm_mode' not in st.session_state: st.session_state.confirm_mode = False
     if 'warning_msg' not in st.session_state: st.session_state.warning_msg = ""
@@ -389,15 +361,17 @@ if mode == "📝 พนักงานจดมิเตอร์":
     if not st.session_state.confirm_mode:
         if st.button("🚀 ตรวจสอบและบันทึก", type="primary"):
             if img_file and point_id:
-                with st.spinner("🤖 AI กำลังประมวลผล + อัปโหลด..."):
+                with st.spinner("🤖 AI กำลังอัปโหลดขึ้น Cloud Storage..."):
                     try:
                         img_bytes = img_file.getvalue()
                         config = get_meter_config(point_id)
                         if not config: st.error("❌ ไม่พบ config"); st.stop()
 
                         ai_val = ocr_process(img_bytes, config)
+                        
+                        # ✅ ใช้ Storage Upload
                         filename = f"{point_id}_{get_thai_time().strftime('%Y%m%d_%H%M%S')}.jpg"
-                        image_url = upload_image_to_drive(img_bytes, filename)
+                        image_url = upload_image_to_storage(img_bytes, filename)
 
                         tol = calc_tolerance(config.get('decimals', 0))
                         if abs(manual_val - ai_val) <= tol:
@@ -410,7 +384,7 @@ if mode == "📝 พนักงานจดมิเตอร์":
                             else: st.error("Save Failed")
                         else:
                             st.session_state.confirm_mode = True
-                            st.session_state.warning_msg = f"ไม่ตรงกัน! กรอก {manual_val} / AI {ai_val}"
+                            st.session_state.warning_msg = f"ไม่ตรงกัน! กรอก {manual_val} / AI {ai_val} (tol {tol})"
                             st.session_state.last_manual_val = manual_val
                             st.session_state.last_ai_val = ai_val
                             st.session_state.last_img_url = image_url
@@ -446,15 +420,12 @@ elif mode == "👮‍♂️ Admin Approval":
                     st.subheader(f"🚩 {item.get('point_id')}")
                     st.caption(f"Inspector: {item.get('inspector')}")
                     
-                    # ✅ แก้ไข: โหลดรูปตรงๆ ไม่ใช้ลิงก์
+                    # ✅ แสดงรูปจาก Cloud Storage ได้เลย (Public URL)
                     img_url = item.get('image_url')
-                    if img_url and img_url != '-':
-                        with st.spinner("Loading image..."):
-                            img_bytes = get_drive_image_bytes(img_url)
-                            if img_bytes:
-                                st.image(img_bytes, width=220)
-                            else:
-                                st.warning("❌ ไม่สามารถโหลดรูปได้")
+                    if img_url and img_url != '-' and img_url.startswith('http'):
+                        st.image(img_url, width=220)
+                    else:
+                        st.warning("No Image or Invalid URL")
 
                 with c_val:
                     m_val = safe_float(item.get('Manual_Value'), 0.0)
