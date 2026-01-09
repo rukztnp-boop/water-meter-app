@@ -7,14 +7,14 @@ import cv2
 import numpy as np
 from google.oauth2 import service_account
 from google.cloud import vision
-from google.cloud import storage # ✅ เพิ่มไลบรารี Storage
+from google.cloud import storage
 from datetime import datetime, timedelta, timezone
 import string
 
 # =========================================================
-# --- 📦 CONFIGURATION (CLOUD STORAGE) ---
+# --- 📦 CONFIGURATION ---
 # =========================================================
-# ✅ ใส่ชื่อ Bucket ของคุณให้เรียบร้อยแล้วครับ
+# ✅ ชื่อ Bucket ของคุณถูกต้องแล้ว
 BUCKET_NAME = 'water-meter-images-watertreatmentplant' 
 
 # =========================================================
@@ -55,8 +55,8 @@ if 'gcp_service_account' in st.secrets:
             key_dict, 
             scopes=[
                 "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive", # ✅ ต้องมีอันนี้ เพื่อให้หาไฟล์ Sheet เจอ
-                "https://www.googleapis.com/auth/cloud-platform"
+                "https://www.googleapis.com/auth/drive",          # ✅ ต้องมีบรรทัดนี้ เพื่อให้หา Sheet เจอ
+                "https://www.googleapis.com/auth/cloud-platform"  # ✅ ต้องมีบรรทัดนี้ เพื่อให้อัปโหลดรูปได้
             ]
         )
     except Exception as e:
@@ -65,25 +65,23 @@ if 'gcp_service_account' in st.secrets:
 else:
     st.error("❌ Secrets not found.")
     st.stop()
-    
+
 gc = gspread.authorize(creds)
 DB_SHEET_NAME = 'WaterMeter_System_DB'     
 REAL_REPORT_SHEET = 'TEST waterreport' 
 VISION_CLIENT = vision.ImageAnnotatorClient(credentials=creds)
-STORAGE_CLIENT = storage.Client(credentials=creds) # ✅ Client สำหรับ Storage
+STORAGE_CLIENT = storage.Client(credentials=creds)
 
 # =========================================================
-# --- CLOUD STORAGE HELPERS (NEW) ---
+# --- CLOUD STORAGE HELPERS ---
 # =========================================================
 def upload_image_to_storage(image_bytes, file_name):
     try:
         bucket = STORAGE_CLIENT.bucket(BUCKET_NAME)
         blob = bucket.blob(file_name)
-        
-        # Upload from RAM directly
+        # อัปโหลดไฟล์ขึ้น Cloud Storage
         blob.upload_from_string(image_bytes, content_type='image/jpeg')
-        
-        # ✅ คืนค่า Public URL (เปิดดูได้เลย ไม่ต้องล็อกอิน)
+        # คืนค่า Public Link
         return blob.public_url
     except Exception as e:
         return f"Error: {e}"
@@ -148,6 +146,9 @@ def get_meter_config(point_id):
                 item['roi_y1'] = safe_float(item.get('roi_y1'), 0.0)
                 item['roi_x2'] = safe_float(item.get('roi_x2'), 0.0)
                 item['roi_y2'] = safe_float(item.get('roi_y2'), 0.0)
+                # เพิ่ม type/name เพื่อเช็ค Digital
+                item['type'] = str(item.get('type', '')).strip()
+                item['name'] = str(item.get('name', '')).strip()
                 return item
         return None
     except: return None
@@ -176,7 +177,7 @@ def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, imag
     except: return False
 
 # =========================================================
-# --- OCR HELPERS ---
+# --- 🧠 OCR ENGINE (Smart ROI + 2-Pass) ---
 # =========================================================
 def normalize_number_str(s: str, decimals: int = 0) -> str:
     if not s: return ""
@@ -198,30 +199,37 @@ def preprocess_text(text):
     text = re.sub(r'(?<=[\d\s])[Oo](?=[\d\s])', '0', text)
     return text
 
-def preprocess_image_cv(image_bytes, config):
+def preprocess_image_cv(image_bytes, config, use_roi=True):
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None: return image_bytes
     
-    h, w = img.shape[:2]
-    if w > 1280:
-        scale = 1280 / w
-        img = cv2.resize(img, (1280, int(h * scale)), interpolation=cv2.INTER_AREA)
-        h, w = img.shape[:2]
+    H, W = img.shape[:2]
+    
+    # 1. Resize if too big
+    if W > 1280:
+        scale = 1280 / W
+        img = cv2.resize(img, (1280, int(H * scale)), interpolation=cv2.INTER_AREA)
+        H, W = img.shape[:2]
 
-    x1, y1, x2, y2 = config.get('roi_x1', 0), config.get('roi_y1', 0), config.get('roi_x2', 0), config.get('roi_y2', 0)
-    if x2 and y2:
-        if 0 < x2 <= 1 and 0 < y2 <= 1: 
-            x1p, y1p = int(x1 * w), int(y1 * h)
-            x2p, y2p = int(x2 * w), int(y2 * h)
-        else: 
-            x1p, y1p, x2p, y2p = int(x1), int(y1), int(x2), int(y2)
-        
-        x1p, y1p = max(0, x1p), max(0, y1p)
-        x2p, y2p = min(w, x2p), min(h, y2p)
-        if x2p > x1p and y2p > y1p:
-            img = img[y1p:y2p, x1p:x2p]
+    # 2. ROI Crop
+    if use_roi:
+        x1, y1, x2, y2 = config.get('roi_x1', 0), config.get('roi_y1', 0), config.get('roi_x2', 0), config.get('roi_y2', 0)
+        if x2 and y2:
+            if 0 < x2 <= 1 and 0 < y2 <= 1: # Ratio
+                x1, y1, x2, y2 = int(x1 * W), int(y1 * H), int(x2 * W), int(y2 * H)
+            else: # Pixel
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            
+            # Padding
+            pad_x, pad_y = int(0.03 * W), int(0.03 * H)
+            x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+            x2, y2 = min(W, x2 + pad_x), min(H, y2 + pad_y)
+            
+            if x2 > x1 and y2 > y1:
+                img = img[y1:y2, x1:x2]
 
+    # 3. Red Removal (For Water Meter)
     if config.get('ignore_red', False):
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         lower_red1 = np.array([0, 70, 50]); upper_red1 = np.array([10, 255, 255])
@@ -229,30 +237,56 @@ def preprocess_image_cv(image_bytes, config):
         mask = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
         img[mask > 0] = [255, 255, 255]
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, 7, 50, 50)
-    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7)
+    # 4. Enhance Logic (Auto Detect Digital vs Analog)
+    meta = (str(config.get('type','')) + " " + str(config.get('name',''))).lower()
+    is_digital = ("digital" in meta) or (config.get('decimals', 0) > 0)
+
+    if is_digital:
+        # Digital: ใช้ Gray + CLAHE (ห้าม Threshold หนัก)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        ok, encoded = cv2.imencode(".png", gray)
+    else:
+        # Analog: ใช้ Threshold ตัดขาวดำ
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.bilateralFilter(gray, 7, 50, 50)
+        th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7)
+        ok, encoded = cv2.imencode(".png", th)
     
-    ok, encoded = cv2.imencode('.png', th)
     return encoded.tobytes() if ok else image_bytes
 
+def vision_read_text(image_bytes):
+    try:
+        image = vision.Image(content=image_bytes)
+        resp = VISION_CLIENT.text_detection(image=image)
+        if not resp.text_annotations: return ""
+        return resp.text_annotations[0].description.replace("\n", " ")
+    except: return ""
+
 def ocr_process(image_bytes, config):
-    processed_bytes = preprocess_image_cv(image_bytes, config)
     decimal_places = config.get('decimals', 0)
     keyword = config.get('keyword', '')
     expected_digits = config.get('expected_digits', 0)
 
-    image = vision.Image(content=processed_bytes)
-    response = VISION_CLIENT.text_detection(image=image)
-    texts = response.text_annotations
-    if not texts: return 0.0
+    # ✅ Pass 1: ลองอ่านแบบใช้ ROI และ Config ที่ตั้งไว้
+    p1 = preprocess_image_cv(image_bytes, config, use_roi=True)
+    raw_text = vision_read_text(p1)
 
-    raw_full_text = texts[0].description.replace('\n', ' ')
-    full_text = preprocess_text(raw_full_text)
+    # ✅ Pass 2: ถ้าอ่านไม่ออก (ROI อาจผิด) ให้ลองอ่านจาก "รูปเต็ม"
+    if not raw_text.strip():
+        # print("Pass 1 failed, trying Pass 2 (Full Image)...")
+        p2 = preprocess_image_cv(image_bytes, config, use_roi=False)
+        raw_text = vision_read_text(p2)
 
+    if not raw_text.strip(): return 0.0
+
+    full_text = preprocess_text(raw_text)
+
+    # --- Keyword Hunter ---
     if keyword:
         pattern = re.escape(keyword) + r"[^\d]*((?:\d|O|o|l|I|\|)+[\.,]?\d*)"
-        match = re.search(pattern, raw_full_text, re.IGNORECASE)
+        match = re.search(pattern, raw_text, re.IGNORECASE)
         if match:
             val_str = match.group(1).replace('O','0').replace('o','0').replace('l','1').replace('I','1').replace('|','1')
             val_str = normalize_number_str(val_str, decimal_places)
@@ -262,6 +296,7 @@ def ocr_process(image_bytes, config):
                 return float(val)
             except: pass
 
+    # --- Blacklist ---
     blacklisted = set()
     id_matches = re.finditer(r'(?i)(?:id|code|no\.?|serial|s\/n)[\D]{0,15}?(\d+(?:[\s-]+\d+)*)', full_text)
     for m in id_matches:
@@ -275,10 +310,11 @@ def ocr_process(image_bytes, config):
         except: return False
 
     candidates = []
+    # Stitcher
     analog_labels = [r'10\D?000', r'1\D?000', r'100', r'10', r'1']
     stitched_digits = {}
     for idx, label in enumerate(analog_labels):
-        m = re.search(label + r'[^\d]{0,30}\s+(\d)\b', raw_full_text)
+        m = re.search(label + r'[^\d]{0,30}\s+(\d)\b', raw_text)
         if m: stitched_digits[idx] = m.group(1)
     if len(stitched_digits) >= 2:
         sorted_keys = sorted(stitched_digits.keys())
@@ -289,6 +325,7 @@ def ocr_process(image_bytes, config):
                 candidates.append({'val': float(val), 'score': 300 + len(final_str) * 10})
         except: pass
 
+    # Standard
     clean_std = re.sub(r'\b202[0-9]\b|\b256[0-9]\b', '', full_text)
     nums = re.findall(r'-?\d+\.\d+|\d+', clean_std)
     for n_str in nums:
@@ -319,7 +356,7 @@ mode = st.sidebar.radio("🔧 เลือกโหมดการทำงา�
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
     st.markdown("### Water treatment Plant - Borthongindustrial")
-    st.caption("Version 3.0 (Cloud Storage Enabled)")
+    st.caption("Version 4.0 (Final Stable - Cloud Storage)")
 
     if 'confirm_mode' not in st.session_state: st.session_state.confirm_mode = False
     if 'warning_msg' not in st.session_state: st.session_state.warning_msg = ""
@@ -362,15 +399,16 @@ if mode == "📝 พนักงานจดมิเตอร์":
     if not st.session_state.confirm_mode:
         if st.button("🚀 ตรวจสอบและบันทึก", type="primary"):
             if img_file and point_id:
-                with st.spinner("🤖 AI กำลังอัปโหลดขึ้น Cloud Storage..."):
+                with st.spinner("🤖 AI กำลังประมวลผล + อัปโหลด..."):
                     try:
                         img_bytes = img_file.getvalue()
                         config = get_meter_config(point_id)
                         if not config: st.error("❌ ไม่พบ config"); st.stop()
 
+                        # อ่านค่า (OCR)
                         ai_val = ocr_process(img_bytes, config)
                         
-                        # ✅ ใช้ Storage Upload
+                        # อัปโหลดรูปขึ้น Cloud Storage
                         filename = f"{point_id}_{get_thai_time().strftime('%Y%m%d_%H%M%S')}.jpg"
                         image_url = upload_image_to_storage(img_bytes, filename)
 
@@ -420,8 +458,6 @@ elif mode == "👮‍♂️ Admin Approval":
                 with c_info:
                     st.subheader(f"🚩 {item.get('point_id')}")
                     st.caption(f"Inspector: {item.get('inspector')}")
-                    
-                    # ✅ แสดงรูปจาก Cloud Storage ได้เลย (Public URL)
                     img_url = item.get('image_url')
                     if img_url and img_url != '-' and img_url.startswith('http'):
                         st.image(img_url, width=220)
