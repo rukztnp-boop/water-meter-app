@@ -14,8 +14,8 @@ import string
 # =========================================================
 # --- 📦 CONFIGURATION ---
 # =========================================================
-# ✅ ชื่อ Bucket ของคุณถูกต้องแล้ว
 BUCKET_NAME = 'water-meter-images-watertreatmentplant' 
+FIXED_FOLDER_ID = '1XH4gKYb73titQLrgp4FYfLT2jzYRgUpO' 
 
 # =========================================================
 # --- 🕒 TIMEZONE HELPER ---
@@ -55,8 +55,8 @@ if 'gcp_service_account' in st.secrets:
             key_dict, 
             scopes=[
                 "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive",          # ✅ ต้องมีบรรทัดนี้ เพื่อให้หา Sheet เจอ
-                "https://www.googleapis.com/auth/cloud-platform"  # ✅ ต้องมีบรรทัดนี้ เพื่อให้อัปโหลดรูปได้
+                "https://www.googleapis.com/auth/drive",
+                "https://www.googleapis.com/auth/cloud-platform"
             ]
         )
     except Exception as e:
@@ -79,9 +79,7 @@ def upload_image_to_storage(image_bytes, file_name):
     try:
         bucket = STORAGE_CLIENT.bucket(BUCKET_NAME)
         blob = bucket.blob(file_name)
-        # อัปโหลดไฟล์ขึ้น Cloud Storage
         blob.upload_from_string(image_bytes, content_type='image/jpeg')
-        # คืนค่า Public Link
         return blob.public_url
     except Exception as e:
         return f"Error: {e}"
@@ -129,6 +127,10 @@ def safe_float(x, default=0.0):
     try: return float(x) if x and str(x).strip() else default
     except: return default
 
+def parse_bool(v):
+    if v is None: return False
+    return str(v).strip().lower() in ("true", "1", "yes", "y", "t")
+
 def get_meter_config(point_id):
     try:
         records = load_points_master()
@@ -141,12 +143,12 @@ def get_meter_config(point_id):
                 if exp == 0: exp = safe_int(item.get('int_digits'), 0)
                 item['expected_digits'] = exp
                 item['report_col'] = str(item.get('report_col', '')).strip()
-                item['ignore_red'] = str(item.get('ignore_red', '')).strip().lower() == 'true'
+                item['ignore_red'] = parse_bool(item.get('ignore_red'))
                 item['roi_x1'] = safe_float(item.get('roi_x1'), 0.0)
                 item['roi_y1'] = safe_float(item.get('roi_y1'), 0.0)
                 item['roi_x2'] = safe_float(item.get('roi_x2'), 0.0)
                 item['roi_y2'] = safe_float(item.get('roi_y2'), 0.0)
-                # เพิ่ม type/name เพื่อเช็ค Digital
+                # Ensure type/name exist for digital detection
                 item['type'] = str(item.get('type', '')).strip()
                 item['name'] = str(item.get('name', '')).strip()
                 return item
@@ -177,7 +179,7 @@ def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, imag
     except: return False
 
 # =========================================================
-# --- 🧠 OCR ENGINE (Smart ROI + 2-Pass) ---
+# --- 🧠 OCR ENGINE (Smart 3-Pass Strategy) ---
 # =========================================================
 def normalize_number_str(s: str, decimals: int = 0) -> str:
     if not s: return ""
@@ -199,37 +201,35 @@ def preprocess_text(text):
     text = re.sub(r'(?<=[\d\s])[Oo](?=[\d\s])', '0', text)
     return text
 
-def preprocess_image_cv(image_bytes, config, use_roi=True):
+def is_digital_meter(config):
+    blob = f"{config.get('type','')} {config.get('name','')}".lower()
+    return ("digital" in blob) or ("scada" in blob) or ("electric" in blob)
+
+def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None: return image_bytes
     
     H, W = img.shape[:2]
-    
-    # 1. Resize if too big
     if W > 1280:
         scale = 1280 / W
         img = cv2.resize(img, (1280, int(H * scale)), interpolation=cv2.INTER_AREA)
         H, W = img.shape[:2]
 
-    # 2. ROI Crop
     if use_roi:
         x1, y1, x2, y2 = config.get('roi_x1', 0), config.get('roi_y1', 0), config.get('roi_x2', 0), config.get('roi_y2', 0)
         if x2 and y2:
-            if 0 < x2 <= 1 and 0 < y2 <= 1: # Ratio
+            if 0 < x2 <= 1 and 0 < y2 <= 1:
                 x1, y1, x2, y2 = int(x1 * W), int(y1 * H), int(x2 * W), int(y2 * H)
-            else: # Pixel
+            else:
                 x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
             
-            # Padding
             pad_x, pad_y = int(0.03 * W), int(0.03 * H)
             x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
             x2, y2 = min(W, x2 + pad_x), min(H, y2 + pad_y)
-            
             if x2 > x1 and y2 > y1:
                 img = img[y1:y2, x1:x2]
 
-    # 3. Red Removal (For Water Meter)
     if config.get('ignore_red', False):
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         lower_red1 = np.array([0, 70, 50]); upper_red1 = np.array([10, 255, 255])
@@ -237,84 +237,95 @@ def preprocess_image_cv(image_bytes, config, use_roi=True):
         mask = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
         img[mask > 0] = [255, 255, 255]
 
-    # 4. Enhance Logic (Auto Detect Digital vs Analog)
-    meta = (str(config.get('type','')) + " " + str(config.get('name',''))).lower()
-    is_digital = ("digital" in meta) or (config.get('decimals', 0) > 0)
+    if variant == "raw":
+        ok, encoded = cv2.imencode(".jpg", img)
+        return encoded.tobytes() if ok else image_bytes
 
-    if is_digital:
-        # Digital: ใช้ Gray + CLAHE (ห้าม Threshold หนัก)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Logic: Auto or Soft (for Digital/Difficult images)
+    if variant == "soft" or (variant == "auto" and is_digital_meter(config)):
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        gray = clahe.apply(gray)
-        ok, encoded = cv2.imencode(".png", gray)
+        g = clahe.apply(gray)
+        blur = cv2.GaussianBlur(g, (0, 0), 1.0)
+        # Unsharp Masking: เพิ่มความคมชัดขอบตัวเลข
+        sharp = cv2.addWeighted(g, 1.7, blur, -0.7, 0)
+        ok, encoded = cv2.imencode(".png", sharp)
     else:
-        # Analog: ใช้ Threshold ตัดขาวดำ
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # Analog: Thresholding
         gray = cv2.bilateralFilter(gray, 7, 50, 50)
         th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7)
         ok, encoded = cv2.imencode(".png", th)
     
     return encoded.tobytes() if ok else image_bytes
 
-def vision_read_text(image_bytes):
+def _vision_read_text(processed_bytes):
     try:
-        image = vision.Image(content=image_bytes)
-        resp = VISION_CLIENT.text_detection(image=image)
-        if not resp.text_annotations: return ""
-        return resp.text_annotations[0].description.replace("\n", " ")
+        image = vision.Image(content=processed_bytes)
+        response = VISION_CLIENT.text_detection(image=image)
+        if not response.text_annotations: return ""
+        return response.text_annotations[0].description or ""
     except: return ""
 
 def ocr_process(image_bytes, config):
-    decimal_places = config.get('decimals', 0)
-    keyword = config.get('keyword', '')
-    expected_digits = config.get('expected_digits', 0)
+    decimal_places = int(config.get('decimals', 0) or 0)
+    keyword = str(config.get('keyword', '') or '').strip()
+    expected_digits = int(config.get('expected_digits', 0) or 0)
 
-    # ✅ Pass 1: ลองอ่านแบบใช้ ROI และ Config ที่ตั้งไว้
-    p1 = preprocess_image_cv(image_bytes, config, use_roi=True)
-    raw_text = vision_read_text(p1)
+    # ✅ Pass 1: Standard (ROI + Auto)
+    processed_bytes = preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto")
+    raw_full_text = _vision_read_text(processed_bytes)
 
-    # ✅ Pass 2: ถ้าอ่านไม่ออก (ROI อาจผิด) ให้ลองอ่านจาก "รูปเต็ม"
-    if not raw_text.strip():
-        # print("Pass 1 failed, trying Pass 2 (Full Image)...")
-        p2 = preprocess_image_cv(image_bytes, config, use_roi=False)
-        raw_text = vision_read_text(p2)
+    # ✅ Pass 2: Soft Mode (ROI + Sharpness) - ช่วยจอ LCD จางๆ
+    if not raw_full_text:
+        processed_bytes = preprocess_image_cv(image_bytes, config, use_roi=True, variant="soft")
+        raw_full_text = _vision_read_text(processed_bytes)
 
-    if not raw_text.strip(): return 0.0
+    # ✅ Pass 3: Full Image (No ROI + Soft) - กันเหนียวถ้า ROI ผิด
+    has_roi = bool(config.get('roi_x2', 0)) and bool(config.get('roi_y2', 0))
+    if not raw_full_text and has_roi:
+        processed_bytes = preprocess_image_cv(image_bytes, config, use_roi=False, variant="soft")
+        raw_full_text = _vision_read_text(processed_bytes)
 
-    full_text = preprocess_text(raw_text)
+    if not raw_full_text: return 0.0
 
-    # --- Keyword Hunter ---
+    raw_full_text = raw_full_text.replace("\n", " ")
+    full_text = preprocess_text(raw_full_text)
+
+    # Keyword Hunter
     if keyword:
-        pattern = re.escape(keyword) + r"[^\d]*((?:\d|O|o|l|I|\|)+[\.,]?\d*)"
-        match = re.search(pattern, raw_text, re.IGNORECASE)
-        if match:
-            val_str = match.group(1).replace('O','0').replace('o','0').replace('l','1').replace('I','1').replace('|','1')
-            val_str = normalize_number_str(val_str, decimal_places)
-            try: 
-                val = float(val_str)
-                if decimal_places > 0 and '.' not in val_str: val = val / (10 ** decimal_places)
-                return float(val)
-            except: pass
+        kw = re.escape(keyword)
+        patterns = [kw + r"[^\d]*((?:\d|O|o|l|I|\|)+[\.,]?\d*)", r"((?:\d|O|o|l|I|\|)+[\.,]?\d*)[^\d]*" + kw]
+        for pat in patterns:
+            match = re.search(pat, raw_full_text, re.IGNORECASE)
+            if match:
+                val_str = match.group(1).replace("O", "0").replace("o", "0").replace("l", "1").replace("I", "1").replace("|", "1")
+                val_str = normalize_number_str(val_str, decimal_places)
+                try:
+                    val = float(val_str)
+                    if decimal_places > 0 and "." not in val_str: val = val / (10 ** decimal_places)
+                    return float(val)
+                except: pass
 
-    # --- Blacklist ---
+    # Blacklist
     blacklisted = set()
-    id_matches = re.finditer(r'(?i)(?:id|code|no\.?|serial|s\/n)[\D]{0,15}?(\d+(?:[\s-]+\d+)*)', full_text)
+    id_matches = re.finditer(r"(?i)(?:id|code|no\.?|serial|s\/n)[\D]{0,15}?(\d+(?:[\s-]+\d+)*)", full_text)
     for m in id_matches:
-        for p in re.split(r'[\s-]+', m.group(1)):
+        for p in re.split(r"[\s-]+", m.group(1)):
             try: blacklisted.add(float(p))
             except: pass
 
     def check_digits(val):
         if expected_digits == 0: return True
-        try: return len(str(int(val))) in (expected_digits, expected_digits - 1)
+        try: return len(str(int(float(val)))) in (expected_digits, expected_digits - 1)
         except: return False
 
     candidates = []
     # Stitcher
-    analog_labels = [r'10\D?000', r'1\D?000', r'100', r'10', r'1']
+    analog_labels = [r"10\D?000", r"1\D?000", r"100", r"10", r"1"]
     stitched_digits = {}
     for idx, label in enumerate(analog_labels):
-        m = re.search(label + r'[^\d]{0,30}\s+(\d)\b', raw_text)
+        m = re.search(label + r"[^\d]{0,30}\s+(\d)\b", raw_full_text)
         if m: stitched_digits[idx] = m.group(1)
     if len(stitched_digits) >= 2:
         sorted_keys = sorted(stitched_digits.keys())
@@ -322,26 +333,26 @@ def ocr_process(image_bytes, config):
         try:
             val = float(final_str)
             if val not in blacklisted and check_digits(val):
-                candidates.append({'val': float(val), 'score': 300 + len(final_str) * 10})
+                candidates.append({"val": float(val), "score": 300 + len(final_str) * 10})
         except: pass
 
     # Standard
-    clean_std = re.sub(r'\b202[0-9]\b|\b256[0-9]\b', '', full_text)
-    nums = re.findall(r'-?\d+\.\d+|\d+', clean_std)
+    clean_std = re.sub(r"\b202[0-9]\b|\b256[0-9]\b", "", full_text)
+    nums = re.findall(r"-?\d+\.\d+|\d+", clean_std)
     for n_str in nums:
         n_str2 = normalize_number_str(n_str, decimal_places)
         if not n_str2: continue
         try:
-            val = float(n_str2) if '.' in n_str2 else int(n_str2)
-            if decimal_places > 0 and '.' not in n_str2: val = float(val) / (10 ** decimal_places)
+            val = float(n_str2) if "." in n_str2 else float(int(n_str2))
+            if decimal_places > 0 and "." not in n_str2: val = val / (10 ** decimal_places)
             if val in blacklisted: continue
             if not check_digits(val): continue
             score = 100
-            if decimal_places > 0 and isinstance(val, float) and '.' in n_str2: score += 30
-            candidates.append({'val': float(val), 'score': score})
+            if decimal_places > 0 and "." in n_str2: score += 30
+            candidates.append({"val": float(val), "score": score})
         except: continue
 
-    if candidates: return float(max(candidates, key=lambda x: x['score'])['val'])
+    if candidates: return float(max(candidates, key=lambda x: x["score"])["val"])
     return 0.0
 
 def calc_tolerance(decimals: int) -> float:
@@ -356,7 +367,7 @@ mode = st.sidebar.radio("🔧 เลือกโหมดการทำงา�
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
     st.markdown("### Water treatment Plant - Borthongindustrial")
-    st.caption("Version 4.0 (Final Stable - Cloud Storage)")
+    st.caption("Version 5.0 (Enhanced 3-Pass OCR)")
 
     if 'confirm_mode' not in st.session_state: st.session_state.confirm_mode = False
     if 'warning_msg' not in st.session_state: st.session_state.warning_msg = ""
@@ -399,13 +410,13 @@ if mode == "📝 พนักงานจดมิเตอร์":
     if not st.session_state.confirm_mode:
         if st.button("🚀 ตรวจสอบและบันทึก", type="primary"):
             if img_file and point_id:
-                with st.spinner("🤖 AI กำลังประมวลผล + อัปโหลด..."):
+                with st.spinner("🤖 AI กำลังประมวลผล (3-Pass Strategy)..."):
                     try:
                         img_bytes = img_file.getvalue()
                         config = get_meter_config(point_id)
                         if not config: st.error("❌ ไม่พบ config"); st.stop()
 
-                        # อ่านค่า (OCR)
+                        # อ่านค่า (3 รอบ)
                         ai_val = ocr_process(img_bytes, config)
                         
                         # อัปโหลดรูปขึ้น Cloud Storage
@@ -462,7 +473,7 @@ elif mode == "👮‍♂️ Admin Approval":
                     if img_url and img_url != '-' and img_url.startswith('http'):
                         st.image(img_url, width=220)
                     else:
-                        st.warning("No Image or Invalid URL")
+                        st.warning("No Image")
 
                 with c_val:
                     m_val = safe_float(item.get('Manual_Value'), 0.0)
