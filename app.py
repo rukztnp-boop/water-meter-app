@@ -179,7 +179,7 @@ def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, imag
     except: return False
 
 # =========================================================
-# --- 🧠 OCR ENGINE (Smart 3-Pass Strategy) ---
+# --- 🧠 OCR ENGINE (Smart 3-Pass Strategy + Unsharp Mask) ---
 # =========================================================
 def normalize_number_str(s: str, decimals: int = 0) -> str:
     if not s: return ""
@@ -237,6 +237,7 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
         mask = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
         img[mask > 0] = [255, 255, 255]
 
+    # Mode: Raw (for debugging or special cases)
     if variant == "raw":
         ok, encoded = cv2.imencode(".jpg", img)
         return encoded.tobytes() if ok else image_bytes
@@ -244,6 +245,7 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     # Logic: Auto or Soft (for Digital/Difficult images)
+    # ✅ ปรับปรุง: ใช้ Unsharp Mask เพื่อให้อ่านจอ LCD ได้ดีขึ้น
     if variant == "soft" or (variant == "auto" and is_digital_meter(config)):
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         g = clahe.apply(gray)
@@ -252,7 +254,7 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
         sharp = cv2.addWeighted(g, 1.7, blur, -0.7, 0)
         ok, encoded = cv2.imencode(".png", sharp)
     else:
-        # Analog: Thresholding
+        # Analog: Thresholding (ดีกับมิเตอร์หมุน)
         gray = cv2.bilateralFilter(gray, 7, 50, 50)
         th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7)
         ok, encoded = cv2.imencode(".png", th)
@@ -276,7 +278,7 @@ def ocr_process(image_bytes, config):
     processed_bytes = preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto")
     raw_full_text = _vision_read_text(processed_bytes)
 
-    # ✅ Pass 2: Soft Mode (ROI + Sharpness) - ช่วยจอ LCD จางๆ
+    # ✅ Pass 2: Soft Mode (ROI + Sharpness) - ไม้ตายสำหรับจอ LCD จางๆ
     if not raw_full_text:
         processed_bytes = preprocess_image_cv(image_bytes, config, use_roi=True, variant="soft")
         raw_full_text = _vision_read_text(processed_bytes)
@@ -367,7 +369,6 @@ mode = st.sidebar.radio("🔧 เลือกโหมดการทำงา�
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
     st.markdown("### Water treatment Plant - Borthongindustrial")
-    st.caption("Version 5.0 (Enhanced 3-Pass OCR)")
 
     if 'confirm_mode' not in st.session_state: st.session_state.confirm_mode = False
     if 'warning_msg' not in st.session_state: st.session_state.warning_msg = ""
@@ -478,7 +479,15 @@ elif mode == "👮‍♂️ Admin Approval":
                 with c_val:
                     m_val = safe_float(item.get('Manual_Value'), 0.0)
                     a_val = safe_float(item.get('AI_Value'), 0.0)
-                    choice = st.radio("เลือกค่า:", [m_val, a_val], key=f"rad_{i}")
+                    
+                    # ✅ ส่วนที่ผมแก้ไขให้: ใส่ Mapping ให้ Admin ดูง่าย
+                    options_map = {
+                        f"👤 คนจด: {m_val}": m_val,
+                        f"🤖 AI: {a_val}": a_val
+                    }
+                    selected_label = st.radio("เลือกค่าที่ถูกต้อง:", list(options_map.keys()), key=f"rad_{i}")
+                    choice = options_map[selected_label]
+
                 with c_act:
                     st.write("")
                     if st.button("✅ อนุมัติ", key=f"btn_{i}", type="primary"):
