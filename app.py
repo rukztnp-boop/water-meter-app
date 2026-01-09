@@ -15,7 +15,6 @@ import string
 # =========================================================
 # --- 📁 CONFIGURATION (FOLDER ID) ---
 # =========================================================
-# ✅ ใส่ ID ของคุณเพื่อแก้ปัญหา Drive Quota เต็ม
 FIXED_FOLDER_ID = '1XH4gKYb73titQLrgp4FYfLT2jzYRgUpO' 
 
 # =========================================================
@@ -73,25 +72,35 @@ REAL_REPORT_SHEET = 'TEST waterreport'
 VISION_CLIENT = vision.ImageAnnotatorClient(credentials=creds)
 
 # =========================================================
-# --- GOOGLE DRIVE HELPERS (FIXED) ---
+# --- GOOGLE DRIVE HELPERS ---
 # =========================================================
 def upload_image_to_drive(image_bytes, file_name):
     try:
         drive_service = build('drive', 'v3', credentials=creds)
-        
-        # ✅ ใช้ FIXED_FOLDER_ID โดยตรง (แก้ปัญหา Quota)
         file_metadata = {'name': file_name, 'parents': [FIXED_FOLDER_ID]}
-        
         media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype='image/jpeg')
         file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
         
-        # เปิดสิทธิ์ให้ใครก็ได้ที่มีลิงก์ดูรูปได้
         permission = {'type': 'anyone', 'role': 'reader'}
         drive_service.permissions().create(fileId=file.get('id'), body=permission).execute()
         
         return file.get('webViewLink')
     except Exception as e:
         return f"Error: {e}"
+
+def convert_drive_url(url):
+    """แปลง Google Drive Link (WebView) ให้เป็น Direct Image Link"""
+    if not url or url == '-': return None
+    # ดึง File ID ออกมาจาก URL
+    # รูปแบบ: https://drive.google.com/file/d/FILE_ID/view...
+    try:
+        if '/d/' in url:
+            file_id = url.split('/d/')[1].split('/')[0]
+            # ใช้ URL แบบ Thumbnail เพื่อให้โหลดเร็วและแสดงผลชัวร์
+            return f"https://drive.google.com/thumbnail?id={file_id}&sz=w800"
+    except:
+        pass
+    return url
 
 # =========================================================
 # --- SHEET HELPERS ---
@@ -105,7 +114,7 @@ def col_to_index(col_str):
 
 def get_thai_sheet_name(sh):
     thai_months = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
-    now = get_thai_time() # ✅ Use Thai Time
+    now = get_thai_time()
     m_idx = now.month - 1
     yy = str(now.year + 543)[-2:] 
     patterns = [f"{thai_months[m_idx]}{yy}", f"{thai_months[m_idx][:-1]}{yy}", f"{thai_months[m_idx]} {yy}", f"{thai_months[m_idx][:-1]} {yy}"]
@@ -163,7 +172,7 @@ def export_to_real_report(point_id, read_value, inspector, report_col):
         sh = gc.open(REAL_REPORT_SHEET)
         sheet_name = get_thai_sheet_name(sh)
         ws = sh.worksheet(sheet_name) if sheet_name else sh.get_worksheet(0)
-        today_day = get_thai_time().day # ✅ Use Thai Time
+        today_day = get_thai_time().day
         target_row = find_day_row_exact(ws, today_day) or (6 + today_day) 
         target_col = col_to_index(report_col)
         if target_col == 0: return False
@@ -208,14 +217,12 @@ def preprocess_image_cv(image_bytes, config):
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None: return image_bytes
     
-    # ✅ 1. Resize if too big (for performance)
     h, w = img.shape[:2]
     if w > 1280:
         scale = 1280 / w
         img = cv2.resize(img, (1280, int(h * scale)), interpolation=cv2.INTER_AREA)
-        h, w = img.shape[:2] # Update dimensions
+        h, w = img.shape[:2]
 
-    # ✅ 2. ROI Crop
     x1, y1, x2, y2 = config.get('roi_x1', 0), config.get('roi_y1', 0), config.get('roi_x2', 0), config.get('roi_y2', 0)
     if x2 and y2:
         if 0 < x2 <= 1 and 0 < y2 <= 1: # Ratio
@@ -229,7 +236,6 @@ def preprocess_image_cv(image_bytes, config):
         if x2p > x1p and y2p > y1p:
             img = img[y1p:y2p, x1p:x2p]
 
-    # ✅ 3. Red Removal
     if config.get('ignore_red', False):
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         lower_red1 = np.array([0, 70, 50]); upper_red1 = np.array([10, 255, 255])
@@ -237,7 +243,6 @@ def preprocess_image_cv(image_bytes, config):
         mask = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
         img[mask > 0] = [255, 255, 255]
 
-    # ✅ 4. Enhance
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.bilateralFilter(gray, 7, 50, 50)
     th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7)
@@ -259,7 +264,6 @@ def ocr_process(image_bytes, config):
     raw_full_text = texts[0].description.replace('\n', ' ')
     full_text = preprocess_text(raw_full_text)
 
-    # Keyword Hunter
     if keyword:
         pattern = re.escape(keyword) + r"[^\d]*((?:\d|O|o|l|I|\|)+[\.,]?\d*)"
         match = re.search(pattern, raw_full_text, re.IGNORECASE)
@@ -272,7 +276,6 @@ def ocr_process(image_bytes, config):
                 return float(val)
             except: pass
 
-    # Blacklist & Checkers
     blacklisted = set()
     id_matches = re.finditer(r'(?i)(?:id|code|no\.?|serial|s\/n)[\D]{0,15}?(\d+(?:[\s-]+\d+)*)', full_text)
     for m in id_matches:
@@ -286,7 +289,6 @@ def ocr_process(image_bytes, config):
         except: return False
 
     candidates = []
-    # Stitcher
     analog_labels = [r'10\D?000', r'1\D?000', r'100', r'10', r'1']
     stitched_digits = {}
     for idx, label in enumerate(analog_labels):
@@ -301,7 +303,6 @@ def ocr_process(image_bytes, config):
                 candidates.append({'val': float(val), 'score': 300 + len(final_str) * 10})
         except: pass
 
-    # Loose Stitcher & Standard
     clean_std = re.sub(r'\b202[0-9]\b|\b256[0-9]\b', '', full_text)
     nums = re.findall(r'-?\d+\.\d+|\d+', clean_std)
     for n_str in nums:
@@ -332,7 +333,7 @@ mode = st.sidebar.radio("🔧 เลือกโหมดการทำงา�
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
     st.markdown("### Water treatment Plant - Borthongindustrial")
-    st.caption("Version 2.3 (Final Drive Fix + Thai Time)")
+    st.caption("Version 2.4 (Fix Image Display)")
 
     if 'confirm_mode' not in st.session_state: st.session_state.confirm_mode = False
     if 'warning_msg' not in st.session_state: st.session_state.warning_msg = ""
@@ -431,8 +432,16 @@ elif mode == "👮‍♂️ Admin Approval":
                 with c_info:
                     st.subheader(f"🚩 {item.get('point_id')}")
                     st.caption(f"Inspector: {item.get('inspector')}")
-                    if item.get('image_url') and item.get('image_url') != '-':
-                        st.image(item.get('image_url'), width=220)
+                    
+                    # ✅ แก้ไขตรงนี้: แปลงลิงก์ก่อนแสดงผล
+                    img_url = item.get('image_url')
+                    if img_url and img_url != '-':
+                        direct_url = convert_drive_url(img_url)
+                        if direct_url:
+                            st.image(direct_url, width=220)
+                        else:
+                            st.warning("รูปภาพไม่สามารถแสดงได้")
+
                 with c_val:
                     m_val = safe_float(item.get('Manual_Value'), 0.0)
                     a_val = safe_float(item.get('AI_Value'), 0.0)
