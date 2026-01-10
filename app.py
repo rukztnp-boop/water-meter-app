@@ -358,7 +358,7 @@ def ocr_process(image_bytes, config, debug=False):
 
     clean_std = re.sub(r"\b202[0-9]\b|\b256[0-9]\b", "", full_text)
     clean_std = re.sub(r"\.{2,}", ".", clean_std)
-    for m in re.finditer(r"-?\d+(?:\.\d+)?", clean_std):
+    for m in re.finditer(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?", clean_std):
         n_str = m.group(0)
         if looks_like_spec_context(raw_full_text, m.start(), m.end()): continue
         n_str2 = normalize_number_str(n_str, decimal_places)
