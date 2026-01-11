@@ -568,86 +568,76 @@ if mode == "📝 พนักงานจดมิเตอร์":
 
     img_file = img_cam if img_cam is not None else img_up
 
-# -------------------------------
-# ✅ AI เสนอค่า → คนติ๊ก/แก้เอง → บันทึกเลย
-# -------------------------------
-# เตรียม session สำหรับเก็บค่า AI
-if "ai_suggest" not in st.session_state:
-    st.session_state.ai_suggest = None
-
-# ปุ่มให้ AI อ่านค่า (แยกจากปุ่มบันทึก เพื่อไม่ให้ OCR รันทุกครั้ง)
-if st.button("🤖 ให้ AI อ่านค่า", type="primary", disabled=(img_file is None or not point_id)):
-    try:
-        img_bytes = img_file.getvalue()
-        config = get_meter_config(point_id)
-        if not config:
-            st.error("❌ ไม่พบ config ของจุดนี้")
-        else:
-            ai_val = ocr_process(img_bytes, config, debug=False)
-            st.session_state.ai_suggest = float(ai_val)
-    except Exception as e:
-        st.error(f"❌ อ่านค่าไม่สำเร็จ: {e}")
-
-# ถ้ามีค่า AI แล้ว → ให้คนยืนยัน/แก้
-if st.session_state.ai_suggest is not None:
-    config = get_meter_config(point_id)
-    decimals = int(config.get("decimals", 0) or 0)
-    step = 1.0 if decimals == 0 else (0.1 if decimals == 1 else 0.01)
-    fmt  = "%.0f" if decimals == 0 else ("%.1f" if decimals == 1 else "%.2f")
-
-    ai_val = float(st.session_state.ai_suggest)
-
     st.write("---")
-    st.subheader("ผลที่ AI อ่านได้")
 
-    # ถ้า AI อ่านเป็น 0.0 ให้ default เป็น “ไม่ถูก” เพื่อกันกดผิด
-    default_correct = False if ai_val == 0.0 else True
+    # ====== เดิมของคุณ: confirm_mode ======
+    if not st.session_state.confirm_mode:
+        if st.button("🚀 ตรวจสอบและบันทึก", type="primary"):
+            if img_file and point_id:
+                with st.spinner(f"🤖 กำลังบันทึกข้อมูลของวันที่ {selected_date}..."):
+                    try:
+                        img_bytes = img_file.getvalue()
 
-    is_correct = st.checkbox(f"✅ AI อ่านถูกต้อง ({ai_val:{fmt}})", value=default_correct)
+                        ai_val = ocr_process(img_bytes, config, debug=False)
 
-    if is_correct:
-        final_val = ai_val
-        status = "CONFIRMED_AI"
-        st.success(f"ค่าที่จะบันทึก: {final_val:{fmt}}")
-    else:
-        manual_val = st.number_input("✍️ กรอกค่าที่ถูกต้อง", min_value=0.0, step=step, format=fmt)
-        final_val = float(manual_val)
-        status = "CONFIRMED_MANUAL"
-        st.info(f"ค่าที่จะบันทึก: {final_val:{fmt}}")
+                        filename = f"{point_id}_{selected_date.strftime('%Y%m%d')}_{get_thai_time().strftime('%H%M%S')}.jpg"
+                        image_url = upload_image_to_storage(img_bytes, filename)
 
-    col_save, col_reset = st.columns(2)
+                        tol = calc_tolerance(config.get('decimals', 0))
+                        if abs(manual_val - ai_val) <= tol:
+                            if save_to_db(point_id, inspector, meter_type, manual_val, ai_val, "VERIFIED", selected_date, image_url):
+                                export_to_real_report(point_id, manual_val, inspector, report_col, selected_date)
+                                st.balloons()
+                                st.success(f"✅ บันทึกสำเร็จ! (วันที่: {selected_date})")
+                                st.info(f"AI: {ai_val} | Manual: {manual_val}")
+                            else:
+                                st.error("Save Failed")
+                        else:
+                            st.session_state.confirm_mode = True
+                            st.session_state.warning_msg = f"ไม่ตรงกัน! กรอก {manual_val} / AI {ai_val}"
 
-    # บันทึกเลย (ไม่ต้องรอ Admin)
-    if col_save.button("💾 บันทึกค่าเลย", type="primary", use_container_width=True):
-        try:
-            img_bytes = img_file.getvalue()
+                            st.session_state.last_manual_val = manual_val
+                            st.session_state.last_ai_val = ai_val
+                            st.session_state.last_img_url = image_url
+                            st.session_state.last_selected_date = selected_date
+                            st.session_state.last_meter_type = meter_type
+                            st.session_state.last_point_id = point_id
+                            st.session_state.last_report_col = report_col
 
-            filename = f"{point_id}_{selected_date.strftime('%Y%m%d')}_{get_thai_time().strftime('%H%M%S')}.jpg"
-            image_url = upload_image_to_storage(img_bytes, filename)
-
-            meter_type = "Water" if "ประปา" in cat_select else "Electric"
-
-            # ✅ บันทึก final_val เป็น Manual_Value เพื่อถือว่าเป็นค่าจริง
-            # ✅ เก็บ ai_val ไว้ใน AI_Value เพื่อย้อนดูได้
-            ok = save_to_db(point_id, inspector, meter_type, final_val, ai_val, status, selected_date, image_url)
-
-            if ok:
-                export_to_real_report(point_id, final_val, inspector, report_col, selected_date)
-                st.balloons()
-                st.success(f"✅ บันทึกสำเร็จ! (วันที่: {selected_date})")
-                # เคลียร์ค่า AI เพื่อเริ่มจุดถัดไป
-                st.session_state.ai_suggest = None
-                st.rerun()
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
             else:
-                st.error("❌ Save Failed")
-        except Exception as e:
-            st.error(f"❌ บันทึกไม่สำเร็จ: {e}")
+                st.warning("⚠️ กรุณาถ่ายรูปก่อนบันทึก")
+    else:
+        st.markdown(
+            f"""<div class="status-box status-warning"><h4>⚠️ {st.session_state.warning_msg}</h4></div>""",
+            unsafe_allow_html=True
+        )
+        col_conf1, col_conf2 = st.columns(2)
 
-    # ปุ่มเริ่มใหม่ (กรณีถ่ายรูปผิด/อยากอ่านใหม่)
-    if col_reset.button("🔁 อ่านใหม่ / เปลี่ยนรูป", use_container_width=True):
-        st.session_state.ai_suggest = None
-        st.rerun()
+        if col_conf1.button("✅ ยืนยัน (ส่งให้ Admin)", use_container_width=True):
+            target_date = st.session_state.get('last_selected_date', get_thai_time().date())
+            pid = st.session_state.get('last_point_id', point_id)
+            mt = st.session_state.get('last_meter_type', meter_type)
 
+            save_to_db(
+                pid, inspector, mt,
+                st.session_state.last_manual_val,
+                st.session_state.last_ai_val,
+                "FLAGGED",
+                target_date,
+                st.session_state.last_img_url
+            )
+            st.success("✅ ส่งเรื่องแล้ว")
+            st.session_state.confirm_mode = False
+            st.rerun()
+
+        if col_conf2.button("❌ แก้ไข", use_container_width=True):
+            st.session_state.confirm_mode = False
+            # กลับไปหน้า INPUT จุดเดิม
+            st.session_state.emp_step = "INPUT"
+            st.rerun()
 
 
 elif mode == "👮‍♂️ Admin Approval":
