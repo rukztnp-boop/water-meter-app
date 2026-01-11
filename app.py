@@ -430,10 +430,20 @@ if mode == "📝 พนักงานจดมิเตอร์":
         manual_val = st.number_input("👁️ ค่าจริง", min_value=0.0, step=0.1, format="%.2f")
 
     tab_cam, tab_up = st.tabs(["📷 ถ่ายรูป", "📂 อัปโหลด"])
-    img_file = tab_cam.camera_input("ถ่ายภาพมิเตอร์")
-    if not img_file: img_file = tab_up.file_uploader("เลือกรูปภาพ", type=['jpg', 'png', 'jpeg'])
 
-    st.write("---")
+     with tab_cam:
+         cam_file = st.camera_input("ถ่ายภาพมิเตอร์")
+         if cam_file is not None:
+             st.image(cam_file, caption="รูปที่ถ่าย", use_container_width=True)
+
+     with tab_up:
+           up_file = st.file_uploader("เลือกรูปภาพ", type=["jpg", "jpeg", "png"])
+         if up_file is not None:
+             st.image(up_file, caption=f"รูปที่เลือก: {up_file.name}", use_container_width=True)
+
+     img_file = cam_file or up_file
+
+     st.write("---")
 
     if not st.session_state.confirm_mode:
         if st.button("🚀 ตรวจสอบและบันทึก", type="primary"):
