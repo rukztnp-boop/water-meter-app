@@ -163,40 +163,66 @@ def get_meter_config(point_id):
         return None
     except: return None
 
-# ✅ แก้ไข: รับ target_date เพื่อลงให้ถูกวัน
-def export_to_real_report(point_id, read_value, inspector, report_col, target_date):
-    if not report_col: return False
+def ensure_dailyreadings_columns(ws):
+    """Ensure extra columns exist on DailyReadings for PointID confidence tracking."""
     try:
-        sh = gc.open(REAL_REPORT_SHEET)
-        # หา Sheet ตามเดือนของวันที่เลือก
-        sheet_name = get_thai_sheet_name(sh, target_date)
-        ws = sh.worksheet(sheet_name) if sheet_name else sh.get_worksheet(0)
-        
-        # ใช้วันที่ที่เลือก (day) หาแถว
-        target_day = target_date.day
-        target_row = find_day_row_exact(ws, target_day) or (6 + target_day)
-        
-        target_col = col_to_index(report_col)
-        if target_col == 0: return False
-        
-        ws.update_cell(target_row, target_col, read_value)
-        return True
-    except: return False
+        header = ws.row_values(1)
+        if not header:
+            header = ["timestamp","Type","point_id","inspector","Manual_Value","AI_Value","Status","Image_URL"]
+            ws.update("A1", [header])
+        needed = ["AI_PointID", "PointID_Confidence"]
+        missing = [c for c in needed if c not in header]
+        if missing:
+            new_header = header + missing
+            ws.update("A1", [new_header])
+            return new_header
+        return header
+    except Exception:
+        return None
 
-# ✅ แก้ไข: รับ target_date เพื่อลง Timestamp ให้ถูกวัน
-def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, target_date, image_url="-"):
+# ✅ แก้ไข: รับ target_date เพื่อลง Timestamp ให้ถูกวัน + เก็บ AI_PointID/Confidence ถ้ามีคอลัมน์
+def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, target_date, image_url="-", ai_point_id=None, pid_confidence=None):
     try:
         sh = gc.open(DB_SHEET_NAME)
         ws = sh.worksheet("DailyReadings")
-        
+
+        header = ensure_dailyreadings_columns(ws) or ws.row_values(1)
         # สร้าง Timestamp: วันที่เลือก + เวลาปัจจุบัน (เพื่อให้รู้ว่าคีย์ตอนกี่โมง แต่วันที่เป็นของวันที่เลือก)
         current_time = get_thai_time().time()
         record_timestamp = datetime.combine(target_date, current_time)
-        
-        row = [record_timestamp.strftime("%Y-%m-%d %H:%M:%S"), meter_type, point_id, inspector, manual_val, ai_val, status, image_url]
+
+        # map col name -> index
+        col_map = {str(h).strip(): i for i, h in enumerate(header, start=1)}
+
+        def _set(row, col_name, value):
+            if col_name in col_map:
+                row[col_map[col_name]-1] = value
+
+        row = [""] * len(header)
+        _set(row, "timestamp", record_timestamp.strftime("%Y-%m-%d %H:%M:%S"))
+        _set(row, "Timestamp", record_timestamp.strftime("%Y-%m-%d %H:%M:%S"))
+        _set(row, "Type", meter_type)
+        _set(row, "point_id", point_id)
+        _set(row, "PointID", point_id)
+        _set(row, "inspector", inspector)
+        _set(row, "Inspector", inspector)
+        _set(row, "Manual_Value", manual_val)
+        _set(row, "manual_val", manual_val)
+        _set(row, "AI_Value", ai_val)
+        _set(row, "ai_val", ai_val)
+        _set(row, "Status", status)
+        _set(row, "Image_URL", image_url)
+        _set(row, "image_url", image_url)
+
+        if ai_point_id is not None:
+            _set(row, "AI_PointID", ai_point_id)
+        if pid_confidence is not None:
+            _set(row, "PointID_Confidence", pid_confidence)
+
         ws.append_row(row)
         return True
-    except: return False
+    except Exception:
+        return False
 
 # =========================================================
 # --- 🧠 OCR ENGINE (Clean & Robust) ---
@@ -221,6 +247,107 @@ def preprocess_text(text):
     text = re.sub(r'(?<=[\d\s])[\|Il!](?=[\d\s])', '1', text)
     text = re.sub(r'(?<=[\d\s])[Oo](?=[\d\s])', '0', text)
     return text
+
+
+
+# =========================================================
+# --- 🔎 POINT-ID DETECTION (Auto) ---
+# =========================================================
+def _build_anchor_maps(meters: list[dict]):
+    """
+    Build helper maps from PointsMaster 'name' field.
+    We use anchors like 'S11A-105', 'S11D-107', 'C07' etc to map -> point_id.
+    """
+    code_to_pid = {}
+    cxx_to_pids = {}
+    for m in meters:
+        pid = str(m.get("point_id", "")).strip()
+        name = str(m.get("name", "")).upper()
+
+        # Anchor: S11A-105 / S11D-107 etc.
+        for code in re.findall(r"S11[A-Z]-\d{2,3}", name):
+            code_to_pid.setdefault(code, []).append(pid)
+
+        # Anchor: C07 / C12 etc (customer code)
+        for cxx in re.findall(r"\bC\d{2}\b", name):
+            cxx_to_pids.setdefault(cxx, []).append(pid)
+
+    return code_to_pid, cxx_to_pids
+
+@st.cache_data(ttl=3600)
+def _cached_anchor_maps():
+    meters = load_points_master()
+    return _build_anchor_maps(meters)
+
+def detect_point_candidates_from_text(raw_text: str, meters: list[dict], max_k: int = 5):
+    """
+    Return list of candidates: [{"point_id":..., "score":..., "reason":...}, ...]
+    score in [0,1] heuristic confidence.
+    """
+    if not raw_text:
+        return []
+
+    text_u = preprocess_text(raw_text).upper()
+
+    # 0) direct exact point_id present
+    all_pids = [str(m.get("point_id","")).strip().upper() for m in meters if m.get("active", True)]
+    direct_hits = [pid for pid in all_pids if pid and pid in text_u]
+    if len(direct_hits) == 1:
+        return [{"point_id": direct_hits[0], "score": 0.98, "reason": "พบ PointID ในรูปโดยตรง"}]
+    elif len(direct_hits) > 1:
+        # multiple direct hits -> ambiguous
+        return [{"point_id": pid, "score": 0.70, "reason": "พบ PointID หลายตัวในรูป (กำกวม)"} for pid in direct_hits[:max_k]]
+
+    code_to_pid, cxx_to_pids = _cached_anchor_maps()
+
+    # 1) match S11?-NNN anchors
+    codes = list(dict.fromkeys(re.findall(r"S11[A-Z]-\d{2,3}", text_u)))
+    candidates = []
+    for code in codes:
+        pids = code_to_pid.get(code, [])
+        if len(pids) == 1:
+            candidates.append({"point_id": pids[0], "score": 0.92, "reason": f"พบโค้ด {code} ในรูป"})
+        elif len(pids) > 1:
+            # ambiguous: same anchor maps to multiple points (rare)
+            for pid in pids[:max_k]:
+                candidates.append({"point_id": pid, "score": 0.65, "reason": f"พบโค้ด {code} แต่หลายจุดใช้ร่วมกัน"})
+
+    # 2) match Cxx anchors as fallback
+    cxxs = list(dict.fromkeys(re.findall(r"\bC\d{2}\b", text_u)))
+    for cxx in cxxs:
+        pids = cxx_to_pids.get(cxx, [])
+        if len(pids) == 1:
+            candidates.append({"point_id": pids[0], "score": 0.80, "reason": f"พบรหัสลูกค้า {cxx} ในรูป"})
+        elif len(pids) > 1:
+            for pid in pids[:max_k]:
+                candidates.append({"point_id": pid, "score": 0.55, "reason": f"พบ {cxx} แต่ยังไม่ชัว (หลายจุด)"})
+
+    # de-dup keep best score per pid
+    best = {}
+    for c in candidates:
+        pid = c["point_id"]
+        if pid not in best or c["score"] > best[pid]["score"]:
+            best[pid] = c
+
+    ranked = sorted(best.values(), key=lambda x: x["score"], reverse=True)
+    return ranked[:max_k]
+
+def detect_point_id_from_image(image_bytes: bytes, meters: list[dict]):
+    """
+    Return (best_point_id, confidence, candidates, ocr_text)
+    """
+    try:
+        raw_text = _vision_read_text(image_bytes) or ""
+    except Exception:
+        raw_text = ""
+
+    candidates = detect_point_candidates_from_text(raw_text, meters, max_k=5)
+    if not candidates:
+        return None, 0.0, [], raw_text
+
+    best = candidates[0]
+    return best["point_id"], float(best["score"]), candidates, raw_text
+
 
 def is_digital_meter(config):
     blob = f"{config.get('type','')} {config.get('name','')} {config.get('keyword','')}".lower()
@@ -358,7 +485,7 @@ def ocr_process(image_bytes, config, debug=False):
 
     clean_std = re.sub(r"\b202[0-9]\b|\b256[0-9]\b", "", full_text)
     clean_std = re.sub(r"\.{2,}", ".", clean_std)
-    for m in re.finditer(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?", clean_std):
+    for m in re.finditer(r"-?\d+(?:\.\d+)?", clean_std):
         n_str = m.group(0)
         if looks_like_spec_context(raw_full_text, m.start(), m.end()): continue
         n_str2 = normalize_number_str(n_str, decimal_places)
@@ -387,9 +514,110 @@ def calc_tolerance(decimals: int) -> float:
 # =========================================================
 # --- UI LOGIC ---
 # =========================================================
-mode = st.sidebar.radio("🔧 เลือกโหมดการทำงาน", ["📝 พนักงานจดมิเตอร์", "👮‍♂️ Admin Approval"])
+mode = st.sidebar.radio("🔧 เลือกโหมดการทำงาน", ["📷 โหมดถ่ายภาพ (Auto PointID)", "📝 พนักงานจดมิเตอร์", "👮‍♂️ Admin Approval"])
 
-if mode == "📝 พนักงานจดมิเตอร์":
+
+if mode == "📷 โหมดถ่ายภาพ (Auto PointID)":
+    st.title("📷 โหมดถ่ายภาพ (Auto PointID)")
+    st.caption("ช่างถ่ายรูป + กรอกค่าที่อ่านได้ | ระบบพยายามหา PointID ให้เอง และตรวจเทียบกับ AI")
+
+    inspector = st.text_input("ชื่อผู้ตรวจ", "User")
+    selected_date = st.date_input("📅 วันที่จดบันทึก (สำหรับลงย้อนหลัง)", value=get_thai_time())
+
+    all_meters = load_points_master()
+    if not all_meters:
+        st.error("❌ ไม่พบ PointsMaster"); st.stop()
+
+    uploaded = st.file_uploader("📸 อัปโหลดรูปมิเตอร์ (JPG/PNG)", type=["jpg","jpeg","png"])
+    if uploaded is None:
+        st.info("กรุณาอัปโหลดรูปเพื่อเริ่ม"); st.stop()
+
+    image_bytes = uploaded.getvalue()
+
+    # 🔒 Rule: ถ้ารูปตะแคง/แนวนอน ให้ถ่ายใหม่ (ตาม requirement ลูกค้า)
+    try:
+        from PIL import Image
+        import io
+        im = Image.open(io.BytesIO(image_bytes))
+        w, h = im.size
+        if w > h:
+            st.error("⚠️ รูปนี้เป็นแนวนอน/ตะแคง กรุณาถ่ายใหม่ให้ตั้งตรง (Portrait)")
+            st.image(im, use_container_width=True)
+            st.stop()
+        st.image(im, caption="รูปที่อัปโหลด", use_container_width=True)
+    except Exception:
+        pass
+
+    with st.spinner("🔎 กำลังหา PointID จากรูป..."):
+        pid, pid_conf, pid_candidates, _raw = detect_point_id_from_image(image_bytes, all_meters)
+
+    if pid is None:
+        st.error("❌ AI ยังหา PointID ไม่เจอ (รูปอาจเอียง/ไม่ชัด/ไม่ใช่จุดที่ถูกต้อง) กรุณาถ่ายใหม่")
+        st.stop()
+
+    st.markdown(f"### 🎯 PointID ที่ AI คิดว่าใช่: **{pid}**  (ความมั่นใจ {pid_conf:.2f})")
+
+    # show top candidates (ช่วย admin/ช่าง)
+    with st.expander("ดู Top candidates"):
+        for c in pid_candidates:
+            st.write(f"- {c['point_id']} | conf={c['score']:.2f} | {c['reason']}")
+
+    # show reference image if available (optional column ref_image_url in PointsMaster)
+    ref_url = None
+    try:
+        for m in all_meters:
+            if str(m.get("point_id","")).strip() == pid:
+                ref_url = m.get("ref_image_url") or m.get("Ref_Image_URL") or m.get("reference_image") or None
+                break
+    except Exception:
+        ref_url = None
+
+    st.markdown("### 🖼️ ภาพตัวอย่างที่ถูกต้อง (Reference)")
+    if ref_url:
+        st.image(ref_url, use_container_width=True)
+    else:
+        st.info("ยังไม่มีรูปตัวอย่างสำหรับจุดนี้ (สามารถเพิ่มได้ในหน้า Admin)")
+
+    # manual input
+    config = get_meter_config(pid) or {}
+    decimals = safe_int(config.get("decimals", 0), 0)
+    step = 1.0 if decimals <= 0 else float(10 ** (-decimals))
+    fmt = "%.0f" if decimals <= 0 else f"%.{decimals}f"
+    manual_val = st.number_input("👁️ ค่าที่ช่างอ่านได้", min_value=0.0, step=step, format=fmt)
+
+    if st.button("🚀 ตรวจสอบและบันทึก", type="primary"):
+        with st.spinner("🤖 AI กำลังอ่านค่าจากรูป..."):
+            ai_val = ocr_process(image_bytes, config)
+
+        st.info(f"AI อ่านได้: {ai_val} | คนกรอก: {manual_val}")
+
+        tol = calc_tolerance(decimals)
+        is_match = abs(float(manual_val) - float(ai_val)) <= tol
+        is_pid_confident = pid_conf >= 0.85
+
+        status = "VERIFIED" if (is_match and is_pid_confident) else "FLAGGED"
+
+        # upload image
+        filename = f"{pid}_{selected_date.strftime('%Y%m%d')}_{get_thai_time().strftime('%H%M%S')}.jpg"
+        try:
+            image_url = upload_image_to_storage(image_bytes, filename)
+        except Exception:
+            image_url = "-"
+
+        meter_type = "Water"
+        if save_to_db(pid, inspector, meter_type, manual_val, ai_val, status, selected_date, image_url, ai_point_id=pid, pid_confidence=pid_conf):
+            if status == "VERIFIED":
+                report_col = config.get("report_col", "")
+                export_to_real_report(pid, manual_val, inspector, report_col, selected_date)
+                st.success("✅ VERIFIED และกรอกลงรายงานทันทีแล้ว")
+            else:
+                st.warning("⚠️ FLAGGED (คนกับ AI ไม่ตรง หรือ AI ไม่มั่นใจ PointID) ส่งให้ Admin ตรวจสอบ")
+            st.balloons()
+        else:
+            st.error("❌ Save Failed")
+
+
+elif mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
     st.markdown("### Water treatment Plant - Borthongindustrial")
     st.caption("Version 6.0 (Date Selection Supported)")
@@ -430,19 +658,8 @@ if mode == "📝 พนักงานจดมิเตอร์":
         manual_val = st.number_input("👁️ ค่าจริง", min_value=0.0, step=0.1, format="%.2f")
 
     tab_cam, tab_up = st.tabs(["📷 ถ่ายรูป", "📂 อัปโหลด"])
-
-    # 📷 ถ่ายรูป (Streamlit มักมี preview ใน widget อยู่แล้วบนมือถือ)
-    with tab_cam:
-        img_cam = st.camera_input("ถ่ายภาพมิเตอร์")
-
-    # 📂 อัปโหลด (แสดง preview ใต้ uploader ทันที)
-    with tab_up:
-        img_up = st.file_uploader("เลือกรูปภาพ", type=['jpg', 'png', 'jpeg'])
-        if img_up is not None:
-            st.image(img_up, caption=f"รูปที่เลือก: {getattr(img_up, 'name', 'upload')}", use_container_width=True)
-
-    # เลือกใช้รูปจากกล้องก่อน ถ้าไม่มีค่อยใช้จากอัปโหลด
-    img_file = img_cam if img_cam is not None else img_up
+    img_file = tab_cam.camera_input("ถ่ายภาพมิเตอร์")
+    if not img_file: img_file = tab_up.file_uploader("เลือกรูปภาพ", type=['jpg', 'png', 'jpeg'])
 
     st.write("---")
 
@@ -492,65 +709,150 @@ if mode == "📝 พนักงานจดมิเตอร์":
         if col_conf2.button("❌ แก้ไข"):
             st.session_state.confirm_mode = False; st.rerun()
 
+
 elif mode == "👮‍♂️ Admin Approval":
-    st.title("👮‍♂️ Admin Dashboard")
-    st.caption("ระบบอนุมัติผลการอ่านค่ามิเตอร์น้ำ/ไฟ")
+    st.title("👮‍♂️ Admin Approval")
+    st.caption("อนุมัติรายการ FLAGGED (คนกับ AI ไม่ตรง หรือ AI ไม่มั่นใจ PointID) ก่อนเขียนลง Test WaterReport")
+
     if st.button("🔄 รีเฟรช"): st.rerun()
+
+    # load points master for dropdown
+    all_meters = load_points_master()
+    all_pids = [str(m.get("point_id","")).strip() for m in all_meters if str(m.get("point_id","")).strip()]
+    all_pids = sorted(list(dict.fromkeys(all_pids)))
+
+    def update_points_master_field(point_id: str, field_name: str, value):
+        """Update a field in PointsMaster by header name."""
+        try:
+            sh = gc.open(DB_SHEET_NAME)
+            ws_pm = sh.worksheet("PointsMaster")
+            header = ws_pm.row_values(1)
+            if field_name not in header:
+                # append new column
+                header2 = header + [field_name]
+                ws_pm.update("A1", [header2])
+                header = header2
+            col = header.index(field_name) + 1
+
+            # find row by point_id in column 1 (assume point_id col exists)
+            cells = ws_pm.findall(point_id)
+            for c in cells:
+                if str(ws_pm.cell(c.row, 1).value).strip() == point_id:
+                    ws_pm.update_cell(c.row, col, value)
+                    return True
+            return False
+        except Exception:
+            return False
 
     sh = gc.open(DB_SHEET_NAME)
     ws = sh.worksheet("DailyReadings")
+    header = ws.row_values(1)
     data = ws.get_all_records()
-    pending = [d for d in data if str(d.get('Status', '')).strip().upper() == 'FLAGGED']
+    pending = [d for d in data if str(d.get("Status", "")).strip().upper() == "FLAGGED"]
 
-    if not pending: st.success("✅ All Clear")
-    else:
-        for i, item in enumerate(pending):
-            with st.container():
-                st.markdown("---")
-                c_info, c_val, c_act = st.columns([1.5, 1.5, 1])
-                with c_info:
-                    st.subheader(f"🚩 {item.get('point_id')}")
-                    st.caption(f"Inspector: {item.get('inspector')}")
-                    img_url = item.get('image_url')
-                    if img_url and img_url != '-' and str(img_url).startswith('http'):
-                        st.image(img_url, width=220)
+    if not pending:
+        st.success("✅ ไม่มีรายการค้าง (All Clear)")
+        st.stop()
+
+    for i, item in enumerate(pending):
+        st.markdown("---")
+        timestamp = str(item.get("timestamp", item.get("Timestamp", ""))).strip()
+        point_id_now = str(item.get("point_id", item.get("PointID", ""))).strip()
+        ai_pid = str(item.get("AI_PointID", point_id_now)).strip()
+        pid_conf = safe_float(item.get("PointID_Confidence", 0.0), 0.0)
+
+        c1, c2 = st.columns([1.2, 1.8])
+
+        with c1:
+            st.write(f"🕒 **{timestamp}**")
+            st.write(f"🤖 AI PointID: **{ai_pid}**  (conf {pid_conf:.2f})")
+            st.write(f"📌 PointID ในรายการ: **{point_id_now}**")
+
+            # Image
+            img_url = item.get("Image_URL", item.get("image_url", "-"))
+            if img_url and img_url != "-":
+                st.image(img_url, use_container_width=True)
+
+        with c2:
+            # ให้ admin เลือก/แก้ PointID (โดยเฉพาะกรณี AI ไม่มั่นใจ)
+            default_pid = point_id_now if point_id_now in all_pids else (ai_pid if ai_pid in all_pids else (all_pids[0] if all_pids else point_id_now))
+            selected_point_id = st.selectbox("เลือก PointID ที่ถูกต้อง", all_pids, index=(all_pids.index(default_pid) if default_pid in all_pids else 0), key=f"pid_{i}")
+
+            m_val = safe_float(item.get("Manual_Value", item.get("manual_val", 0.0)), 0.0)
+            a_val = safe_float(item.get("AI_Value", item.get("ai_val", 0.0)), 0.0)
+
+            options_map = {
+                f"👤 คนจด: {m_val}": m_val,
+                f"🤖 AI: {a_val}": a_val,
+            }
+            selected_label = st.radio("เลือกค่าที่ถูกต้อง:", list(options_map.keys()), key=f"rad_{i}")
+            choice = options_map[selected_label]
+
+            # เผื่อ admin อยากแก้เอง
+            if st.checkbox("แก้ค่าเอง", key=f"edit_{i}"):
+                cfg = get_meter_config(selected_point_id) or {}
+                decimals = safe_int(cfg.get("decimals", 0), 0)
+                step = 1.0 if decimals <= 0 else float(10 ** (-decimals))
+                fmt = "%.0f" if decimals <= 0 else f"%.{decimals}f"
+                choice = st.number_input("ใส่ค่าที่ถูกต้อง", value=float(choice), step=step, format=fmt, key=f"num_{i}")
+
+            if st.button("✅ Approve & เขียนลงรายงาน", key=f"btn_{i}", type="primary"):
+                try:
+                    # หา row ด้วย timestamp
+                    cells = ws.findall(timestamp)
+                    updated = False
+                    for cell in cells:
+                        row = cell.row
+                        # ตรวจว่าเป็นแถว FLAGGED จริง และ point_id ตรงกับรายการเดิม
+                        pid_cell = str(ws.cell(row, 3).value).strip()
+                        status_cell = str(ws.cell(row, 7).value).strip().upper()
+                        if status_cell == "FLAGGED" and pid_cell == point_id_now:
+                            # update point_id ถ้าแก้
+                            if selected_point_id and selected_point_id != pid_cell:
+                                ws.update_cell(row, 3, selected_point_id)
+
+                            # update manual value + status
+                            ws.update_cell(row, 5, choice)
+                            ws.update_cell(row, 7, "APPROVED")
+
+                            # export to report
+                            config = get_meter_config(selected_point_id) or {}
+                            report_col = config.get("report_col", "")
+
+                            try:
+                                dt_obj = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+                                approve_date = dt_obj.date()
+                            except Exception:
+                                approve_date = get_thai_time().date()
+
+                            export_to_real_report(selected_point_id, choice, str(item.get("inspector", "")), report_col, approve_date)
+                            updated = True
+                            break
+
+                    if updated:
+                        st.success("✅ Approved!")
+                        st.rerun()
                     else:
-                        st.warning("No Image")
+                        st.error("ไม่พบแถวที่จะอัปเดต (อาจถูก Approve ไปแล้ว)")
 
-                with c_val:
-                    m_val = safe_float(item.get('Manual_Value'), 0.0)
-                    a_val = safe_float(item.get('AI_Value'), 0.0)
-                    options_map = {
-                        f"👤 คนจด: {m_val}": m_val,
-                        f"🤖 AI: {a_val}": a_val
-                    }
-                    selected_label = st.radio("เลือกค่าที่ถูกต้อง:", list(options_map.keys()), key=f"rad_{i}")
-                    choice = options_map[selected_label]
+                except Exception as e:
+                    st.error(f"Approve error: {e}")
 
-                with c_act:
-                    st.write("")
-                    if st.button("✅ อนุมัติ", key=f"btn_{i}", type="primary"):
-                        try:
-                            timestamp = str(item.get('timestamp', '')).strip()
-                            point_id = str(item.get('point_id', '')).strip()
-                            cells = ws.findall(timestamp)
-                            updated = False
-                            for cell in cells:
-                                if str(ws.cell(cell.row, 3).value).strip() == point_id:
-                                    ws.update_cell(cell.row, 7, "APPROVED")
-                                    ws.update_cell(cell.row, 5, choice)
-                                    config = get_meter_config(point_id)
-                                    report_col = (config.get('report_col', '') if config else '')
-                                    
-                                    # ✅ Parse timestamp กลับเป็นวันที่ เพื่อหา Sheet ให้เจอตอน Approve
-                                    try:
-                                        dt_obj = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
-                                        approve_date = dt_obj.date()
-                                    except:
-                                        approve_date = get_thai_time().date() # fallback
-                                        
-                                    export_to_real_report(point_id, choice, str(item.get('inspector', '')), report_col, approve_date)
-                                    updated = True; break
-                            if updated: st.success("Approved!"); st.rerun()
-                            else: st.warning("หา row ไม่เจอ")
-                        except Exception as e: st.error(f"Error approve: {e}")
+            # --- Reference image management ---
+            with st.expander("🖼️ ตั้งค่า Reference Image ของจุดนี้ (เพื่อให้ช่างถ่ายตาม)"):
+                st.caption("อัปโหลดรูปตัวอย่าง 1 รูป แล้วระบบจะเก็บ URL ไว้ใน PointsMaster (คอลัมน์ ref_image_url)")
+                ref_file = st.file_uploader("อัปโหลดรูปตัวอย่าง", type=["jpg","jpeg","png"], key=f"refup_{i}")
+                if ref_file is not None:
+                    b = ref_file.getvalue()
+                    fn = f"REF_{selected_point_id}.jpg"
+                    try:
+                        ref_url = upload_image_to_storage(b, fn)
+                        ok = update_points_master_field(selected_point_id, "ref_image_url", ref_url)
+                        if ok:
+                            st.success("บันทึก Reference Image แล้ว ✅")
+                        else:
+                            st.warning("อัปโหลดได้ แต่ยังบันทึกลง PointsMaster ไม่สำเร็จ")
+                        st.image(ref_url, use_container_width=True)
+                    except Exception as e:
+                        st.error(f"Upload failed: {e}")
+
