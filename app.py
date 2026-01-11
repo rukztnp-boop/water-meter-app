@@ -5,6 +5,7 @@ import gspread
 import json
 import cv2
 import numpy as np
+import pandas as pd
 import math
 from google.oauth2 import service_account
 from google.cloud import vision
@@ -80,10 +81,19 @@ def upload_image_to_storage(image_bytes, file_name):
     try:
         bucket = STORAGE_CLIENT.bucket(BUCKET_NAME)
         blob = bucket.blob(file_name)
-        blob.upload_from_string(image_bytes, content_type='image/jpeg')
+
+        # ตั้งค่า Content-Type ให้ตรงกับนามสกุลไฟล์ (ช่วยให้เปิดรูปบนมือถือได้ถูกต้อง)
+        ext = str(file_name).lower().split(".")[-1] if "." in str(file_name) else "jpg"
+        if ext in ("png",):
+            content_type = "image/png"
+        else:
+            content_type = "image/jpeg"
+
+        blob.upload_from_string(image_bytes, content_type=content_type)
         return blob.public_url
     except Exception as e:
         return f"Error: {e}"
+
 
 # =========================================================
 # --- SHEET HELPERS ---
@@ -387,7 +397,7 @@ def calc_tolerance(decimals: int) -> float:
 # =========================================================
 # --- UI LOGIC ---
 # =========================================================
-mode = st.sidebar.radio("🔧 เลือกโหมดการทำงาน", ["📝 พนักงานจดมิเตอร์", "👮‍♂️ Admin Approval"])
+mode = st.sidebar.radio("🔧 เลือกโหมดการทำงาน", ["📝 พนักงานจดมิเตอร์", "📟 SCADA (4 รูป)", "👮‍♂️ Admin Approval"])
 
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
@@ -487,10 +497,190 @@ if mode == "📝 พนักงานจดมิเตอร์":
         if col_conf1.button("✅ ยืนยัน (ส่งให้ Admin)"):
             # ✅ ใช้วันที่ที่เก็บไว้ใน session_state
             target_date = st.session_state.get('last_selected_date', get_thai_time().date())
-            save_to_db(point_id, inspector, "Water", st.session_state.last_manual_val, st.session_state.last_ai_val, "FLAGGED", target_date, st.session_state.last_img_url)
+            save_to_db(point_id, inspector, ("Water" if "ประปา" in cat_select else "Electric"), st.session_state.last_manual_val, st.session_state.last_ai_val, "FLAGGED", target_date, st.session_state.last_img_url)
             st.success("✅ ส่งเรื่องแล้ว"); st.session_state.confirm_mode = False; st.rerun()
         if col_conf2.button("❌ แก้ไข"):
             st.session_state.confirm_mode = False; st.rerun()
+
+
+elif mode == "📟 SCADA (4 รูป)":
+    st.title("📟 SCADA (4 รูป)")
+    st.caption("ส่งรูป 4 รูป → AI เสนอค่า → ช่างแก้ → บันทึกทีเดียว (มือถือ)")
+
+    # ชื่อผู้ตรวจ + วันที่
+    c1, c2 = st.columns(2)
+    with c1:
+        inspector = st.text_input("ชื่อผู้ตรวจ", "Admin")
+    with c2:
+        selected_date = st.date_input("📅 วันที่ของข้อมูล (ลงย้อนหลังได้)", value=get_thai_time())
+
+    with st.expander("✅ วิธีใช้ (แนะนำ)", expanded=True):
+        st.write("1) แนะนำใช้ “แคปหน้าจอ (screenshot)” จะอ่านติดกว่าถ่ายกล้อง")
+        st.write("2) อัปโหลดรูป WT / UF / Booster เป็นหลัก (รูป Monitor View เป็น optional)")
+        st.write("3) กด “ให้ AI อ่านค่า” → ถ้าผิด ช่างแก้ในตาราง → กด “บันทึกทั้งหมด”")
+
+    st.subheader("อัปโหลดรูป 4 รูป")
+    img1 = st.file_uploader("รูปที่ 1: Monitor View (ตาราง) (Optional)", type=['jpg', 'png', 'jpeg'], key="scada_img1")
+    img2 = st.file_uploader("รูปที่ 2: WT_SYSTEM", type=['jpg', 'png', 'jpeg'], key="scada_img2")
+    img3 = st.file_uploader("รูปที่ 3: UF_SYSTEM", type=['jpg', 'png', 'jpeg'], key="scada_img3")
+    img4 = st.file_uploader("รูปที่ 4: BoosterPumpCW", type=['jpg', 'png', 'jpeg'], key="scada_img4")
+
+    can_run = (img2 is not None) and (img3 is not None) and (img4 is not None)
+    run = st.button("🤖 ให้ AI อ่านค่า", use_container_width=True, disabled=not can_run)
+
+    if run:
+        all_points = load_points_master()
+        if not all_points:
+            st.error("❌ โหลด PointsMaster ไม่สำเร็จ")
+            st.stop()
+
+        # สร้าง config_map ครั้งเดียว (เร็วกว่าเรียก get_meter_config ทีละจุด)
+        config_map = {}
+        for item in all_points:
+            pid = str(item.get('point_id', '')).strip().upper()
+            if not pid:
+                continue
+            cfg = dict(item)
+            cfg['decimals'] = safe_int(cfg.get('decimals'), 0)
+            cfg['keyword'] = str(cfg.get('keyword', '')).strip()
+            exp = safe_int(cfg.get('expected_digits'), 0)
+            if exp == 0:
+                exp = safe_int(cfg.get('int_digits'), 0)
+            cfg['expected_digits'] = exp
+            cfg['report_col'] = str(cfg.get('report_col', '')).strip()
+            cfg['ignore_red'] = parse_bool(cfg.get('ignore_red'))
+            cfg['roi_x1'] = safe_float(cfg.get('roi_x1'), 0.0)
+            cfg['roi_y1'] = safe_float(cfg.get('roi_y1'), 0.0)
+            cfg['roi_x2'] = safe_float(cfg.get('roi_x2'), 0.0)
+            cfg['roi_y2'] = safe_float(cfg.get('roi_y2'), 0.0)
+            cfg['type'] = str(cfg.get('type', '')).strip()
+            cfg['name'] = str(cfg.get('name', '')).strip()
+            config_map[pid] = cfg
+
+        def _blob(p):
+            return f"{p.get('type','')} {p.get('name','')}".lower()
+
+        wt_points = [p for p in all_points if "scada_wt" in str(p.get("type","")).lower()]
+        uf_points = [p for p in all_points if "scada_uf" in str(p.get("type","")).lower()]
+        booster_points = [p for p in all_points if ("scada_boosterpumpcw" in str(p.get("type","")).lower()) or ("cw1" in str(p.get("name","")).lower())]
+
+        # กันซ้ำ
+        def _uniq(points):
+            seen=set(); out=[]
+            for p in points:
+                pid=str(p.get("point_id","")).strip().upper()
+                if pid and pid not in seen:
+                    seen.add(pid); out.append(p)
+            return out
+
+        wt_points = _uniq(wt_points)
+        uf_points = _uniq(uf_points)
+        booster_points = _uniq(booster_points)
+
+        # เตรียมรูป (bytes)
+        img_bytes_wt = img2.getvalue()
+        img_bytes_uf = img3.getvalue()
+        img_bytes_booster = img4.getvalue()
+
+        # อัปโหลดรูปไว้ (เก็บเป็น url pack เดียว)
+        urls = {}
+        tstamp = get_thai_time().strftime("%Y%m%d_%H%M%S")
+        if img1 is not None:
+            urls["MON"] = upload_image_to_storage(img1.getvalue(), f"SCADA_MON_{selected_date.strftime('%Y%m%d')}_{tstamp}.png")
+        urls["WT"]  = upload_image_to_storage(img_bytes_wt, f"SCADA_WT_{selected_date.strftime('%Y%m%d')}_{tstamp}.png")
+        urls["UF"]  = upload_image_to_storage(img_bytes_uf, f"SCADA_UF_{selected_date.strftime('%Y%m%d')}_{tstamp}.png")
+        urls["BST"] = upload_image_to_storage(img_bytes_booster, f"SCADA_BST_{selected_date.strftime('%Y%m%d')}_{tstamp}.png")
+        image_url_pack = " | ".join([f"{k}:{v}" for k, v in urls.items()]) if urls else "-"
+
+        # อ่านค่าแบบ "AI เสนอ"
+        rows = []
+        def read_group(group_name, points, screen_bytes):
+            for p in points:
+                pid = str(p.get("point_id","")).strip().upper()
+                cfg = config_map.get(pid)
+                if not cfg:
+                    continue
+
+                # probe ว่ามี digit ไหม (ช่วยแยกกรณีอ่านไม่เจอ vs ค่าเป็น 0 จริง)
+                probe = preprocess_image_cv(screen_bytes, cfg, use_roi=True, variant="auto")
+                probe_txt, _ = _vision_read_text(probe)
+                has_digit = any(ch.isdigit() for ch in (probe_txt or ""))
+
+                ai_val = ocr_process(screen_bytes, cfg, debug=False)
+                if (not has_digit) and float(ai_val) == 0.0:
+                    ai_show = None
+                else:
+                    ai_show = float(ai_val)
+
+                roi_missing = (cfg.get("roi_x2", 0.0) == 0.0) or (cfg.get("roi_y2", 0.0) == 0.0)
+
+                rows.append({
+                    "group": group_name,
+                    "point_id": pid,
+                    "name": str(cfg.get("name","")).strip(),
+                    "ai_value": ai_show,
+                    "manual_value": ai_show,   # ให้ช่างเริ่มจาก AI แล้วค่อยแก้
+                    "report_col": str(cfg.get("report_col","")).strip(),
+                    "roi_missing": roi_missing
+                })
+
+        read_group("WT_SYSTEM", wt_points, img_bytes_wt)
+        read_group("UF_SYSTEM", uf_points, img_bytes_uf)
+        read_group("BOOSTER_CW_RO", booster_points, img_bytes_booster)
+
+        if not rows:
+            st.error("❌ ไม่เจอรายการ SCADA ใน PointsMaster (เช็ค type ว่าเริ่มด้วย SCADA_ ไหม)")
+            st.stop()
+
+        df = pd.DataFrame(rows)
+
+        missing_roi = df[df["roi_missing"] == True]
+        if not missing_roi.empty:
+            st.warning("มีบางจุดยังไม่มี ROI (อาจอ่านไม่แม่น): " + ", ".join(missing_roi["point_id"].tolist()))
+
+        st.subheader("ผลที่ AI อ่านได้ (ช่างแก้ได้)")
+        edited = st.data_editor(
+            df[["group","point_id","name","ai_value","manual_value","report_col"]],
+            use_container_width=True,
+            num_rows="fixed",
+            column_config={
+                "manual_value": st.column_config.NumberColumn("ค่าที่ช่างยืนยัน (แก้ได้)"),
+                "ai_value": st.column_config.NumberColumn("ค่า AI เสนอ"),
+            }
+        )
+
+        st.divider()
+        if st.button("💾 บันทึกทั้งหมด", use_container_width=True, type="primary"):
+            ok_cnt, fail_cnt = 0, 0
+            for _, r in edited.iterrows():
+                pid = str(r.get("point_id","")).strip().upper()
+                man = r.get("manual_value", None)
+                ai  = r.get("ai_value", None)
+
+                if man is None or (isinstance(man, float) and np.isnan(man)):
+                    fail_cnt += 1
+                    continue
+
+                cfg = config_map.get(pid, {})
+                report_col = str(cfg.get("report_col","")).strip()
+
+                try:
+                    save_to_db(
+                        pid,
+                        inspector,
+                        "SCADA",
+                        float(man),
+                        ("" if ai is None or (isinstance(ai, float) and np.isnan(ai)) else float(ai)),
+                        "VERIFIED",
+                        selected_date,
+                        image_url_pack
+                    )
+                    export_to_real_report(pid, float(man), inspector, report_col, selected_date)
+                    ok_cnt += 1
+                except:
+                    fail_cnt += 1
+
+            st.success(f"✅ บันทึกสำเร็จ {ok_cnt} รายการ | ❌ ไม่สำเร็จ {fail_cnt} รายการ")
 
 elif mode == "👮‍♂️ Admin Approval":
     st.title("👮‍♂️ Admin Dashboard")
