@@ -431,19 +431,20 @@ if mode == "📝 พนักงานจดมิเตอร์":
 
     tab_cam, tab_up = st.tabs(["📷 ถ่ายรูป", "📂 อัปโหลด"])
 
-     with tab_cam:
-         cam_file = st.camera_input("ถ่ายภาพมิเตอร์")
-         if cam_file is not None:
-             st.image(cam_file, caption="รูปที่ถ่าย", use_container_width=True)
+    # 📷 ถ่ายรูป (Streamlit มักมี preview ใน widget อยู่แล้วบนมือถือ)
+    with tab_cam:
+        img_cam = st.camera_input("ถ่ายภาพมิเตอร์")
 
-     with tab_up:
-           up_file = st.file_uploader("เลือกรูปภาพ", type=["jpg", "jpeg", "png"])
-         if up_file is not None:
-             st.image(up_file, caption=f"รูปที่เลือก: {up_file.name}", use_container_width=True)
+    # 📂 อัปโหลด (แสดง preview ใต้ uploader ทันที)
+    with tab_up:
+        img_up = st.file_uploader("เลือกรูปภาพ", type=['jpg', 'png', 'jpeg'])
+        if img_up is not None:
+            st.image(img_up, caption=f"รูปที่เลือก: {getattr(img_up, 'name', 'upload')}", use_container_width=True)
 
-     img_file = cam_file or up_file
+    # เลือกใช้รูปจากกล้องก่อน ถ้าไม่มีค่อยใช้จากอัปโหลด
+    img_file = img_cam if img_cam is not None else img_up
 
-     st.write("---")
+    st.write("---")
 
     if not st.session_state.confirm_mode:
         if st.button("🚀 ตรวจสอบและบันทึก", type="primary"):
