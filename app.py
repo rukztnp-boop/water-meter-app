@@ -240,6 +240,13 @@ def normalize_number_str(s: str, decimals: int = 0) -> str:
     return s
 
 def preprocess_text(text):
+    if text is None:
+        text = ""
+    elif not isinstance(text, str):
+        # _vision_read_text returns (text, err) -> take first
+        if isinstance(text, (tuple, list)) and len(text) > 0:
+            text = text[0]
+        text = str(text)
     patterns = [r'IP\s*51', r'50\s*Hz', r'Class\s*2', r'3x220/380\s*V', r'Type', r'Mitsubishi', r'Electric', r'Wire', r'kWh', r'MH\s*[-]?\s*96', r'30\s*\(100\)\s*A', r'\d+\s*rev/kWh', r'WATT-HOUR\s*METER', r'Indoor\s*Use', r'Made\s*in\s*Thailand']
     for p in patterns: text = re.sub(p, '', text, flags=re.IGNORECASE)
     text = re.sub(r'\b10,000\b', '', text)
@@ -337,7 +344,8 @@ def detect_point_id_from_image(image_bytes: bytes, meters: list[dict]):
     Return (best_point_id, confidence, candidates, ocr_text)
     """
     try:
-        raw_text = _vision_read_text(image_bytes) or ""
+        raw_text, _err = _vision_read_text(image_bytes)
+        raw_text = raw_text or ""
     except Exception:
         raw_text = ""
 
@@ -521,6 +529,9 @@ if mode == "📷 โหมดถ่ายภาพ (Auto PointID)":
     st.title("📷 โหมดถ่ายภาพ (Auto PointID)")
     st.caption("ช่างถ่ายรูป + กรอกค่าที่อ่านได้ | ระบบพยายามหา PointID ให้เอง และตรวจเทียบกับ AI")
 
+    with st.expander("✅ ตัวอย่างรูปที่ถูกต้อง (แนวตั้ง/ชัด/เห็นป้ายรหัส)"): 
+        st.markdown("- ถือโทรศัพท์แนวตั้ง (Portrait)\n- ไม่เอียง/ไม่ตะแคง\n- ให้เห็นป้ายรหัส (เช่น S11A-111) ชัด ๆ\n- ถ้าเอียง ระบบจะให้ถ่ายใหม่")
+
     inspector = st.text_input("ชื่อผู้ตรวจ", "User")
     selected_date = st.date_input("📅 วันที่จดบันทึก (สำหรับลงย้อนหลัง)", value=get_thai_time())
 
@@ -528,9 +539,15 @@ if mode == "📷 โหมดถ่ายภาพ (Auto PointID)":
     if not all_meters:
         st.error("❌ ไม่พบ PointsMaster"); st.stop()
 
-    uploaded = st.file_uploader("📸 อัปโหลดรูปมิเตอร์ (JPG/PNG)", type=["jpg","jpeg","png"])
+    st.markdown("### 📸 ถ่ายรูป / อัปโหลดรูป")
+    tab_cam, tab_up = st.tabs(["📷 ถ่ายรูป (แนะนำในหน้างาน)", "⬆️ อัปโหลดไฟล์"])
+    with tab_cam:
+        cam = st.camera_input("ถ่ายรูปมิเตอร์ (ให้ตั้งตรง ไม่เอียง/ไม่ตะแคง)", key="auto_pid_cam")
+    with tab_up:
+        up = st.file_uploader("อัปโหลดรูปมิเตอร์ (JPG/PNG)", type=["jpg","jpeg","png"], key="auto_pid_up")
+    uploaded = cam if cam is not None else up
     if uploaded is None:
-        st.info("กรุณาอัปโหลดรูปเพื่อเริ่ม"); st.stop()
+        st.info("กรุณาถ่ายรูปหรืออัปโหลดรูปเพื่อเริ่ม"); st.stop()
 
     image_bytes = uploaded.getvalue()
 
