@@ -408,6 +408,9 @@ def _vision_read_text(processed_bytes: bytes):
 def ocr_process(image_bytes: bytes, config: dict, debug=False) -> float:
     decimal_places = int(config.get('decimals', 0) or 0)
     keyword = str(config.get('keyword', '') or '').strip()
+    # กัน keyword สั้นเกินไป (เช่น 'A', 'AL') ที่มักจับผิดง่าย
+    if keyword and len(re.sub(r"[^A-Za-z0-9]+", "", keyword)) < 3:
+        keyword = ""
     expected_digits = int(config.get('expected_digits', 0) or 0)
 
     attempts = [
@@ -499,7 +502,12 @@ def ocr_process(image_bytes: bytes, config: dict, debug=False) -> float:
 
             score = 120
             int_part = str(int(abs(val)))
-            score += min(len(int_part), 10) * 10
+            ln = len(int_part)
+            # ถ้ามี expected_digits → ให้คะแนนตามความใกล้เคียง (ช่วยลดการหยิบเลขผิดจาก spec/เวลา)
+            if expected_digits > 0:
+                diff = abs(ln - expected_digits)
+                score += max(0, 80 - diff * 40)
+            score += min(ln, 10) * 10
             if decimal_places > 0 and "." in n_str2:
                 score += 25
 
@@ -787,335 +795,422 @@ if mode == "📝 พนักงานจดมิเตอร์":
 
 elif mode == "📟 SCADA (4 รูป)":
     st.title("📟 SCADA (4 รูป)")
-    st.caption("อัปโหลดรูป SCADA 4 รูป → AI จะอ่านค่าให้ทันที → ถ้าถูกให้ยืนยัน / ถ้าผิดแก้เอง → กดบันทึก")
+    st.caption("อัปโหลด 3–4 รูป (แนะนำให้ใช้ Screenshot ชัด ๆ) → AI อ่านค่า → ยืนยันทีละจุดแล้วลงรายงานทันที")
 
-    # --- session state ---
-    if "scada_pack_hash" not in st.session_state:
-        st.session_state.scada_pack_hash = ""
-    if "scada_df" not in st.session_state:
-        st.session_state.scada_df = None
+    # -----------------------------
+    # Session state
+    # -----------------------------
+    if "scada_step" not in st.session_state: st.session_state.scada_step = "UPLOAD"  # UPLOAD / REVIEW
+    if "scada_results" not in st.session_state: st.session_state.scada_results = {}  # point_id -> dict
+    if "scada_order" not in st.session_state: st.session_state.scada_order = []
+    if "scada_idx" not in st.session_state: st.session_state.scada_idx = 0
+    if "scada_sig" not in st.session_state: st.session_state.scada_sig = ""
+    if "scada_imgs" not in st.session_state: st.session_state.scada_imgs = {}        # group_key -> bytes
+    if "scada_urls" not in st.session_state: st.session_state.scada_urls = {}        # group_key -> url
 
-    # --- header inputs ---
+    # -----------------------------
+    # Helpers (local)
+    # -----------------------------
+    def _scada_group(item: dict) -> str:
+        """
+        คืนค่า key ของกลุ่มรูปที่ควรใช้:
+        - MON: Monitor View
+        - WT_SYSTEM
+        - UF_SYSTEM
+        - BST: BoosterPumpCW
+        """
+        rc = str(item.get("report_col", "") or "").strip().upper()
+        if rc.startswith("SCADA_MON") or rc.startswith("MON_") or "MONITOR" in rc:
+            return "MON"
+        if rc.startswith("SCADA_UF") or rc.startswith("UF_"):
+            return "UF_SYSTEM"
+        if rc.startswith("SCADA_BST") or rc.startswith("BST_") or "BOOST" in rc:
+            return "BST"
+        # default
+        return "WT_SYSTEM"
+
+    def _scada_excel_col(report_col: str) -> str:
+        """
+        รองรับ report_col แบบ:
+        - "CH" (ปกติ)
+        - "SCADA_WT_AL" -> "AL"
+        - "UF_AX" -> "AX"
+        ถ้าแยกไม่ได้ จะคืนค่าเดิม
+        """
+        rc = str(report_col or "").strip().upper()
+        if "_" in rc:
+            tail = rc.split("_")[-1].strip()
+            if tail.isalpha() and 1 <= len(tail) <= 3:
+                return tail
+        if rc.isalpha() and 1 <= len(rc) <= 3:
+            return rc
+        return rc  # fallback
+
+    def _md5(b: bytes) -> str:
+        return hashlib.md5(b).hexdigest()
+
+    def _calc_scada_signature(imgs: dict) -> str:
+        # imgs: group_key -> bytes
+        parts = []
+        for k in sorted(imgs.keys()):
+            parts.append(k + ":" + _md5(imgs[k]))
+        return "|".join(parts)
+
+    def _pick_image_bytes(group_key: str) -> bytes:
+        # เลือกรูปตามกลุ่ม (ถ้าไม่มี ให้ fallback ไป WT)
+        if group_key in st.session_state.scada_imgs:
+            return st.session_state.scada_imgs[group_key]
+        if "WT_SYSTEM" in st.session_state.scada_imgs:
+            return st.session_state.scada_imgs["WT_SYSTEM"]
+        # ลำดับ fallback
+        for k in ["UF_SYSTEM", "BST", "MON"]:
+            if k in st.session_state.scada_imgs:
+                return st.session_state.scada_imgs[k]
+        return b""
+
+    def _run_scada_ocr(inspector: str, target_date):
+        # โหลด SCADA points จาก PointsMaster
+        all_points = load_points_master()
+        scada_points = []
+        for item in all_points:
+            t = str(item.get("type", "") or "").strip().upper()
+            name = str(item.get("name", "") or "").strip().upper()
+            # SCADA เงื่อนไข: type หรือ name มีคำว่า SCADA
+            if ("SCADA" in t) or ("SCADA" in name):
+                scada_points.append(item)
+
+        if not scada_points:
+            st.error("❌ ไม่พบจุด SCADA ใน PointsMaster (เช็คคอลัมน์ type/name ว่ามีคำว่า SCADA)")
+            return
+
+        results = {}
+        # จัด order: แยกตามกลุ่มก่อน แล้วตาม point_id
+        scada_points_sorted = sorted(scada_points, key=lambda x: (_scada_group(x), str(x.get("point_id",""))))
+
+        with st.spinner("🤖 AI กำลังอ่านค่า SCADA ..."):
+            for item in scada_points_sorted:
+                pid = str(item.get("point_id", "") or "").strip().upper()
+                if not pid:
+                    continue
+                cfg = get_meter_config(pid)
+                if not cfg:
+                    continue
+
+                # ตรวจ ROI เบื้องต้น (ถ้า ROI ผิดรูปแบบจะทำให้ AI อ่านมั่วมาก)
+                try:
+                    x1 = float(cfg.get('roi_x1', 0) or 0)
+                    y1 = float(cfg.get('roi_y1', 0) or 0)
+                    x2 = float(cfg.get('roi_x2', 0) or 0)
+                    y2 = float(cfg.get('roi_y2', 0) or 0)
+                    roi_bad = (x2 <= x1) or (y2 <= y1)
+                except:
+                    roi_bad = False
+
+                grp = _scada_group(item)
+                img_bytes = _pick_image_bytes(grp)
+                if not img_bytes:
+                    ai_val = 0.0
+                else:
+                    if roi_bad:
+                        ai_val = 0.0
+                    else:
+                        try:
+                            ai_val = float(ocr_process(img_bytes, cfg, debug=False) or 0.0)
+                        except:
+                            ai_val = 0.0
+
+                report_col_raw = str(item.get("report_col", "") or "").strip()
+                excel_col = _scada_excel_col(report_col_raw)
+                decimals = int(cfg.get("decimals", 0) or 0)
+
+                results[pid] = {
+                    "group": grp,
+                    "point_id": pid,
+                    "name": str(cfg.get("name", "") or "").strip(),
+                    "report_col_raw": report_col_raw,
+                    "excel_col": excel_col,
+                    "decimals": decimals,
+                    "ai_value": float(ai_val),
+                    "confirmed": False,
+                    "final_value": None,
+                    "status": "ROI_INVALID" if roi_bad else "AUTO_SCADA",
+                }
+
+        st.session_state.scada_results = results
+        st.session_state.scada_order = list(results.keys())
+        # เรียง order ให้เหมือนที่อ่าน
+        st.session_state.scada_order = [str(item.get("point_id","")).strip().upper() for item in scada_points_sorted if str(item.get("point_id","")).strip().upper() in results]
+        st.session_state.scada_idx = 0
+        st.session_state.scada_step = "REVIEW"
+
+    def _next_unconfirmed(start_idx: int = 0) -> int:
+        order = st.session_state.scada_order
+        res = st.session_state.scada_results
+        for i in range(max(0, start_idx), len(order)):
+            pid = order[i]
+            if pid in res and not res[pid].get("confirmed", False):
+                return i
+        return min(start_idx, max(0, len(order) - 1))
+
+    # -----------------------------
+    # Input (inspector + date)
+    # -----------------------------
     c_insp, c_date = st.columns(2)
     with c_insp:
         inspector = st.text_input("ชื่อผู้ตรวจ", "Admin", key="scada_inspector")
     with c_date:
-        selected_date = st.date_input(
-            "📅 วันที่ของข้อมูล (ลงย้อนหลังได้)",
-            value=get_thai_time().date(),
-            key="scada_date"
+        selected_date = st.date_input("📅 วันที่ของข้อมูล", value=get_thai_time().date(), key="scada_date")
+
+    st.write("---")
+
+    # -----------------------------
+    # STEP: UPLOAD 4 IMAGES
+    # -----------------------------
+    if st.session_state.scada_step == "UPLOAD":
+        st.subheader("อัปโหลดรูป SCADA (4 รูป)")
+
+        st.caption("แนะนำ: ใช้ screenshot (คมชัดกว่า) • WT/UF/BST ควรครบ • MON เป็นทางเลือก (ถ้ามี)")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            f_mon = st.file_uploader("รูปที่ 1: Monitor View (ไม่บังคับ)", type=["jpg","jpeg","png"], key="scada_mon")
+            f_wt  = st.file_uploader("รูปที่ 2: WT_SYSTEM (จำเป็น)", type=["jpg","jpeg","png"], key="scada_wt")
+        with col2:
+            f_uf  = st.file_uploader("รูปที่ 3: UF_SYSTEM (จำเป็น)", type=["jpg","jpeg","png"], key="scada_uf")
+            f_bst = st.file_uploader("รูปที่ 4: BoosterPumpCW (จำเป็น)", type=["jpg","jpeg","png"], key="scada_bst")
+
+        # เก็บ bytes ไว้ใน session (เพื่อใช้ตอน REVIEW)
+        imgs = {}
+        if f_mon is not None: imgs["MON"] = f_mon.getvalue()
+        if f_wt  is not None: imgs["WT_SYSTEM"] = f_wt.getvalue()
+        if f_uf  is not None: imgs["UF_SYSTEM"] = f_uf.getvalue()
+        if f_bst is not None: imgs["BST"] = f_bst.getvalue()
+
+        ready = ("WT_SYSTEM" in imgs) and ("UF_SYSTEM" in imgs) and ("BST" in imgs)
+
+        if ready:
+            sig = _calc_scada_signature(imgs)
+            # ถ้าเปลี่ยนรูป → reset ผลเดิม แล้วอ่านใหม่
+            if sig != st.session_state.scada_sig:
+                st.session_state.scada_sig = sig
+                st.session_state.scada_results = {}
+                st.session_state.scada_order = []
+                st.session_state.scada_idx = 0
+                st.session_state.scada_imgs = imgs
+                st.session_state.scada_urls = {}
+
+            # เริ่มอ่านอัตโนมัติ "ทันที" หลังอัปโหลดครบ (ครั้งเดียวต่อ signature)
+            if not st.session_state.scada_results:
+                # อัปโหลดรูปไปที่ GCS ก่อน เพื่อเก็บหลักฐาน 4 รูป (ครั้งเดียว)
+                urls = {}
+                for k, b in imgs.items():
+                    fname = f"SCADA_{k}_{selected_date.strftime('%Y%m%d')}_{get_thai_time().strftime('%H%M%S')}.jpg"
+                    urls[k] = upload_image_to_storage(b, fname)
+                st.session_state.scada_urls = urls
+
+                _run_scada_ocr(inspector, selected_date)
+                st.rerun()
+
+            st.success("✅ อัปโหลดครบแล้ว กำลังไปหน้า ‘ยืนยันทีละจุด’ ...")
+
+        else:
+            st.info("📌 อัปโหลดให้ครบอย่างน้อย WT / UF / BST แล้วระบบจะเริ่มอ่านค่าอัตโนมัติ")
+
+        # ปุ่มรีเซ็ต
+        if st.button("🧹 เริ่มใหม่ (ล้างผล/อัปโหลดใหม่)", use_container_width=True):
+            st.session_state.scada_step = "UPLOAD"
+            st.session_state.scada_results = {}
+            st.session_state.scada_order = []
+            st.session_state.scada_idx = 0
+            st.session_state.scada_sig = ""
+            st.session_state.scada_imgs = {}
+            st.session_state.scada_urls = {}
+            st.rerun()
+
+        st.stop()
+
+    # -----------------------------
+# -----------------------------
+# STEP: REVIEW ทีละจุด (โหมดเร็ว / 1 จุด 1 ปุ่ม)
+# -----------------------------
+if st.session_state.scada_step == "REVIEW":
+    order = st.session_state.get("scada_order", [])
+    results_map = st.session_state.get("scada_results", {})
+
+    if not order or not results_map:
+        st.warning("ยังไม่มีผล AI — กรุณากลับไปอัปโหลดรูปก่อน")
+        if st.button("⬅️ กลับไปหน้าอัปโหลด", use_container_width=True):
+            st.session_state.scada_step = "UPLOAD"
+            st.rerun()
+        st.stop()
+
+    # สร้าง flag confirmed ครั้งแรก
+    for pid0 in order:
+        if "confirmed" not in results_map.get(pid0, {}):
+            results_map[pid0]["confirmed"] = False
+            results_map[pid0]["final_value"] = None
+            results_map[pid0]["final_status"] = None
+
+    # นับความคืบหน้า
+    total = len(order)
+    done = sum(1 for p in order if results_map.get(p, {}).get("confirmed"))
+    st.subheader("ตรวจทีละจุด (ยืนยันแล้วจะลง Excel ทันที)")
+    st.progress(0 if total == 0 else done / total)
+    st.caption(f"ยืนยันแล้ว {done}/{total} จุด")
+
+    # ถ้าทำครบแล้ว
+    if done >= total:
+        st.success("✅ ยืนยันครบทุกจุดแล้ว")
+        if st.button("⬅️ กลับไปหน้าอัปโหลด (เริ่มรอบใหม่)", use_container_width=True):
+            st.session_state.scada_step = "UPLOAD"
+            st.session_state.scada_results = {}
+            st.session_state.scada_order = []
+            st.session_state.scada_idx = 0
+            st.session_state.scada_imgs = {}
+            st.session_state.scada_uploaded_urls = {}
+            st.rerun()
+        st.stop()
+
+    # เลือก index ปัจจุบัน → ถ้ายืนยันแล้วให้กระโดดไปตัวถัดไป
+    idx = int(st.session_state.get("scada_idx", 0) or 0)
+    idx = max(0, min(idx, total - 1))
+    while idx < total and results_map.get(order[idx], {}).get("confirmed"):
+        idx += 1
+    if idx >= total:
+        idx = 0
+        while idx < total and results_map.get(order[idx], {}).get("confirmed"):
+            idx += 1
+    st.session_state.scada_idx = idx
+
+    point_id = order[idx]
+    item = results_map.get(point_id, {})
+    config = get_meter_config(point_id) or {}
+    name = (config.get("name") or item.get("name") or "").strip()
+    group = (item.get("group") or config.get("scada_group") or config.get("group") or "").strip()
+
+    # เลือกรูปตามกลุ่ม (ซ่อน dropdown ไว้ใน expander)
+    group_to_key = {
+        "WT_SYSTEM": "WT_SYSTEM",
+        "UF_SYSTEM": "UF_SYSTEM",
+        "BOOSTER": "BOOSTER",
+        "MON": "MON",
+    }
+    default_img_key = group_to_key.get(str(group).strip().upper(), "WT_SYSTEM")
+    override_key_name = f"scada_imgkey_{point_id}"
+    img_key = st.session_state.get(override_key_name, default_img_key)
+
+    # -----------------------------
+    # UI แบบ "สะอาด" (ไม่โชว์หลายปุ่ม)
+    # -----------------------------
+    st.write("---")
+    st.markdown(f"### 📍 {point_id}")
+    if name:
+        st.caption(name)
+    if group:
+        st.caption(f"กลุ่ม: **{group}**")
+
+    # ปุ่มเล็ก ๆ ด้านบน (ไม่รก)
+    b_back, b_skip = st.columns([1, 1])
+    if b_back.button("⬅️ กลับไปอัปโหลด", use_container_width=True):
+        st.session_state.scada_step = "UPLOAD"
+        st.rerun()
+
+    if b_skip.button("⏭️ ข้ามจุดนี้", use_container_width=True):
+        # ทำเครื่องหมายว่า skip (ยังไม่ยืนยัน) แล้วไปจุดถัดไป
+        st.session_state.scada_idx = min(idx + 1, total - 1)
+        st.rerun()
+
+    # รูปประกอบ — ซ่อนใน expander (เปิดดูเฉพาะตอนต้องเช็ก)
+    img_bytes = _pick_image_bytes(img_key)
+    with st.expander("🖼️ ดูรูปประกอบ (ROI/Preview) — เปิดเฉพาะตอนต้องเช็ก"):
+        # ให้เลือกภาพกรณีเลือกผิด (advanced)
+        st.selectbox(
+            "เลือกภาพที่ใช้สำหรับจุดนี้ (กรณี AI อ่านเพี้ยนเพราะเลือกภาพผิด)",
+            options=list(group_to_key.values()),
+            index=list(group_to_key.values()).index(img_key) if img_key in list(group_to_key.values()) else 0,
+            key=override_key_name
+        )
+        img_key = st.session_state.get(override_key_name, img_key)
+        img_bytes = _pick_image_bytes(img_key)
+        if img_bytes:
+            try:
+                roi_preview = preprocess_image_cv(img_bytes, config, use_roi=True, variant="raw")
+                st.image(roi_preview, use_container_width=True)
+            except Exception:
+                st.image(img_bytes, use_container_width=True)
+        else:
+            st.warning("ไม่พบรูปของกลุ่มนี้ (อาจลืมอัปโหลด)")
+
+    # ค่า AI
+    ai_val = float(item.get("value") or 0.0)
+    decimals = int(config.get("decimals", 0) or 0)
+    step = 1.0 if decimals == 0 else (0.1 if decimals == 1 else 0.01)
+    fmt = "%.0f" if decimals == 0 else ("%.1f" if decimals == 1 else "%.2f")
+
+    st.write("#### 🤖 ค่า AI ที่อ่านได้")
+    st.metric("AI", fmt % ai_val)
+
+    # --------- ฟอร์มยืนยัน "จุดนี้จบเลย" ----------
+    with st.form(key=f"scada_confirm_{point_id}", clear_on_submit=False):
+        # เลือกใช้ AI หรือแก้เอง
+        default_mode = "✍️ แก้เอง" if ai_val == 0.0 else "✅ ใช้ค่า AI"
+        pick = st.radio(
+            "จะบันทึกค่าไหน?",
+            ["✅ ใช้ค่า AI", "✍️ แก้เอง"],
+            index=0 if default_mode == "✅ ใช้ค่า AI" else 1,
+            horizontal=True
         )
 
-    st.write("### อัปโหลดรูป SCADA (4 รูป)")
-    st.caption("แนะนำให้ใช้ screenshot จาก SCADA จะอ่านง่ายกว่า")
+        final_val = ai_val
+        final_status = "AUTO_SCADA"
+        if pick == "✍️ แก้เอง":
+            final_val = st.number_input("กรอกค่าที่ถูกต้อง", value=ai_val, min_value=0.0, step=step, format=fmt)
+            final_status = "MANUAL_SCADA"
 
-    img_mon = st.file_uploader("รูปที่ 1: Monitor View (จำเป็น)", type=["jpg", "jpeg", "png"], key="scada_mon")
-    img_wt  = st.file_uploader("รูปที่ 2: WT_SYSTEM (จำเป็น)", type=["jpg", "jpeg", "png"], key="scada_wt")
-    img_uf  = st.file_uploader("รูปที่ 3: UF_SYSTEM (จำเป็น)", type=["jpg", "jpeg", "png"], key="scada_uf")
-    img_bst = st.file_uploader("รูปที่ 4: BoosterPumpCW/BST (จำเป็น)", type=["jpg", "jpeg", "png"], key="scada_bst")
+        col_ok, col_re = st.columns([2, 1])
+        submitted = col_ok.form_submit_button("✅ ยืนยันจุดนี้ + ลงรายงาน", type="primary", use_container_width=True)
+        reocr = col_re.form_submit_button("🔁 ให้ AI อ่านใหม่", use_container_width=True)
 
-    missing = []
-    if img_mon is None: missing.append("Monitor View")
-    if img_wt is None:  missing.append("WT_SYSTEM")
-    if img_uf is None:  missing.append("UF_SYSTEM")
-    if img_bst is None: missing.append("BoosterPumpCW/BST")
+    # --- action: อ่านใหม่ ---
+    if reocr and img_bytes:
+        with st.spinner("🤖 AI กำลังอ่านใหม่..."):
+            new_val = _run_scada_ocr([point_id], st.session_state.get('scada_imgs', {}))
+            if new_val and isinstance(new_val, list) and new_val[0].get("value") is not None:
+                results_map[point_id]["value"] = float(new_val[0]["value"] or 0.0)
+                st.session_state.scada_results = results_map
+                st.success("อ่านใหม่เรียบร้อย")
+                st.rerun()
 
-    # --- helper: pack hash ---
-    def _hash_files(files):
-        h = hashlib.md5()
-        for f in files:
-            if f is None:
-                continue
-            try:
-                h.update(f.getvalue())
-            except Exception:
-                pass
-        return h.hexdigest()
+    # --- action: ยืนยัน ---
+    if submitted:
+        report_col = str(config.get("report_col") or item.get("report_col") or "").strip()
+        if not report_col:
+            st.error("❌ จุดนี้ไม่มี report_col ใน PointsMaster (ยังลงรายงานไม่ได้)")
+            st.stop()
 
-    # --- helper: group mapping for SCADA points ---
-    def _scada_group(item: dict) -> str:
-        rc = str(item.get("report_col", "") or "").strip().upper()
-        blob = (str(item.get("type", "")) + " " + str(item.get("name", ""))).upper()
+        # บันทึก DB + ลงรายงานทันที
+        img_url = st.session_state.get("scada_uploaded_urls", {}).get(img_key, "-")
+        ok_db = save_to_db(point_id, inspector, "SCADA", float(final_val), float(ai_val), final_status, selected_date, img_url)
+        ok_rp = export_to_real_report(point_id, float(final_val), inspector, report_col, selected_date)
 
-        # 1) ใช้ report_col เป็นตัวนำ (แม่นสุด)
-        if rc.startswith("SCADA_MON") or rc.startswith("SCADA_M"):
-            return "MON"
-        if rc.startswith("SCADA_WT"):
-            return "WT_SYSTEM"
-        if rc.startswith("SCADA_UF"):
-            return "UF_SYSTEM"
-        if rc.startswith("SCADA_BST") or rc.startswith("SCADA_BOOS") or rc.startswith("SCADA_BOOST"):
-            return "BST"
+        if ok_db and ok_rp:
+            results_map[point_id]["confirmed"] = True
+            results_map[point_id]["final_value"] = float(final_val)
+            results_map[point_id]["final_status"] = final_status
+            st.session_state.scada_results = results_map
 
-        # 2) fallback จาก type/name
-        if "MONITOR" in blob or " MON " in blob or "MON " in blob:
-            return "MON"
-        if "UF" in blob:
-            return "UF_SYSTEM"
-        if "BOOST" in blob or "BST" in blob or "PUMP" in blob or "CW" in blob:
-            return "BST"
-        return "WT_SYSTEM"
-
-    # --- helper: run OCR and build df (do NOT save yet) ---
-    def _build_scada_df(mon_bytes: bytes, wt_bytes: bytes, uf_bytes: bytes, bst_bytes: bytes):
-        import pandas as pd
-
-        points = load_points_master() or []
-        scada_points = []
-        for it in points:
-            t = (str(it.get("type", "")) + " " + str(it.get("name", "")) + " " + str(it.get("report_col", ""))).lower()
-            if "scada" in t:
-                scada_points.append(it)
-
-        # เรียงตาม group เพื่อดูง่าย
-        group_order = {"MON": 0, "WT_SYSTEM": 1, "UF_SYSTEM": 2, "BST": 3}
-        scada_points.sort(key=lambda x: (group_order.get(_scada_group(x), 9), str(x.get("point_id", ""))))
-
-        bytes_map = {
-            "MON": mon_bytes,
-            "WT_SYSTEM": wt_bytes,
-            "UF_SYSTEM": uf_bytes,
-            "BST": bst_bytes,
-        }
-
-        rows = []
-        for it in scada_points:
-            pid = str(it.get("point_id", "") or "").strip().upper()
-            if not pid:
-                continue
-
-            cfg = get_meter_config(pid)
-            if not cfg:
-                continue
-
-            grp = _scada_group(it)
-            src_bytes = bytes_map.get(grp, wt_bytes)
-
-            ai_raw = float(ocr_process(src_bytes, cfg, debug=False) or 0.0)
-
-            dec = int(cfg.get("decimals", 0) or 0)
-            if dec <= 0:
-                ai_val = float(int(round(ai_raw)))
-            else:
-                ai_val = round(ai_raw, dec)
-
-            # default: ถ้า AI ได้ 0 → ให้แก้เอง
-            use_ai = (ai_val != 0.0)
-            final_val = ai_val
-
-            status = "AUTO_SCADA" if use_ai else "FLAGGED_SCADA"
-
-            rows.append({
-                "group": grp,
-                "point_id": pid,
-                "name": str(cfg.get("name", "") or ""),
-                "report_col": str(cfg.get("report_col", "") or ""),
-                "decimals": dec,
-                "ai_value": ai_val,
-                "use_ai": use_ai,
-                "final_value": final_val,
-                "status": status,
-            })
-
-        df = pd.DataFrame(rows)
-        if not df.empty:
-            # ให้ final_value เป็น numeric เสมอ
-            df["final_value"] = pd.to_numeric(df["final_value"], errors="coerce").fillna(0.0)
-            df["ai_value"] = pd.to_numeric(df["ai_value"], errors="coerce").fillna(0.0)
-        return df
-
-    if missing:
-        st.warning("⚠️ ยังอัปโหลดรูปไม่ครบ: " + ", ".join(missing))
-        st.stop()
-
-    # --- AUTO OCR on upload (only when images change) ---
-    pack_hash = _hash_files([img_mon, img_wt, img_uf, img_bst])
-    if pack_hash and pack_hash != st.session_state.scada_pack_hash:
-        with st.spinner("🤖 AI กำลังอ่านค่าจากรูป SCADA..."):
-            df_new = _build_scada_df(
-                img_mon.getvalue(),
-                img_wt.getvalue(),
-                img_uf.getvalue(),
-                img_bst.getvalue(),
-            )
-        st.session_state.scada_df = df_new
-        st.session_state.scada_pack_hash = pack_hash
-
-    df = st.session_state.scada_df
-    if df is None or getattr(df, "empty", True):
-        st.error("❌ ยังไม่มีผลลัพธ์จาก AI (ตรวจว่า PointsMaster มีจุด SCADA และรูปอ่านได้)")
-        st.stop()
-
-    st.write("---")
-    st.subheader("สรุปค่าที่ AI อ่านได้ (แก้/ยืนยันได้ก่อนบันทึก)")
-
-    total_cnt = len(df)
-    need_fix = df[(df["ai_value"].fillna(0).astype(float) == 0.0) | (df["use_ai"] == False)]
-    fix_cnt = len(need_fix)
-
-    st.info(f"รวม {total_cnt} จุด | ต้องตรวจ/แก้ {fix_cnt} จุด (ค่า AI = 0 หรือเลือกไม่ใช้ค่า AI)")
-
-    # ✅ กันกระพริบ/ค่าหาย: ใช้ form เพื่อไม่ให้หน้า rerun ทุกครั้งที่พิมพ์
-    tab_fix, tab_table = st.tabs(["✅ แก้เฉพาะจุดที่ต้องแก้ (แนะนำ)", "🧾 แก้ในตาราง (ถ้าจำเป็น)"])
-
-    with tab_fix:
-        st.caption("โหมดนี้จะนิ่งกว่า ไม่กระพริบ และค่าที่พิมพ์จะไม่หาย (กดปุ่มด้านล่างเพื่ออัปเดต)")
-        if fix_cnt == 0:
-            st.success("ไม่มีจุดที่ต้องแก้ ✅")
+            # ไปจุดถัดไปอัตโนมัติ
+            st.session_state.scada_idx = min(idx + 1, total - 1)
+            st.success("✅ ยืนยันและลงรายงานแล้ว — ไปจุดถัดไป")
+            st.rerun()
         else:
-            with st.form("scada_fix_form", clear_on_submit=False):
-                st.warning(f"มี {fix_cnt} จุดที่ต้องแก้/ยืนยัน (ระบบตั้งให้กรอกเอง)")
-                for _, r in need_fix.iterrows():
-                    pid = str(r.get("point_id", "")).strip().upper()
-                    nm  = str(r.get("name", ""))
-                    grp = str(r.get("group", ""))
+            if not ok_db:
+                st.error("❌ บันทึก DB ไม่สำเร็จ (DailyReadings)")
+            if not ok_rp:
+                st.error("❌ ลงรายงานไม่สำเร็จ (TEST waterreport)")
 
-                    cfg = get_meter_config(pid) or {}
-                    decimals = int(cfg.get("decimals", 0) or 0)
-                    step = 1.0 if decimals == 0 else (0.1 if decimals == 1 else 0.01)
-                    fmt  = "%.0f" if decimals == 0 else ("%.1f" if decimals == 1 else "%.2f")
+    st.stop()
 
-                    ai_val = float(r.get("ai_value", 0.0) or 0.0)
-                    default_val = float(r.get("final_value", ai_val) or ai_val or 0.0)
-
-                    st.markdown(f"### 🚩 {pid}")
-                    st.caption(f"{grp} | {nm}")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.metric("ค่า AI", fmt % ai_val)
-                    with c2:
-                        st.number_input(
-                            "กรอกค่าที่ถูกต้อง",
-                            value=float(default_val),
-                            step=step,
-                            format=fmt,
-                            key=f"fix_val_{pid}",
-                        )
-                    st.write("")
-
-                apply_fix = st.form_submit_button("✅ ใช้ค่าที่กรอก (อัปเดตข้อมูล)")
-            if apply_fix:
-                for _, r in need_fix.iterrows():
-                    pid = str(r.get("point_id", "")).strip().upper()
-                    new_val = float(st.session_state.get(f"fix_val_{pid}", 0.0) or 0.0)
-
-                    # อัปเดตค่าที่จะบันทึก
-                    df.loc[df["point_id"] == pid, "use_ai"] = False
-                    df.loc[df["point_id"] == pid, "final_value"] = new_val
-                    df.loc[df["point_id"] == pid, "status"] = "FLAGGED_SCADA"
-
-                st.session_state.scada_df = df
-                st.success("อัปเดตเรียบร้อย ✅ (เลื่อนลงไปกด 'บันทึกทั้งหมด')")
-
-    with tab_table:
-        st.caption("ถ้าจำเป็นต้องแก้หลายจุดพร้อมกัน ใช้ตารางนี้ได้ แต่แนะนำให้แก้เฉพาะจุดที่ต้องแก้ด้านซ้ายจะเร็วกว่า")
-        with st.form("scada_table_form", clear_on_submit=False):
-            show_df = df[["group", "point_id", "name", "ai_value", "use_ai", "final_value"]].copy()
-
-            edited = st.data_editor(
-                show_df,
-                hide_index=True,
-                use_container_width=True,
-                column_config={
-                    "ai_value": st.column_config.NumberColumn("ai_value", disabled=True),
-                    "use_ai": st.column_config.CheckboxColumn("✅ ใช้ค่า AI", help="ถ้าเอาติ๊กออก แปลว่าจะกรอกเองในคอลัมน์ final_value"),
-                    "final_value": st.column_config.NumberColumn("final_value", help="ค่าที่จะบันทึกจริง (ถ้าไม่ใช้ AI ให้กรอกเองตรงนี้)"),
-                },
-                key="scada_editor",
-            )
-
-            apply_table = st.form_submit_button("✅ ใช้ค่าที่แก้ในตาราง (อัปเดตข้อมูล)")
-        if apply_table:
-            st.session_state.scada_df = edited
-            df = edited
-            st.success("อัปเดตข้อมูลจากตารางเรียบร้อย ✅")
-
-    st.write("---")
-    colA, colB, colC = st.columns(3)
-
-    if colB.button("🔁 อ่านใหม่จากรูปเดิม", use_container_width=True):
-        st.session_state.scada_pack_hash = ""
-        st.session_state.scada_df = None
-        st.rerun()
-
-    if colC.button("🧹 ล้างผลลัพธ์/เริ่มใหม่", use_container_width=True):
-        st.session_state.scada_pack_hash = ""
-        st.session_state.scada_df = None
-        # เคลียร์ไฟล์ใน uploader ได้ยากใน Streamlit → ให้ผู้ใช้กด X ลบไฟล์เอง
-        st.rerun()
-
-    if colA.button("💾 บันทึกทั้งหมด", type="primary", use_container_width=True):
-        try:
-            df_save = st.session_state.scada_df.copy()
-
-            # คำนวณค่า final จาก use_ai
-            final_values = []
-            statuses = []
-            for _, row in df_save.iterrows():
-                ai_val = float(row.get("ai_value") or 0.0)
-                use_ai = bool(row.get("use_ai"))
-                fv = ai_val if use_ai else float(row.get("final_value") or 0.0)
-
-                # ถ้า fv = 0 ให้ถือว่า FLAGGED (ไม่ลงรายงาน) เพื่อกันข้อมูลผิด
-                status = "AUTO_SCADA" if use_ai else "MANUAL_SCADA"
-                if float(fv) == 0.0:
-                    status = "FLAGGED_SCADA"
-
-                final_values.append(float(fv))
-                statuses.append(status)
-
-            df_save["final_calc"] = final_values
-            df_save["status_calc"] = statuses
-
-            # อัปโหลด 4 รูปครั้งเดียว แล้วเอา URL ไปใส่ทุกแถว
-            ts = get_thai_time().strftime("%H%M%S")
-            base = selected_date.strftime("%Y%m%d")
-
-            urls = {}
-            urls["MON"] = upload_image_to_storage(img_mon.getvalue(), f"SCADA_MON_{base}_{ts}.jpg")
-            urls["WT"]  = upload_image_to_storage(img_wt.getvalue(),  f"SCADA_WT_{base}_{ts}.jpg")
-            urls["UF"]  = upload_image_to_storage(img_uf.getvalue(),  f"SCADA_UF_{base}_{ts}.jpg")
-            urls["BST"] = upload_image_to_storage(img_bst.getvalue(), f"SCADA_BST_{base}_{ts}.jpg")
-
-            pack_url = f"MON:{urls['MON']} | WT:{urls['WT']} | UF:{urls['UF']} | BST:{urls['BST']}"
-
-            ok_cnt = 0
-            flag_cnt2 = 0
-
-            for _, row in df_save.iterrows():
-                pid = str(row.get("point_id", "")).strip().upper()
-                cfg = get_meter_config(pid)
-                report_col = str(cfg.get("report_col", "") or "") if cfg else ""
-
-                ai_val = float(row.get("ai_value") or 0.0)
-                final_val = float(row.get("final_calc") or 0.0)
-                status = str(row.get("status_calc") or "FLAGGED_SCADA")
-
-                # save to DB (meter_type = SCADA)
-                save_to_db(
-                    pid,
-                    inspector,
-                    "SCADA",
-                    final_val,
-                    ai_val,
-                    status,
-                    selected_date,
-                    pack_url
-                )
-
-                # export เฉพาะที่ไม่ flagged
-                if status != "FLAGGED_SCADA" and report_col:
-                    export_to_real_report(pid, final_val, inspector, report_col, selected_date)
-                    ok_cnt += 1
-                else:
-                    flag_cnt2 += 1
-
-            st.success(f"✅ บันทึกแล้ว {ok_cnt} จุด")
-            if flag_cnt2 > 0:
-                st.warning(f"⚠️ ยังมี {flag_cnt2} จุดที่ค่าเป็น 0 (FLAGGED_SCADA) → ไปตรวจ/แก้ในหน้า Admin ได้")
-
-        except Exception as e:
-            st.error(f"❌ บันทึกไม่สำเร็จ: {e}")
 elif mode == "👮‍♂️ Admin Approval":
     st.title("👮‍♂️ Admin Dashboard")
     st.caption("1) ตรวจงานที่ระบบ Flag  2) เช็คจุดที่ “ยังไม่มีรูป/ยังไม่มีข้อมูล”")
