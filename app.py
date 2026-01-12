@@ -221,24 +221,80 @@ def get_meter_config(point_id):
     except: return None
 
 # ✅ แก้ไข: รับ target_date เพื่อลงให้ถูกวัน
-def export_to_real_report(point_id, read_value, inspector, report_col, target_date):
-    if not report_col: return False
+def export_to_real_report(point_id, read_value, inspector, report_col, target_date, debug=False):
+    """ส่งค่าลง Google Sheet REAL_REPORT_SHEET
+    - debug=False: คืน True/False เหมือนเดิม
+    - debug=True : คืน (ok, message) เพื่อโชว์สาเหตุเวลาส่งไม่เข้า
+    """
+
+    def _ret(ok, msg=""):
+        return (ok, msg) if debug else ok
+
+    if not report_col:
+        return _ret(False, "report_col ว่าง")
+    report_col = str(report_col).strip()
+    if report_col in ("-", "—", "–"):
+        return _ret(False, "report_col เป็น '-' (ยังไม่ได้ตั้งค่าใน PointsMaster)")
+
+    # เปิดชีท
     try:
         sh = gc.open(REAL_REPORT_SHEET)
-        # หา Sheet ตามเดือนของวันที่เลือก
+    except Exception as e:
+        return _ret(False, f"เปิดชีท '{REAL_REPORT_SHEET}' ไม่ได้: {e}")
+
+    # หาแท็บเดือน
+    sheet_name = None
+    try:
         sheet_name = get_thai_sheet_name(sh, target_date)
+    except Exception:
+        sheet_name = None
+
+    # ถ้าไม่เจอ → หาแบบฟัซซี่ (ตัดช่องว่าง/จุด)
+    if not sheet_name:
+        try:
+            thai_months = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
+            m_idx = target_date.month - 1
+            yy2 = str(target_date.year + 543)[-2:]
+            yy4 = str(target_date.year + 543)
+            m_norm = thai_months[m_idx].replace(".", "").replace(" ", "")
+
+            def norm(x):
+                return str(x).replace(".", "").replace(" ", "").strip()
+
+            for t in [s.title for s in sh.worksheets()]:
+                tn = norm(t)
+                if (m_norm in tn) and (yy2 in tn or yy4 in tn):
+                    sheet_name = t
+                    break
+        except Exception:
+            sheet_name = None
+
+    # เปิด worksheet
+    try:
         ws = sh.worksheet(sheet_name) if sheet_name else sh.get_worksheet(0)
-        
-        # ใช้วันที่ที่เลือก (day) หาแถว
-        target_day = target_date.day
+    except Exception as e:
+        return _ret(False, f"เปิดแท็บ '{sheet_name}' ไม่ได้: {e}")
+
+    # หาแถวของวัน
+    try:
+        target_day = int(target_date.day)
         target_row = find_day_row_exact(ws, target_day) or (6 + target_day)
-        
-        target_col = col_to_index(report_col)
-        if target_col == 0: return False
-        
+    except Exception as e:
+        return _ret(False, f"หาแถวของวันไม่สำเร็จ: {e}")
+
+    # หา col
+    target_col = col_to_index(report_col)
+    if target_col == 0:
+        return _ret(False, f"report_col '{report_col}' แปลงเป็นคอลัมน์ไม่ได้")
+
+    # เขียนค่า
+    try:
         ws.update_cell(target_row, target_col, read_value)
-        return True
-    except: return False
+        return _ret(True, f"OK → sheet='{ws.title}', row={target_row}, col={report_col}({target_col}), val={read_value}")
+    except Exception as e:
+        return _ret(False, f"เขียนค่าไม่สำเร็จ: {e}")
+
+
 
 # ✅ แก้ไข: รับ target_date เพื่อลง Timestamp ให้ถูกวัน
 def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, target_date, image_url="-"):
@@ -683,7 +739,9 @@ if mode == "📝 พนักงานจดมิเตอร์":
 
             ok = save_to_db(point_id, inspector, meter_type, float(final_val), float(ai_val), status, selected_date, image_url)
             if ok:
-                export_to_real_report(point_id, float(final_val), inspector, report_col, selected_date)
+                ok_r, msg_r = export_to_real_report(point_id, float(final_val), inspector, report_col, selected_date, debug=True)
+                if not ok_r:
+                    st.warning('⚠️ ส่งค่าไป TEST waterreport ไม่สำเร็จ: ' + msg_r)
                 st.success("✅ บันทึกสำเร็จ")
 
                 # ไปจุดถัดไป
@@ -759,7 +817,9 @@ elif mode == "👮‍♂️ Admin Approval":
                                     except:
                                         approve_date = get_thai_time().date() # fallback
                                         
-                                    export_to_real_report(point_id, choice, str(item.get('inspector', '')), report_col, approve_date)
+                                    ok_r, msg_r = export_to_real_report(point_id, choice, str(item.get('inspector', '')), report_col, approve_date, debug=True)
+                                    if not ok_r:
+                                        st.warning('⚠️ ส่งค่าไป TEST waterreport ไม่สำเร็จ: ' + msg_r)
                                     updated = True; break
                             if updated: st.success("Approved!"); st.rerun()
                             else: st.warning("หา row ไม่เจอ")
