@@ -10,11 +10,14 @@ from google.cloud import vision
 from google.cloud import storage
 from datetime import datetime, timedelta, timezone
 import string
+import zipfile
+import xml.etree.ElementTree as ET
 
 # =========================================================
 # --- 📦 CONFIGURATION ---
 # =========================================================
 BUCKET_NAME = 'water-meter-images-watertreatmentplant'
+SCADA_TEMPLATE_XLSX_BLOB = 'templates/WaterMeter_DB.xlsx'  # ✅ ไฟล์ mapping ที่มีรูป Remark (กรอบแดง)
 DB_SHEET_NAME = 'WaterMeter_System_DB'
 REAL_REPORT_SHEET = 'TEST waterreport'
 
@@ -574,6 +577,236 @@ def missing_required_photos(meter_type: str, image_url: str):
 # =========================================================
 # --- UI ---
 # =========================================================
+
+# =========================================================
+# --- 🟥 SCADA TEMPLATE ROI (ดึงจาก WaterMeter_DB Remark) ---
+# =========================================================
+def _norm_pid(pid: str) -> str:
+    return re.sub(r"[^A-Z0-9_]", "_", str(pid or "").strip().upper().replace("-", "_"))
+
+def _resolve_xlsx_target(target: str) -> str:
+    # target เช่น ../media/image13.png
+    t = (target or "").replace("..", "xl").lstrip("/")
+    if not t.startswith("xl/"):
+        t = "xl/" + t
+    return t
+
+def _detect_red_box_roi(bgr: np.ndarray):
+    """หากรอบแดงในภาพ template แล้วคืนค่า (x1,y1,x2,y2)"""
+    if bgr is None:
+        return None
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    lower1 = np.array([0, 70, 50]);   upper1 = np.array([10, 255, 255])
+    lower2 = np.array([170, 70, 50]); upper2 = np.array([180, 255, 255])
+    mask = cv2.inRange(hsv, lower1, upper1) | cv2.inRange(hsv, lower2, upper2)
+
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+
+    areas = [cv2.contourArea(c) for c in cnts]
+    i = int(np.argmax(areas))
+    if areas[i] < 200:
+        return None
+
+    x, y, w, h = cv2.boundingRect(cnts[i])
+    return (int(x), int(y), int(x + w), int(y + h))
+
+def _prepare_template_gray(bgr: np.ndarray):
+    """ทำ template เป็น gray และลบสีแดงออก (กัน match ไปติดกรอบแดง)"""
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    lower1 = np.array([0, 70, 50]);   upper1 = np.array([10, 255, 255])
+    lower2 = np.array([170, 70, 50]); upper2 = np.array([180, 255, 255])
+    redmask = cv2.inRange(hsv, lower1, upper1) | cv2.inRange(hsv, lower2, upper2)
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray[redmask > 0] = 255
+    return gray
+
+def _build_scada_template_map_from_xlsx_bytes(xlsx_bytes: bytes):
+    """อ่าน WaterMeter_DB.xlsx (sheet POINTS) แล้วดึงรูป Remark + ROI (กรอบแดง)"""
+    out = {}
+    if not xlsx_bytes:
+        return out
+
+    zf = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
+
+    # หา drawing จาก sheet1 (POINTS)
+    try:
+        rels_xml = zf.read("xl/worksheets/_rels/sheet1.xml.rels")
+    except Exception:
+        return out
+
+    ns_rel = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
+    rels = ET.fromstring(rels_xml)
+    drawing_target = None
+    for rel in rels.findall("r:Relationship", ns_rel):
+        if (rel.get("Type", "") or "").endswith("/drawing"):
+            drawing_target = rel.get("Target")
+            break
+    if not drawing_target:
+        return out
+
+    drawing_path = _resolve_xlsx_target(drawing_target)  # xl/drawings/drawing1.xml
+    try:
+        drawing_xml = zf.read(drawing_path)
+    except Exception:
+        return out
+
+    # drawing rels -> media
+    drawing_rels_path = drawing_path.replace("xl/drawings/", "xl/drawings/_rels/") + ".rels"
+    try:
+        drel_xml = zf.read(drawing_rels_path)
+    except Exception:
+        return out
+
+    drel = ET.fromstring(drel_xml)
+    rel_map = {}
+    for rel in drel.findall("r:Relationship", ns_rel):
+        rel_map[rel.get("Id")] = rel.get("Target")
+
+    # อ่าน PointID แถว 2..200 (ด้วย openpyxl เพื่อให้ได้ shared strings)
+    pid_by_excel_row = {}
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), read_only=True, data_only=True)
+        ws = wb["POINTS"] if "POINTS" in wb.sheetnames else wb[wb.sheetnames[0]]
+        for r in range(2, 200):
+            pid = ws.cell(row=r, column=1).value
+            if pid:
+                pid_by_excel_row[r] = str(pid).strip()
+    except Exception:
+        pass
+
+    ns_draw = {
+        "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    }
+    draw = ET.fromstring(drawing_xml)
+
+    for one in draw.findall("xdr:oneCellAnchor", ns_draw):
+        frm = one.find("xdr:from", ns_draw)
+        if frm is None:
+            continue
+        row0 = int(frm.find("xdr:row", ns_draw).text)
+        excel_row = row0 + 1
+        pid = pid_by_excel_row.get(excel_row)
+        if not pid:
+            continue
+
+        pic = one.find("xdr:pic", ns_draw)
+        if pic is None:
+            continue
+        # blip embed id
+        blip = pic.find(".//a:blip", {"a": ns_draw["a"]})
+        if blip is None:
+            continue
+        rid = blip.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
+        target = rel_map.get(rid)
+        if not target:
+            continue
+
+        media_path = _resolve_xlsx_target(target)
+        try:
+            img_bytes = zf.read(media_path)
+        except Exception:
+            continue
+
+        bgr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if bgr is None:
+            continue
+
+        roi = _detect_red_box_roi(bgr)
+        if not roi:
+            continue
+
+        out[_norm_pid(pid)] = {
+            "template_gray": _prepare_template_gray(bgr),
+            "roi": roi,  # (x1,y1,x2,y2) ใน template px
+        }
+
+    return out
+
+@st.cache_resource(ttl=86400)
+def load_scada_template_map():
+    """โหลด WaterMeter_DB.xlsx จาก bucket (โหลดวันละครั้ง)"""
+    try:
+        bucket = STORAGE_CLIENT.bucket(BUCKET_NAME)
+        blob = bucket.blob(SCADA_TEMPLATE_XLSX_BLOB)
+        xlsx_bytes = blob.download_as_bytes()
+    except Exception:
+        return {}
+    return _build_scada_template_map_from_xlsx_bytes(xlsx_bytes)
+
+def crop_scada_roi_by_template(full_image_bytes: bytes, point_id: str):
+    templates = load_scada_template_map()
+    info = templates.get(_norm_pid(point_id))
+    if not info:
+        return None, {"reason": "no_template"}
+
+    full = cv2.imdecode(np.frombuffer(full_image_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if full is None:
+        return None, {"reason": "bad_full_image"}
+    full_gray = cv2.cvtColor(full, cv2.COLOR_BGR2GRAY)
+
+    templ = info["template_gray"]
+    rx1, ry1, rx2, ry2 = info["roi"]
+
+    best_score = -1.0
+    best_loc = None
+    best_scale = 1.0
+
+    scales = [1.0, 0.95, 1.05, 0.9, 1.1, 0.85, 1.15]
+    fh, fw = full_gray.shape[:2]
+    for s in scales:
+        t = templ if abs(s - 1.0) < 1e-6 else cv2.resize(templ, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+        th, tw = t.shape[:2]
+        if th >= fh or tw >= fw:
+            continue
+        res = cv2.matchTemplate(full_gray, t, cv2.TM_CCOEFF_NORMED)
+        _, maxv, _, maxl = cv2.minMaxLoc(res)
+        if float(maxv) > best_score:
+            best_score = float(maxv)
+            best_loc = maxl
+            best_scale = float(s)
+
+    if best_loc is None or best_score < 0.45:
+        return None, {"reason": "match_fail", "score": best_score}
+
+    x0, y0 = best_loc
+    s = best_scale
+
+    x1 = int(x0 + rx1 * s)
+    y1 = int(y0 + ry1 * s)
+    x2 = int(x0 + rx2 * s)
+    y2 = int(y0 + ry2 * s)
+
+    pad = 6
+    x1 = max(0, x1 - pad); y1 = max(0, y1 - pad)
+    x2 = min(full.shape[1], x2 + pad); y2 = min(full.shape[0], y2 + pad)
+
+    if x2 <= x1 or y2 <= y1:
+        return None, {"reason": "roi_bad"}
+
+    crop = full[y1:y2, x1:x2]
+    ok, enc = cv2.imencode(".png", crop)
+    if not ok:
+        return None, {"reason": "encode_fail"}
+
+    return enc.tobytes(), {"reason": "ok", "score": best_score, "scale": s}
+
+def ocr_process_scada(full_image_bytes: bytes, config: dict, point_id: str):
+    crop_bytes, dbg = crop_scada_roi_by_template(full_image_bytes, point_id)
+    if crop_bytes:
+        cfg2 = dict(config or {})
+        cfg2["roi_x1"] = 0; cfg2["roi_y1"] = 0; cfg2["roi_x2"] = 0; cfg2["roi_y2"] = 0
+        return ocr_process(crop_bytes, cfg2, debug=False), crop_bytes, dbg
+    return ocr_process(full_image_bytes, config, debug=False), None, dbg
+
+
 mode = st.sidebar.radio(
     "🔧 เลือกโหมดการทำงาน",
     ["📝 พนักงานจดมิเตอร์", "📟 SCADA (4 รูป)", "👮‍♂️ Admin Approval"]
