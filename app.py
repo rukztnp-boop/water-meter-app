@@ -1,3 +1,4 @@
+import hashlib
 import streamlit as st
 import io
 import re
@@ -80,10 +81,66 @@ def upload_image_to_storage(image_bytes, file_name):
     try:
         bucket = STORAGE_CLIENT.bucket(BUCKET_NAME)
         blob = bucket.blob(file_name)
-        blob.upload_from_string(image_bytes, content_type='image/jpeg')
+
+        # ตั้งค่า Content-Type ให้ตรงกับนามสกุลไฟล์ (มือถือเปิดรูปได้ถูกต้อง)
+        ext = str(file_name).lower().split(".")[-1] if "." in str(file_name) else "jpg"
+        content_type = "image/png" if ext == "png" else "image/jpeg"
+
+        blob.upload_from_string(image_bytes, content_type=content_type)
         return blob.public_url
     except Exception as e:
         return f"Error: {e}"
+
+
+# =========================================================
+# --- 🖼️ REFERENCE IMAGE (Auto Find) ---
+# =========================================================
+REF_IMAGE_FOLDER = "ref_images"
+
+@st.cache_data(ttl=3600)
+def load_ref_image_bytes_any(point_id: str):
+    """
+    หา reference รูปให้เอง:
+    1) ref_images/POINT.(jpg/png)
+    2) POINT.(jpg/png) ใน root
+    3) ถ้าไม่เจอ → หาไฟล์ล่าสุดที่ขึ้นต้นด้วย POINT_ (เช่น POINT_2026...jpg)
+    คืนค่า: (bytes, path) หรือ (None, None)
+    """
+    pid = str(point_id).strip().upper()
+    bucket = STORAGE_CLIENT.bucket(BUCKET_NAME)
+
+    # 1) ลองชื่อมาตรฐานก่อน
+    candidates = []
+    for ext in ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG"]:
+        candidates += [
+            f"{REF_IMAGE_FOLDER}/{pid}.{ext}",
+            f"{pid}.{ext}",
+        ]
+
+    # ลองดาวน์โหลดตรง ๆ (ไม่ต้องใช้ exists เพื่อกันเวอร์ชันไลบรารีต่างกัน)
+    for path in candidates:
+        try:
+            blob = bucket.blob(path)
+            data = blob.download_as_bytes()
+            if data:
+                return data, path
+        except Exception:
+            pass
+
+    # 2) หาแบบ prefix เอาไฟล์ล่าสุด (POINT_....jpg/png)
+    try:
+        blobs = list(bucket.list_blobs(prefix=f"{pid}_"))
+        blobs = [b for b in blobs if str(b.name).lower().endswith((".jpg", ".jpeg", ".png"))]
+        if blobs:
+            blobs.sort(key=lambda b: b.updated or datetime.min, reverse=True)
+            b = blobs[0]
+            data = b.download_as_bytes()
+            return data, b.name
+    except Exception:
+        pass
+
+    return None, None
+
 
 # =========================================================
 # --- SHEET HELPERS ---
@@ -164,98 +221,24 @@ def get_meter_config(point_id):
     except: return None
 
 # ✅ แก้ไข: รับ target_date เพื่อลงให้ถูกวัน
-def export_to_real_report(point_id, read_value, inspector, report_col, target_date, debug=False):
-    """ส่งค่าลง Google Sheet 'REAL_REPORT_SHEET' ตามคอลัมน์ report_col และแถวของวัน (target_date.day)
-
-    ถ้า debug=True จะคืน (ok, message) และช่วยโชว์สาเหตุเวลาไม่ลง
-    ปกติคืนค่า True/False เหมือนเดิม
-    """
-    def _ret(ok, msg=""):
-        if debug:
-            return ok, msg
-        return ok
-
-    # กันค่าคอลัมน์ว่าง/ผิด
-    if not report_col:
-        return _ret(False, "report_col ว่าง")
-    report_col = str(report_col).strip()
-    if report_col in ("-", "—", "–"):
-        return _ret(False, "report_col เป็น '-' (ยังไม่ได้ตั้งค่าใน PointsMaster)")
-
+def export_to_real_report(point_id, read_value, inspector, report_col, target_date):
+    if not report_col: return False
     try:
         sh = gc.open(REAL_REPORT_SHEET)
-    except Exception as e:
-        return _ret(False, f"เปิดชีท REAL_REPORT_SHEET ไม่ได้: {e}")
-
-    # หา worksheet ชื่อเดือน (ถ้าไม่เจอให้เดาแบบฟัซซี่)
-    try:
+        # หา Sheet ตามเดือนของวันที่เลือก
         sheet_name = get_thai_sheet_name(sh, target_date)
-    except Exception as e:
-        sheet_name = None
-        if debug:
-            pass
-
-    if not sheet_name:
-        # fuzzy: หาแท็บที่มีเดือน+ปี (ทั้ง 2 หลัก/4 หลัก) โดยตัดช่องว่างและจุด
-        try:
-            thai_months = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
-            m_idx = target_date.month - 1
-            yy2 = str(target_date.year + 543)[-2:]
-            yy4 = str(target_date.year + 543)
-            m_raw = thai_months[m_idx]
-            m_norm = m_raw.replace(".", "").replace(" ", "")
-            titles = [s.title for s in sh.worksheets()]
-
-            def norm(x):
-                return str(x).replace(".", "").replace(" ", "").strip()
-
-            for t in titles:
-                tn = norm(t)
-                if (m_norm in tn) and (yy2 in tn or yy4 in tn):
-                    sheet_name = t
-                    break
-        except Exception:
-            sheet_name = None
-
-    # ถ้ายังไม่เจอ ใช้แท็บแรก แต่แจ้งเตือนใน debug
-    if sheet_name:
-        try:
-            ws = sh.worksheet(sheet_name)
-        except Exception as e:
-            return _ret(False, f"เปิดแท็บ '{sheet_name}' ไม่ได้: {e}")
-    else:
-        try:
-            ws = sh.get_worksheet(0)
-        except Exception as e:
-            return _ret(False, f"เปิดแท็บแรกไม่สำเร็จ: {e}")
-        if debug:
-            # บอกว่าเดาไม่เจอชื่อเดือน
-            pass
-
-    # หาแถวของวัน
-    try:
-        target_day = int(target_date.day)
-    except Exception:
-        return _ret(False, "target_date ไม่ถูกต้อง")
-
-    try:
+        ws = sh.worksheet(sheet_name) if sheet_name else sh.get_worksheet(0)
+        
+        # ใช้วันที่ที่เลือก (day) หาแถว
+        target_day = target_date.day
         target_row = find_day_row_exact(ws, target_day) or (6 + target_day)
-    except Exception as e:
-        return _ret(False, f"หาแถวของวันไม่สำเร็จ: {e}")
-
-    # หาเลขคอลัมน์
-    target_col = col_to_index(report_col)
-    if target_col == 0:
-        return _ret(False, f"report_col '{report_col}' แปลงเป็นคอลัมน์ไม่ได้")
-
-    # เขียนค่า
-    try:
+        
+        target_col = col_to_index(report_col)
+        if target_col == 0: return False
+        
         ws.update_cell(target_row, target_col, read_value)
-        if debug:
-            return True, f"OK → sheet='{ws.title}', row={target_row}, col={report_col}({target_col}), val={read_value}"
         return True
-    except Exception as e:
-        return _ret(False, f"เขียนค่าไม่สำเร็จ: {e}")
+    except: return False
 
 # ✅ แก้ไข: รับ target_date เพื่อลง Timestamp ให้ถูกวัน
 def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, target_date, image_url="-"):
@@ -457,7 +440,35 @@ def ocr_process(image_bytes, config, debug=False):
 def calc_tolerance(decimals: int) -> float:
     if decimals <= 0: return 0.5
     return 0.5 * (10 ** (-decimals))
+# =========================================================
+# --- 🔳 QR + REF IMAGE HELPERS (Mobile) ---
+# =========================================================
+REF_IMAGE_FOLDER = "ref_images"  # โฟลเดอร์รูปตัวอย่างใน Bucket
 
+def get_ref_image_url(point_id: str) -> str:
+    pid = str(point_id).strip().upper()
+    return f"https://storage.googleapis.com/{BUCKET_NAME}/{REF_IMAGE_FOLDER}/{pid}.jpg"
+
+def decode_qr(image_bytes: bytes):
+    """คืนค่า point_id จาก QR (ถ้าอ่านไม่ได้จะคืน None)"""
+    try:
+        arr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        detector = cv2.QRCodeDetector()
+        data, _, _ = detector.detectAndDecode(img)
+        data = (data or "").strip()
+        return data.upper() if data else None
+    except:
+        return None
+
+def infer_meter_type(config: dict) -> str:
+    """เดา meter_type จาก config เพื่อกันกรอกผิด"""
+    blob = f"{config.get('type','')} {config.get('name','')}".lower()
+    if ("น้ำ" in blob) or ("water" in blob) or ("ประปา" in blob):
+        return "Water"
+    return "Electric"
 # =========================================================
 # --- UI LOGIC ---
 # =========================================================
@@ -466,107 +477,230 @@ mode = st.sidebar.radio("🔧 เลือกโหมดการทำงา�
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
     st.markdown("### Water treatment Plant - Borthongindustrial")
-    st.caption("Version 6.0 (Date Selection Supported)")
+    st.caption("Version 6.1 (QR-first for Mobile)")
 
+    # --- session state ---
     if 'confirm_mode' not in st.session_state: st.session_state.confirm_mode = False
     if 'warning_msg' not in st.session_state: st.session_state.warning_msg = ""
     if 'last_manual_val' not in st.session_state: st.session_state.last_manual_val = 0.0
 
+    if "emp_step" not in st.session_state: st.session_state.emp_step = "SCAN_QR"
+    if "emp_point_id" not in st.session_state: st.session_state.emp_point_id = ""
+
     all_meters = load_points_master()
-    if not all_meters: st.stop()
+    if not all_meters:
+        st.error("❌ โหลด PointsMaster ไม่ได้")
+        st.stop()
 
-    col_type, col_insp = st.columns(2)
-    with col_type: cat_select = st.radio("ประเภทมิเตอร์", ["💧 ประปา (Water)", "⚡️ ไฟฟ้า (Electric)"], horizontal=True)
-    with col_insp: inspector = st.text_input("ชื่อผู้ตรวจ", "Admin")
+    # --- ฟอร์มบนสุด (มือถือควรให้สั้น) ---
+    c_insp, c_date = st.columns(2)
+    with c_insp:
+        inspector = st.text_input("ชื่อผู้ตรวจ", "Admin", key="emp_inspector")
+    with c_date:
+        selected_date = st.date_input(
+            "📅 วันที่จดบันทึก (ลงย้อนหลังได้)",
+            value=get_thai_time().date(),
+            key="emp_date"
+        )
 
-    # ✅ เพิ่ม Date Picker (ใช้ get_thai_time() เป็นค่า default)
-    selected_date = st.date_input("📅 วันที่จดบันทึก (สำหรับลงย้อนหลัง)", value=get_thai_time())
+    # ถ้าอยู่โหมด mismatch confirm ให้ล็อกอยู่จุดเดิม
+    if st.session_state.get("confirm_mode", False):
+        st.session_state.emp_point_id = st.session_state.get("last_point_id", st.session_state.emp_point_id)
+        st.session_state.emp_step = "INPUT"
 
-    filtered_meters = []
-    for m in all_meters:
-        m_type = (str(m.get('type', '')).lower() + " " + str(m.get('name', '')).lower())
-        if "ประปา" in cat_select:
-            if any(x in m_type for x in ['น้ำ', 'water', 'ประปา']): filtered_meters.append(m)
+    # =========================================================
+    # STEP 1: SCAN QR
+    # =========================================================
+    if st.session_state.emp_step == "SCAN_QR":
+        st.subheader("ขั้นที่ 1: สแกน QR ที่มิเตอร์")
+        st.write("📌 ถ่ายให้ใกล้ ๆ และชัด (ประมาณ 15–25 ซม.)")
+
+        qr_pic = st.camera_input("ถ่าย QR ให้ชัด", key="emp_qr_cam")
+        if qr_pic is not None:
+            pid = decode_qr(qr_pic.getvalue())
+            if pid:
+                st.session_state.emp_point_id = pid
+                st.session_state.emp_step = "CONFIRM_POINT"
+                st.rerun()
+            else:
+                st.warning("ยังอ่าน QR ไม่ได้ ลองถ่ายใหม่ให้ชัดขึ้น/ใกล้ขึ้น")
+
+        # --- ทางหนีฉุกเฉิน (ซ่อน) ---
+        with st.expander("สแกนไม่ได้? พิมพ์รหัสเอง"):
+            manual_pid = st.text_input("พิมพ์ point_id", key="emp_manual_pid")
+            if st.button("ยืนยันรหัส", use_container_width=True, key="emp_manual_ok"):
+                if manual_pid.strip():
+                    st.session_state.emp_point_id = manual_pid.strip().upper()
+                    st.session_state.emp_step = "CONFIRM_POINT"
+                    st.rerun()
+                else:
+                    st.warning("กรุณาพิมพ์รหัสก่อน")
+
+        st.stop()
+
+    # =========================================================
+    # STEP 2: CONFIRM POINT (show name + ref image)
+    # =========================================================
+    if st.session_state.emp_step == "CONFIRM_POINT":
+        pid = st.session_state.emp_point_id
+        config = get_meter_config(pid)
+        if not config:
+            st.error(f"❌ ไม่พบ point_id: {pid} ใน PointsMaster")
+            if st.button("กลับไปสแกนใหม่", use_container_width=True):
+                st.session_state.emp_step = "SCAN_QR"
+                st.session_state.emp_point_id = ""
+                st.rerun()
+            st.stop()
+
+        meter_type = infer_meter_type(config)
+
+        st.subheader("ขั้นที่ 2: ยืนยันจุดตรวจ")
+        st.write(f"**Point:** {pid}")
+        if config.get("name"):
+            st.write(f"**ชื่อจุด:** {config.get('name')}")
+        st.write(f"**ประเภท:** {'💧 Water' if meter_type=='Water' else '⚡ Electric'}")
+        # รูปตัวอย่าง (โหลดจาก GCS ด้วยสิทธิ์ service account ไม่ต้อง public)
+        ref_bytes, ref_path = load_ref_image_bytes_any(pid)
+        if ref_bytes:
+            st.image(ref_bytes, caption=f"รูปตัวอย่าง (Reference): {ref_path}", use_container_width=True)
         else:
-            if any(x in m_type for x in ['ไฟ', 'electric', 'scada']): filtered_meters.append(m)
+            st.warning("⚠️ ไม่พบรูปตัวอย่างใน bucket สำหรับจุดนี้")
+            st.caption("แนะนำให้มีไฟล์ขึ้นต้นด้วย point_id เช่น CH_S11D_106_....jpg หรือทำไฟล์มาตรฐาน ref_images/CH_S11D_106.jpg")
 
-    option_map = {f"{m.get('point_id')} : {m.get('name')}": m for m in filtered_meters}
-    
+
+        b1, b2 = st.columns(2)
+        if b1.button("✅ ใช่จุดนี้", type="primary", use_container_width=True):
+            st.session_state.emp_step = "INPUT"
+            st.rerun()
+        if b2.button("❌ ไม่ใช่ / สแกนใหม่", use_container_width=True):
+            st.session_state.emp_step = "SCAN_QR"
+            st.session_state.emp_point_id = ""
+            st.rerun()
+
+        st.stop()
+
+    # =========================================================
+    # STEP 3: INPUT + PHOTO + SAVE
+    # =========================================================
+    # มาถึงตรงนี้ = emp_step == "INPUT"
+    point_id = st.session_state.emp_point_id
+    config = get_meter_config(point_id)
+    if not config:
+        st.error("❌ ไม่พบ config ของจุดนี้")
+        st.session_state.emp_step = "SCAN_QR"
+        st.session_state.emp_point_id = ""
+        st.stop()
+
+    report_col = str(config.get('report_col', '-') or '-').strip()
+    meter_type = infer_meter_type(config)
+
     st.write("---")
     c1, c2 = st.columns([2, 1])
+
     with c1:
-        selected_label = st.selectbox("📍 เลือกจุดตรวจ", list(option_map.keys()))
-        meter_data = option_map[selected_label]
-        point_id = meter_data.get('point_id')
-        report_col = str(meter_data.get('report_col', '-') or '-').strip()
+        st.markdown(f"📍 จุดตรวจ: **{point_id}**")
+        if config.get("name"):
+            st.caption(config.get("name"))
         st.markdown(f"💾 บันทึกลงคอลัมน์: <span class='report-badge'>{report_col}</span>", unsafe_allow_html=True)
+        if st.button("🔁 เปลี่ยนจุด (สแกนใหม่)", use_container_width=True, key="emp_change_point"):
+            st.session_state.emp_step = "SCAN_QR"
+            st.session_state.emp_point_id = ""
+            st.session_state.confirm_mode = False
+            st.rerun()
+
     with c2:
-        manual_val = st.number_input("👁️ ค่าจริง", min_value=0.0, step=0.1, format="%.2f")
+        decimals = int(config.get("decimals", 0) or 0)
+        step = 1.0 if decimals == 0 else (0.1 if decimals == 1 else 0.01)
+        fmt = "%.0f" if decimals == 0 else ("%.1f" if decimals == 1 else "%.2f")
+        st.caption("ถ่ายรูปแล้ว AI จะเสนอค่าด้านล่าง")
 
     tab_cam, tab_up = st.tabs(["📷 ถ่ายรูป", "📂 อัปโหลด"])
 
-    # 📷 ถ่ายรูป (Streamlit มักมี preview ใน widget อยู่แล้วบนมือถือ)
     with tab_cam:
-        img_cam = st.camera_input("ถ่ายภาพมิเตอร์")
+        img_cam = st.camera_input("ถ่ายภาพมิเตอร์", key="emp_meter_cam")
 
-    # 📂 อัปโหลด (แสดง preview ใต้ uploader ทันที)
     with tab_up:
-        img_up = st.file_uploader("เลือกรูปภาพ", type=['jpg', 'png', 'jpeg'])
+        img_up = st.file_uploader("เลือกรูปภาพ", type=['jpg', 'png', 'jpeg'], key="emp_meter_upload")
         if img_up is not None:
             st.image(img_up, caption=f"รูปที่เลือก: {getattr(img_up, 'name', 'upload')}", use_container_width=True)
 
-    # เลือกใช้รูปจากกล้องก่อน ถ้าไม่มีค่อยใช้จากอัปโหลด
     img_file = img_cam if img_cam is not None else img_up
 
     st.write("---")
+    st.subheader("ขั้นที่ 3: AI เสนอค่า และบันทึก")
 
-    if not st.session_state.confirm_mode:
-        if st.button("🚀 ตรวจสอบและบันทึก", type="primary"):
-            if img_file and point_id:
-                with st.spinner(f"🤖 กำลังบันทึกข้อมูลของวันที่ {selected_date}..."):
-                    try:
-                        img_bytes = img_file.getvalue()
-                        config = get_meter_config(point_id)
-                        if not config: st.error("❌ ไม่พบ config"); st.stop()
+    # --- กัน OCR รันซ้ำเวลาหน้า rerun ---
+    if "emp_ai_value" not in st.session_state:
+        st.session_state.emp_ai_value = None
+    if "emp_img_hash" not in st.session_state:
+        st.session_state.emp_img_hash = ""
 
-                        # Hardcode Debug=False for production
-                        ai_val = ocr_process(img_bytes, config, debug=False)
-                        
-                        filename = f"{point_id}_{selected_date.strftime('%Y%m%d')}_{get_thai_time().strftime('%H%M%S')}.jpg"
-                        image_url = upload_image_to_storage(img_bytes, filename)
+    if img_file is None:
+        st.info("📷 ถ่ายรูป หรืออัปโหลดรูป แล้ว AI จะอ่านค่าให้เองอัตโนมัติ")
+        st.stop()
 
-                        tol = calc_tolerance(config.get('decimals', 0))
-                        if abs(manual_val - ai_val) <= tol:
-                            meter_type = "Water" if "ประปา" in cat_select else "Electric"
-                            # ✅ ส่ง selected_date เข้าไปบันทึก
-                            if save_to_db(point_id, inspector, meter_type, manual_val, ai_val, "VERIFIED", selected_date, image_url):
-                                ok_r, msg_r = export_to_real_report(point_id, manual_val, inspector, report_col, selected_date, debug=True)
-                                if not ok_r:
-                                    st.warning('⚠️ บันทึกลง TEST waterreport ไม่สำเร็จ: ' + msg_r)
-                                st.balloons()
-                                st.success(f"✅ บันทึกสำเร็จ! (วันที่: {selected_date})")
-                                st.info(f"AI: {ai_val} | Manual: {manual_val}")
-                            else: st.error("Save Failed")
-                        else:
-                            st.session_state.confirm_mode = True
-                            st.session_state.warning_msg = f"ไม่ตรงกัน! กรอก {manual_val} / AI {ai_val}"
-                            st.session_state.last_manual_val = manual_val
-                            st.session_state.last_ai_val = ai_val
-                            st.session_state.last_img_url = image_url
-                            st.session_state.last_selected_date = selected_date # เก็บวันที่ไว้ใช้ตอน Confirm
-                            st.rerun()
-                    except Exception as e: st.error(f"Error: {e}")
-            else: st.warning("⚠️ กรุณาถ่ายรูปและเลือกจุดตรวจ")
+    img_bytes = img_file.getvalue()
+    img_hash = hashlib.md5(img_bytes).hexdigest()
+
+    # ถ้ารูปเปลี่ยน → อ่านใหม่
+    if img_hash != st.session_state.emp_img_hash:
+        st.session_state.emp_img_hash = img_hash
+        with st.spinner("🤖 AI กำลังอ่านค่า..."):
+            st.session_state.emp_ai_value = float(ocr_process(img_bytes, config, debug=False))
+
+    ai_val = float(st.session_state.emp_ai_value or 0.0)
+    st.write(f"🤖 **AI เสนอค่า:** {fmt % ai_val}")
+
+    choice = st.radio(
+        "จะบันทึกค่าไหน?",
+        ["✅ ใช้ค่า AI", "✍️ แก้เอง"],
+        horizontal=True,
+        key="emp_choice"
+    )
+
+    if choice == "✍️ แก้เอง":
+        final_val = st.number_input(
+            "พิมพ์ค่าที่ถูกต้อง",
+            value=float(ai_val),
+            min_value=0.0,
+            step=step,
+            format=fmt,
+            key="emp_override_val"
+        )
+        status = "CONFIRMED_MANUAL"
     else:
-        st.markdown(f"""<div class="status-box status-warning"><h4>⚠️ {st.session_state.warning_msg}</h4></div>""", unsafe_allow_html=True)
-        col_conf1, col_conf2 = st.columns(2)
-        if col_conf1.button("✅ ยืนยัน (ส่งให้ Admin)"):
-            # ✅ ใช้วันที่ที่เก็บไว้ใน session_state
-            target_date = st.session_state.get('last_selected_date', get_thai_time().date())
-            save_to_db(point_id, inspector, "Water", st.session_state.last_manual_val, st.session_state.last_ai_val, "FLAGGED", target_date, st.session_state.last_img_url)
-            st.success("✅ ส่งเรื่องแล้ว"); st.session_state.confirm_mode = False; st.rerun()
-        if col_conf2.button("❌ แก้ไข"):
-            st.session_state.confirm_mode = False; st.rerun()
+        final_val = float(ai_val)
+        status = "CONFIRMED_AI"
+
+    st.info(f"ค่าที่จะบันทึก: {fmt % float(final_val)}")
+
+    col_save, col_retry = st.columns(2)
+
+    if col_save.button("💾 บันทึกค่า", type="primary", use_container_width=True):
+        try:
+            filename = f"{point_id}_{selected_date.strftime('%Y%m%d')}_{get_thai_time().strftime('%H%M%S')}.jpg"
+            image_url = upload_image_to_storage(img_bytes, filename)
+
+            ok = save_to_db(point_id, inspector, meter_type, float(final_val), float(ai_val), status, selected_date, image_url)
+            if ok:
+                export_to_real_report(point_id, float(final_val), inspector, report_col, selected_date)
+                st.success("✅ บันทึกสำเร็จ")
+
+                # ไปจุดถัดไป
+                st.session_state.emp_ai_value = None
+                st.session_state.emp_img_hash = ""
+                st.session_state.emp_step = "SCAN_QR"
+                st.session_state.emp_point_id = ""
+                st.rerun()
+            else:
+                st.error("❌ Save Failed")
+        except Exception as e:
+            st.error(f"❌ บันทึกไม่สำเร็จ: {e}")
+
+    if col_retry.button("🔁 ถ่าย/เลือกใหม่", use_container_width=True):
+        st.session_state.emp_ai_value = None
+        st.session_state.emp_img_hash = ""
+        st.rerun()
 
 elif mode == "👮‍♂️ Admin Approval":
     st.title("👮‍♂️ Admin Dashboard")
@@ -625,9 +759,7 @@ elif mode == "👮‍♂️ Admin Approval":
                                     except:
                                         approve_date = get_thai_time().date() # fallback
                                         
-                                    ok_r, msg_r = export_to_real_report(point_id, choice, str(item.get('inspector', '')), report_col, approve_date, debug=True)
-                                    if not ok_r:
-                                        st.warning('⚠️ บันทึกลง TEST waterreport ไม่สำเร็จ: ' + msg_r)
+                                    export_to_real_report(point_id, choice, str(item.get('inspector', '')), report_col, approve_date)
                                     updated = True; break
                             if updated: st.success("Approved!"); st.rerun()
                             else: st.warning("หา row ไม่เจอ")
