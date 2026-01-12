@@ -1,3 +1,4 @@
+import hashlib
 import streamlit as st
 import io
 import re
@@ -611,7 +612,7 @@ if mode == "📝 พนักงานจดมิเตอร์":
         decimals = int(config.get("decimals", 0) or 0)
         step = 1.0 if decimals == 0 else (0.1 if decimals == 1 else 0.01)
         fmt = "%.0f" if decimals == 0 else ("%.1f" if decimals == 1 else "%.2f")
-        manual_val = st.number_input("👁️ ค่าจริง", min_value=0.0, step=step, format=fmt, key="emp_manual_val")
+        st.caption("ถ่ายรูปแล้ว AI จะเสนอค่าด้านล่าง")
 
     tab_cam, tab_up = st.tabs(["📷 ถ่ายรูป", "📂 อัปโหลด"])
 
@@ -625,87 +626,81 @@ if mode == "📝 พนักงานจดมิเตอร์":
 
     img_file = img_cam if img_cam is not None else img_up
 
-# -------------------------------
-# ✅ AI เสนอค่า → คนติ๊ก/แก้เอง → บันทึกเลย
-# -------------------------------
-# เตรียม session สำหรับเก็บค่า AI
-if "ai_suggest" not in st.session_state:
-    st.session_state.ai_suggest = None
-
-# ปุ่มให้ AI อ่านค่า (แยกจากปุ่มบันทึก เพื่อไม่ให้ OCR รันทุกครั้ง)
-if st.button("🤖 ให้ AI อ่านค่า", type="primary", disabled=(img_file is None or not point_id)):
-    try:
-        img_bytes = img_file.getvalue()
-        config = get_meter_config(point_id)
-        if not config:
-            st.error("❌ ไม่พบ config ของจุดนี้")
-        else:
-            ai_val = ocr_process(img_bytes, config, debug=False)
-            st.session_state.ai_suggest = float(ai_val)
-    except Exception as e:
-        st.error(f"❌ อ่านค่าไม่สำเร็จ: {e}")
-
-# ถ้ามีค่า AI แล้ว → ให้คนยืนยัน/แก้
-if st.session_state.ai_suggest is not None:
-    config = get_meter_config(point_id)
-    decimals = int(config.get("decimals", 0) or 0)
-    step = 1.0 if decimals == 0 else (0.1 if decimals == 1 else 0.01)
-    fmt  = "%.0f" if decimals == 0 else ("%.1f" if decimals == 1 else "%.2f")
-
-    ai_val = float(st.session_state.ai_suggest)
-
     st.write("---")
-    st.subheader("ผลที่ AI อ่านได้")
+    st.subheader("ขั้นที่ 3: AI เสนอค่า และบันทึก")
 
-    # ถ้า AI อ่านเป็น 0.0 ให้ default เป็น “ไม่ถูก” เพื่อกันกดผิด
-    default_correct = False if ai_val == 0.0 else True
+    # --- กัน OCR รันซ้ำเวลาหน้า rerun ---
+    if "emp_ai_value" not in st.session_state:
+        st.session_state.emp_ai_value = None
+    if "emp_img_hash" not in st.session_state:
+        st.session_state.emp_img_hash = ""
 
-    is_correct = st.checkbox(f"✅ AI อ่านถูกต้อง ({ai_val:{fmt}})", value=default_correct)
+    if img_file is None:
+        st.info("📷 ถ่ายรูป หรืออัปโหลดรูป แล้ว AI จะอ่านค่าให้เองอัตโนมัติ")
+        st.stop()
 
-    if is_correct:
-        final_val = ai_val
-        status = "CONFIRMED_AI"
-        st.success(f"ค่าที่จะบันทึก: {final_val:{fmt}}")
-    else:
-        manual_val = st.number_input("✍️ กรอกค่าที่ถูกต้อง", min_value=0.0, step=step, format=fmt)
-        final_val = float(manual_val)
+    img_bytes = img_file.getvalue()
+    img_hash = hashlib.md5(img_bytes).hexdigest()
+
+    # ถ้ารูปเปลี่ยน → อ่านใหม่
+    if img_hash != st.session_state.emp_img_hash:
+        st.session_state.emp_img_hash = img_hash
+        with st.spinner("🤖 AI กำลังอ่านค่า..."):
+            st.session_state.emp_ai_value = float(ocr_process(img_bytes, config, debug=False))
+
+    ai_val = float(st.session_state.emp_ai_value or 0.0)
+    st.write(f"🤖 **AI เสนอค่า:** {fmt % ai_val}")
+
+    choice = st.radio(
+        "จะบันทึกค่าไหน?",
+        ["✅ ใช้ค่า AI", "✍️ แก้เอง"],
+        horizontal=True,
+        key="emp_choice"
+    )
+
+    if choice == "✍️ แก้เอง":
+        final_val = st.number_input(
+            "พิมพ์ค่าที่ถูกต้อง",
+            value=float(ai_val),
+            min_value=0.0,
+            step=step,
+            format=fmt,
+            key="emp_override_val"
+        )
         status = "CONFIRMED_MANUAL"
-        st.info(f"ค่าที่จะบันทึก: {final_val:{fmt}}")
+    else:
+        final_val = float(ai_val)
+        status = "CONFIRMED_AI"
 
-    col_save, col_reset = st.columns(2)
+    st.info(f"ค่าที่จะบันทึก: {fmt % float(final_val)}")
 
-    # บันทึกเลย (ไม่ต้องรอ Admin)
-    if col_save.button("💾 บันทึกค่าเลย", type="primary", use_container_width=True):
+    col_save, col_retry = st.columns(2)
+
+    if col_save.button("💾 บันทึกค่า", type="primary", use_container_width=True):
         try:
-            img_bytes = img_file.getvalue()
-
             filename = f"{point_id}_{selected_date.strftime('%Y%m%d')}_{get_thai_time().strftime('%H%M%S')}.jpg"
             image_url = upload_image_to_storage(img_bytes, filename)
 
-            meter_type = "Water" if "ประปา" in cat_select else "Electric"
-
-            # ✅ บันทึก final_val เป็น Manual_Value เพื่อถือว่าเป็นค่าจริง
-            # ✅ เก็บ ai_val ไว้ใน AI_Value เพื่อย้อนดูได้
-            ok = save_to_db(point_id, inspector, meter_type, final_val, ai_val, status, selected_date, image_url)
-
+            ok = save_to_db(point_id, inspector, meter_type, float(final_val), float(ai_val), status, selected_date, image_url)
             if ok:
-                export_to_real_report(point_id, final_val, inspector, report_col, selected_date)
-                st.balloons()
-                st.success(f"✅ บันทึกสำเร็จ! (วันที่: {selected_date})")
-                # เคลียร์ค่า AI เพื่อเริ่มจุดถัดไป
-                st.session_state.ai_suggest = None
+                export_to_real_report(point_id, float(final_val), inspector, report_col, selected_date)
+                st.success("✅ บันทึกสำเร็จ")
+
+                # ไปจุดถัดไป
+                st.session_state.emp_ai_value = None
+                st.session_state.emp_img_hash = ""
+                st.session_state.emp_step = "SCAN_QR"
+                st.session_state.emp_point_id = ""
                 st.rerun()
             else:
                 st.error("❌ Save Failed")
         except Exception as e:
             st.error(f"❌ บันทึกไม่สำเร็จ: {e}")
 
-    # ปุ่มเริ่มใหม่ (กรณีถ่ายรูปผิด/อยากอ่านใหม่)
-    if col_reset.button("🔁 อ่านใหม่ / เปลี่ยนรูป", use_container_width=True):
-        st.session_state.ai_suggest = None
+    if col_retry.button("🔁 ถ่าย/เลือกใหม่", use_container_width=True):
+        st.session_state.emp_ai_value = None
+        st.session_state.emp_img_hash = ""
         st.rerun()
-
-
 
 elif mode == "👮‍♂️ Admin Approval":
     st.title("👮‍♂️ Admin Dashboard")
