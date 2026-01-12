@@ -949,40 +949,86 @@ elif mode == "📟 SCADA (4 รูป)":
     st.write("---")
     st.subheader("สรุปค่าที่ AI อ่านได้ (แก้/ยืนยันได้ก่อนบันทึก)")
 
-    # สรุปจำนวนจุดต้องตรวจ
-    try:
-        flag_cnt = int((df["ai_value"] == 0.0).sum())
-    except Exception:
-        flag_cnt = 0
+    total_cnt = len(df)
+    need_fix = df[(df["ai_value"].fillna(0).astype(float) == 0.0) | (df["use_ai"] == False)]
+    fix_cnt = len(need_fix)
 
-    st.info(f"รวม {len(df)} จุด | ต้องตรวจ/แก้ {flag_cnt} จุด (ค่า AI = 0)")
+    st.info(f"รวม {total_cnt} จุด | ต้องตรวจ/แก้ {fix_cnt} จุด (ค่า AI = 0 หรือเลือกไม่ใช้ค่า AI)")
 
-    st.caption("วิธีใช้: ถ้าค่าถูก → ปล่อยไว้ที่ ✅ ใช้ค่า AI | ถ้าค่าผิด → เอาติ๊กออก แล้วแก้ที่คอลัมน์ final_value")
+    # ✅ กันกระพริบ/ค่าหาย: ใช้ form เพื่อไม่ให้หน้า rerun ทุกครั้งที่พิมพ์
+    tab_fix, tab_table = st.tabs(["✅ แก้เฉพาะจุดที่ต้องแก้ (แนะนำ)", "🧾 แก้ในตาราง (ถ้าจำเป็น)"])
 
-    import pandas as pd  # type: ignore
+    with tab_fix:
+        st.caption("โหมดนี้จะนิ่งกว่า ไม่กระพริบ และค่าที่พิมพ์จะไม่หาย (กดปุ่มด้านล่างเพื่ออัปเดต)")
+        if fix_cnt == 0:
+            st.success("ไม่มีจุดที่ต้องแก้ ✅")
+        else:
+            with st.form("scada_fix_form", clear_on_submit=False):
+                st.warning(f"มี {fix_cnt} จุดที่ต้องแก้/ยืนยัน (ระบบตั้งให้กรอกเอง)")
+                for _, r in need_fix.iterrows():
+                    pid = str(r.get("point_id", "")).strip().upper()
+                    nm  = str(r.get("name", ""))
+                    grp = str(r.get("group", ""))
 
-    # จำกัดคอลัมน์ที่ให้แก้ (ให้แก้ได้เฉพาะ use_ai, final_value)
-    show_df = df[["group", "point_id", "name", "ai_value", "use_ai", "final_value", "status"]].copy()
+                    cfg = get_meter_config(pid) or {}
+                    decimals = int(cfg.get("decimals", 0) or 0)
+                    step = 1.0 if decimals == 0 else (0.1 if decimals == 1 else 0.01)
+                    fmt  = "%.0f" if decimals == 0 else ("%.1f" if decimals == 1 else "%.2f")
 
-    edited = st.data_editor(
-        show_df,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        key="scada_editor",
-        column_config={
-            "group": st.column_config.TextColumn("group", disabled=True),
-            "point_id": st.column_config.TextColumn("point_id", disabled=True),
-            "name": st.column_config.TextColumn("name", disabled=True),
-            "ai_value": st.column_config.NumberColumn("ai_value", disabled=True),
-            "use_ai": st.column_config.CheckboxColumn("✅ ใช้ค่า AI"),
-            "final_value": st.column_config.NumberColumn("final_value"),
-            "status": st.column_config.TextColumn("status", disabled=True),
-        }
-    )
+                    ai_val = float(r.get("ai_value", 0.0) or 0.0)
+                    default_val = float(r.get("final_value", ai_val) or ai_val or 0.0)
 
-    # เก็บกลับเข้า session
-    st.session_state.scada_df = edited
+                    st.markdown(f"### 🚩 {pid}")
+                    st.caption(f"{grp} | {nm}")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.metric("ค่า AI", fmt % ai_val)
+                    with c2:
+                        st.number_input(
+                            "กรอกค่าที่ถูกต้อง",
+                            value=float(default_val),
+                            step=step,
+                            format=fmt,
+                            key=f"fix_val_{pid}",
+                        )
+                    st.write("")
+
+                apply_fix = st.form_submit_button("✅ ใช้ค่าที่กรอก (อัปเดตข้อมูล)")
+            if apply_fix:
+                for _, r in need_fix.iterrows():
+                    pid = str(r.get("point_id", "")).strip().upper()
+                    new_val = float(st.session_state.get(f"fix_val_{pid}", 0.0) or 0.0)
+
+                    # อัปเดตค่าที่จะบันทึก
+                    df.loc[df["point_id"] == pid, "use_ai"] = False
+                    df.loc[df["point_id"] == pid, "final_value"] = new_val
+                    df.loc[df["point_id"] == pid, "status"] = "FLAGGED_SCADA"
+
+                st.session_state.scada_df = df
+                st.success("อัปเดตเรียบร้อย ✅ (เลื่อนลงไปกด 'บันทึกทั้งหมด')")
+
+    with tab_table:
+        st.caption("ถ้าจำเป็นต้องแก้หลายจุดพร้อมกัน ใช้ตารางนี้ได้ แต่แนะนำให้แก้เฉพาะจุดที่ต้องแก้ด้านซ้ายจะเร็วกว่า")
+        with st.form("scada_table_form", clear_on_submit=False):
+            show_df = df[["group", "point_id", "name", "ai_value", "use_ai", "final_value"]].copy()
+
+            edited = st.data_editor(
+                show_df,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "ai_value": st.column_config.NumberColumn("ai_value", disabled=True),
+                    "use_ai": st.column_config.CheckboxColumn("✅ ใช้ค่า AI", help="ถ้าเอาติ๊กออก แปลว่าจะกรอกเองในคอลัมน์ final_value"),
+                    "final_value": st.column_config.NumberColumn("final_value", help="ค่าที่จะบันทึกจริง (ถ้าไม่ใช้ AI ให้กรอกเองตรงนี้)"),
+                },
+                key="scada_editor",
+            )
+
+            apply_table = st.form_submit_button("✅ ใช้ค่าที่แก้ในตาราง (อัปเดตข้อมูล)")
+        if apply_table:
+            st.session_state.scada_df = edited
+            df = edited
+            st.success("อัปเดตข้อมูลจากตารางเรียบร้อย ✅")
 
     st.write("---")
     colA, colB, colC = st.columns(3)
