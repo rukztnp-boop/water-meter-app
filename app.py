@@ -426,44 +426,62 @@ def _find_cell_exact(ws, target_text: str, max_rows=60, max_cols=40):
     return None
 
 
+def _hhmm_to_minutes(hhmm: str):
+    try:
+        h, m = str(hhmm).split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return None
+
+
 def _extract_value_from_ws(ws, target_time_hhmm, value_col_letter: str, time_header="Time"):
     """
     หา row ของเวลาที่ต้องการ แล้วดึงค่าตามคอลัมน์ตัวอักษร (เช่น 'Y')
-    ถ้าหาเวลาไม่เจอ จะ fallback ไป row สุดท้ายที่มีข้อมูล
+    - ถ้าไม่เจอเวลาเป๊ะ: เลือกแถวที่เวลา "ใกล้ที่สุด"
+    - ถ้า cell ว่าง: ไล่ขึ้นไปหาแถวก่อนหน้าที่มีค่า
+    คืนค่า: (value, status)
     """
     hdr = _find_cell_exact(ws, time_header)
     if not hdr:
         return None, "NO_TIME_HEADER"
 
     hdr_row, time_col = hdr
-    target_row = None
 
-    if target_time_hhmm:
-        for r in range(hdr_row + 1, ws.max_row + 1):
-            v = ws.cell(r, time_col).value
-            if _normalize_scada_time(v) == target_time_hhmm:
-                target_row = r
-                break
+    # เก็บแถวที่มีเวลาเป็นนาที
+    time_rows = []
+    for r in range(hdr_row + 1, ws.max_row + 1):
+        v = ws.cell(r, time_col).value
+        hhmm = _normalize_scada_time(v)
+        mm = _hhmm_to_minutes(hhmm) if hhmm else None
+        if mm is not None:
+            time_rows.append((r, mm))
 
-    if target_row is None:
-        # หา row สุดท้ายที่ time ไม่ว่าง
-        for r in range(ws.max_row, hdr_row, -1):
-            v = ws.cell(r, time_col).value
-            if _normalize_scada_time(v) is not None:
-                target_row = r
-                break
-
-    if target_row is None:
+    if not time_rows:
         return None, "NO_DATA_ROW"
 
+    # เลือกแถวเป้าหมาย
+    if target_time_hhmm:
+        tmm = _hhmm_to_minutes(target_time_hhmm)
+        if tmm is None:
+            target_row = time_rows[-1][0]
+        else:
+            target_row = min(time_rows, key=lambda x: abs(x[1] - tmm))[0]
+    else:
+        target_row = time_rows[-1][0]
+
+    # คอลัมน์ค่า
     try:
-        col_idx = column_index_from_string(value_col_letter)
+        col_idx = column_index_from_string(str(value_col_letter).strip().upper())
     except Exception:
         return None, "BAD_COLUMN"
 
-    val = ws.cell(target_row, col_idx).value
-    return val, "OK"
+    # ถ้าแถวที่เลือกว่าง → ไล่ขึ้นไปหาแถวก่อนหน้าที่มีค่า
+    for rr in range(target_row, hdr_row, -1):
+        val = ws.cell(rr, col_idx).value
+        if val not in (None, "", " "):
+            return val, "OK"
 
+    return None, "EMPTY_CELL"
 
 def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict):
     """
@@ -740,8 +758,10 @@ def infer_meter_type(config: dict) -> str:
 # =========================================================
 # --- UI LOGIC ---
 # =========================================================
-mode = st.sidebar.radio("🔧 เลือกโหมดการทำงาน", ["📝 พนักงานจดมิเตอร์", "👮‍♂️ Admin Approval"])
-
+mode = st.sidebar.radio(
+    "🔧 เลือกโหมดการทำงาน",
+    ["📝 พนักงานจดมิเตอร์", "📥 อัปโหลด Excel (SCADA Export)", "👮‍♂️ Admin Approval"]
+)
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
     st.markdown("### Water treatment Plant - Borthongindustrial")
