@@ -1071,7 +1071,7 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
     )
 
     # เลือกวันที่รายงาน
-    report_date = st.date_input("📅 วันที่ของรายงาน (ที่จะไปกรอกใน WaterReport)", value=datetime.date.today())
+    report_date = st.date_input("📅 วันที่ของรายงาน (ที่จะไปกรอกใน WaterReport)", value=get_thai_time().date())
     report_date_str = report_date.strftime("%Y/%m/%d")
 
     # โหลด mapping
