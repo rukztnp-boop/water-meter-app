@@ -320,77 +320,38 @@ def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, targ
 # =========================================================
 
 # ------------------------ SCADA Excel Upload (Export) ------------------------
-def _normalize_scada_time(token):
-    """Normalize SCADA time tokens into 'HH:MM' string.
-
-    Supports:
-      - '23:55', '23.55', '23:55:00'
-      - numbers like 23.55 (meaning 23:55) from DB mappings
-      - Excel time fractions like 0.996527... (meaning 23:55)
-      - datetime/time objects
+def _normalize_scada_time(value):
     """
-    if token is None:
+    แปลงเวลาให้เป็นรูปแบบ 'HH:MM' เพื่อเทียบกันง่าย (รองรับ time/datetime/str/float)
+    """
+    import datetime as _dt
+    if value is None:
         return None
 
-    # datetime objects
-    try:
-        import datetime as _dt
-        if isinstance(token, _dt.datetime):
-            return f"{token.hour:02d}:{token.minute:02d}"
-        if isinstance(token, _dt.time):
-            return f"{token.hour:02d}:{token.minute:02d}"
-    except Exception:
-        pass
+    # Excel time (เช่น 0.9965) = สัดส่วนของวัน
+    if isinstance(value, (int, float)) and 0 <= float(value) < 1:
+        seconds = int(round(float(value) * 24 * 60 * 60))
+        h = (seconds // 3600) % 24
+        m = (seconds % 3600) // 60
+        return f"{h:02d}:{m:02d}"
 
-    # Numeric tokens
-    if isinstance(token, (int, float)):
-        x = float(token)
+    if isinstance(value, _dt.datetime):
+        value = value.time()
+    if isinstance(value, _dt.time):
+        return f"{value.hour:02d}:{value.minute:02d}"
 
-        # 1) HH.MM style (e.g., 23.55 -> 23:55, 0.10 -> 00:10)
-        #    We detect it by "2-digit minutes" pattern: fractional part * 100 is close to an integer < 60.
-        hh = int(x) if x >= 0 else None
-        frac = x - (hh or 0)
-        mm_candidate = int(round(frac * 100))
-
-        # tolerance for binary float issues
-        if hh is not None:
-            approx = (hh + (mm_candidate / 100.0))
-            if 0 <= hh <= 23 and 0 <= mm_candidate <= 59 and abs(x - approx) < 1e-6:
-                return f"{hh:02d}:{mm_candidate:02d}"
-
-        # 2) Excel fraction-of-day (0..1)
-        if 0 <= x < 1:
-            minutes = int(round(x * 24 * 60))
-            hh2 = (minutes // 60) % 24
-            mm2 = minutes % 60
-            return f"{hh2:02d}:{mm2:02d}"
-
-        return None
-
-    # String tokens
-    s = str(token).strip()
-    if not s:
-        return None
-
-    # allow dot separator
-    s = s.replace(".", ":")
-
-    import re as _re
-    m = _re.match(r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$", s)
-    if m:
-        hh = int(m.group(1))
-        mm = int(m.group(2))
-        if 0 <= hh <= 23 and 0 <= mm <= 59:
-            return f"{hh:02d}:{mm:02d}"
-
-    m = _re.match(r"^(\d{1,2})(\d{2})$", s)
-    if m:
-        hh = int(m.group(1))
-        mm = int(m.group(2))
-        if 0 <= hh <= 23 and 0 <= mm <= 59:
-            return f"{hh:02d}:{mm:02d}"
+    s = str(value).strip()
+    # 23.55
+    if re.match(r"^\d{1,2}\.\d{2}$", s):
+        h, m = s.split(".")
+        return f"{int(h):02d}:{int(m):02d}"
+    # 23:55 or 23:55:00
+    if re.match(r"^\d{1,2}:\d{2}", s):
+        parts = s.split(":")
+        return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
 
     return None
+
 
 def _strip_date_prefix(name: str) -> str:
     """
@@ -779,11 +740,7 @@ def infer_meter_type(config: dict) -> str:
 # =========================================================
 # --- UI LOGIC ---
 # =========================================================
-mode = st.sidebar.radio(
-    "🔧 เลือกโหมดการทำงาน",
-    ["📝 พนักงานจดมิเตอร์", "📥 อัปโหลด Excel (SCADA Export)", "👮‍♂️ Admin Approval"]
-)
-
+mode = st.sidebar.radio("🔧 เลือกโหมดการทำงาน", ["📝 พนักงานจดมิเตอร์", "👮‍♂️ Admin Approval"])
 
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
@@ -1094,7 +1051,7 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
     )
 
     # เลือกวันที่รายงาน
-    report_date = st.date_input("📅 วันที่ของรายงาน (ที่จะไปกรอกใน WaterReport)", value=get_thai_time().date())
+    report_date = st.date_input("📅 วันที่ของรายงาน (ที่จะไปกรอกใน WaterReport)", value=datetime.date.today())
     report_date_str = report_date.strftime("%Y/%m/%d")
 
     # โหลด mapping
@@ -1175,34 +1132,63 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
             saved_fail = 0
             fail_list = []
 
+            inspector_name = "Admin"  # จะเปลี่ยนเป็นช่องกรอกก็ได้
+
             with st.spinner("กำลังบันทึกลง WaterReport..."):
                 for pid, val in final_values.items():
+                    # ข้ามค่าที่ว่าง
                     if val is None or str(val).strip() == "":
                         continue
 
                     cfg = get_meter_config(pid)
                     if not cfg:
                         saved_fail += 1
-                        fail_list.append((pid, "NO_CONFIG"))
+                        fail_list.append((pid, "NO_CONFIG_IN_POINTSMaster"))
                         continue
 
-                    # ส่งเข้ารายงาน
-                    ok, msg = export_to_real_report(pid, val, report_date_str)
-                    if ok:
+                    report_col = str(cfg.get("report_col", "") or "").strip()
+
+                    # แปลงให้เป็นตัวเลขถ้าทำได้ (กัน ',' หรือช่องว่าง)
+                    write_val = val
+                    try:
+                        write_val = float(str(val).replace(",", "").strip())
+                    except Exception:
+                        write_val = str(val).strip()
+
+                    # ✅ ส่งเข้ารายงาน (ต้องส่ง: point_id, value, inspector, report_col, target_date)
+                    ok_r, msg_r = export_to_real_report(
+                        pid,
+                        write_val,
+                        inspector_name,
+                        report_col,
+                        report_date,
+                        debug=True
+                    )
+
+                    if ok_r:
                         saved_ok += 1
+                        # (ไม่บังคับ) เก็บ Log ลง DailyReadings
                         try:
-                            # บันทึก log ลง DB
-                            save_to_db(pid, cfg.get("name",""), cfg.get("group",""), report_date_str, "", str(val), "AUTO_EXCEL_SCADA", "Admin")
+                            meter_type = infer_meter_type(cfg)
+                            save_to_db(
+                                pid,
+                                inspector_name,
+                                meter_type,
+                                write_val,   # manual_val
+                                write_val,   # ai_val (ในโหมด Excel ให้เท่ากัน)
+                                "AUTO_EXCEL_SCADA",
+                                report_date,
+                                image_url="-"
+                            )
                         except Exception:
                             pass
                     else:
                         saved_fail += 1
-                        fail_list.append((pid, msg))
+                        fail_list.append((pid, msg_r))
 
             st.success(f"บันทึกสำเร็จ: {saved_ok} จุด")
             if saved_fail:
                 st.error(f"บันทึกไม่สำเร็จ: {saved_fail} จุด")
                 st.write(fail_list)
-
         st.divider()
         st.info("หมายเหตุ: ถ้าลูกค้าบอกว่า 'มีมิเตอร์ไฟ 1 จุดที่ไม่มี export มาใน Excel' -> ใช้ช่องกรอกเองด้านบนได้เลย (เหมือนมิเตอร์น้ำ)")
