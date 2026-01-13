@@ -1,11 +1,15 @@
 import hashlib
 import streamlit as st
 import io
+import os
 import re
 import gspread
+import openpyxl
+from openpyxl.utils.cell import column_index_from_string
 import json
 import cv2
 import numpy as np
+import pandas as pd
 import math
 from google.oauth2 import service_account
 from google.cloud import vision
@@ -314,6 +318,214 @@ def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, targ
 # =========================================================
 # --- 🧠 OCR ENGINE (Clean & Robust) ---
 # =========================================================
+
+# ------------------------ SCADA Excel Upload (Export) ------------------------
+def _normalize_scada_time(value):
+    """
+    แปลงเวลาให้เป็นรูปแบบ 'HH:MM' เพื่อเทียบกันง่าย (รองรับ time/datetime/str/float)
+    """
+    import datetime as _dt
+    if value is None:
+        return None
+
+    # Excel time (เช่น 0.9965) = สัดส่วนของวัน
+    if isinstance(value, (int, float)) and 0 <= float(value) < 1:
+        seconds = int(round(float(value) * 24 * 60 * 60))
+        h = (seconds // 3600) % 24
+        m = (seconds % 3600) // 60
+        return f"{h:02d}:{m:02d}"
+
+    if isinstance(value, _dt.datetime):
+        value = value.time()
+    if isinstance(value, _dt.time):
+        return f"{value.hour:02d}:{value.minute:02d}"
+
+    s = str(value).strip()
+    # 23.55
+    if re.match(r"^\d{1,2}\.\d{2}$", s):
+        h, m = s.split(".")
+        return f"{int(h):02d}:{int(m):02d}"
+    # 23:55 or 23:55:00
+    if re.match(r"^\d{1,2}:\d{2}", s):
+        parts = s.split(":")
+        return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+
+    return None
+
+
+def _strip_date_prefix(name: str) -> str:
+    """
+    เอาวันที่นำหน้าออก (เช่น 2026_01_12_Daily_Report -> Daily_Report)
+    """
+    base = os.path.splitext(os.path.basename(name))[0]
+    base = re.sub(r"^\d{4}_\d{2}_\d{2}_", "", base)
+    return base.strip().lower()
+
+
+def load_scada_excel_mapping(local_path: str = "DB_Water_Scada.xlsx", uploaded_bytes=None):
+    """
+    อ่าน mapping จากไฟล์ DB_Water_Scada.xlsx
+    ต้องมีหัวตาราง: PointID, File, Sheet, Time, Colume
+    คืนค่าเป็น list ของ dict: {point_id, file_key, sheet, time, col}
+    """
+    if uploaded_bytes:
+        wb = openpyxl.load_workbook(io.BytesIO(uploaded_bytes), data_only=True)
+    else:
+        if not os.path.exists(local_path):
+            return []
+        wb = openpyxl.load_workbook(local_path, data_only=True)
+
+    ws = wb[wb.sheetnames[0]]
+
+    # หาแถวหัวตาราง
+    header_row = None
+    header_map = {}
+    for r in range(1, min(ws.max_row, 30) + 1):
+        row_vals = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 20) + 1)]
+        row_str = [str(v).strip().lower() if v is not None else "" for v in row_vals]
+        if "pointid" in row_str and "file" in row_str and "sheet" in row_str:
+            header_row = r
+            for idx, name in enumerate(row_str, start=1):
+                if name in ["pointid", "file", "sheet", "time", "colume", "column"]:
+                    header_map[name] = idx
+            break
+
+    if not header_row:
+        return []
+
+    # รองรับสะกด Colume/Column
+    col_idx = header_map.get("colume") or header_map.get("column")
+    out = []
+    for r in range(header_row + 1, ws.max_row + 1):
+        point_id = ws.cell(r, header_map["pointid"]).value
+        if point_id is None or str(point_id).strip() == "":
+            continue
+
+        file_key = ws.cell(r, header_map["file"]).value
+        sheet = ws.cell(r, header_map["sheet"]).value
+        t = ws.cell(r, header_map.get("time", 0)).value if header_map.get("time") else None
+        col = ws.cell(r, col_idx).value if col_idx else None
+
+        out.append({
+            "point_id": str(point_id).strip(),
+            "file_key": str(file_key).strip() if file_key is not None else "",
+            "sheet": str(sheet).strip() if sheet is not None else "Sheet1",
+            "time": t,
+            "col": str(col).strip() if col is not None else "",
+        })
+    return out
+
+
+def _find_cell_exact(ws, target_text: str, max_rows=60, max_cols=40):
+    target = target_text.strip().lower()
+    for r in range(1, min(ws.max_row, max_rows) + 1):
+        for c in range(1, min(ws.max_column, max_cols) + 1):
+            v = ws.cell(r, c).value
+            if isinstance(v, str) and v.strip().lower() == target:
+                return r, c
+    return None
+
+
+def _extract_value_from_ws(ws, target_time_hhmm, value_col_letter: str, time_header="Time"):
+    """
+    หา row ของเวลาที่ต้องการ แล้วดึงค่าตามคอลัมน์ตัวอักษร (เช่น 'Y')
+    ถ้าหาเวลาไม่เจอ จะ fallback ไป row สุดท้ายที่มีข้อมูล
+    """
+    hdr = _find_cell_exact(ws, time_header)
+    if not hdr:
+        return None, "NO_TIME_HEADER"
+
+    hdr_row, time_col = hdr
+    target_row = None
+
+    if target_time_hhmm:
+        for r in range(hdr_row + 1, ws.max_row + 1):
+            v = ws.cell(r, time_col).value
+            if _normalize_scada_time(v) == target_time_hhmm:
+                target_row = r
+                break
+
+    if target_row is None:
+        # หา row สุดท้ายที่ time ไม่ว่าง
+        for r in range(ws.max_row, hdr_row, -1):
+            v = ws.cell(r, time_col).value
+            if _normalize_scada_time(v) is not None:
+                target_row = r
+                break
+
+    if target_row is None:
+        return None, "NO_DATA_ROW"
+
+    try:
+        col_idx = column_index_from_string(value_col_letter)
+    except Exception:
+        return None, "BAD_COLUMN"
+
+    val = ws.cell(target_row, col_idx).value
+    return val, "OK"
+
+
+def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict):
+    """
+    mapping_rows: list[dict] จาก load_scada_excel_mapping
+    uploaded_exports: dict filename->bytes ของไฟล์ Excel ที่อัปโหลด
+    คืนค่า:
+      - results: list[dict] สำหรับแสดงในตาราง
+      - missing: list[dict] รายการที่ดึงไม่สำเร็จ
+    """
+    # โหลด workbook ทีละไฟล์ (cache ใน dict)
+    wb_cache = {}
+    for fname, b in uploaded_exports.items():
+        try:
+            wb_cache[fname] = openpyxl.load_workbook(io.BytesIO(b), data_only=True)
+        except Exception:
+            wb_cache[fname] = None
+
+    # helper: หาไฟล์ที่ตรงกับ file_key
+    def pick_file_for_key(file_key: str):
+        if not uploaded_exports:
+            return None
+        key_norm = _strip_date_prefix(file_key)
+        # exact by contains
+        for fname in uploaded_exports.keys():
+            if key_norm and key_norm in _strip_date_prefix(fname):
+                return fname
+        # fallback: ถ้ามีไฟล์เดียว ใช้อันนั้น
+        if len(uploaded_exports) == 1:
+            return list(uploaded_exports.keys())[0]
+        return None
+
+    results = []
+    missing = []
+
+    for row in mapping_rows:
+        point_id = row["point_id"]
+        file_key = row["file_key"]
+        sheet = row.get("sheet") or "Sheet1"
+        col = row.get("col") or ""
+        t_hhmm = _normalize_scada_time(row.get("time"))
+
+        fname = pick_file_for_key(file_key)
+        if not fname or not wb_cache.get(fname):
+            missing.append({**row, "reason": "NO_MATCH_FILE"})
+            results.append({"point_id": point_id, "value": None, "file": file_key, "sheet": sheet, "time": t_hhmm, "col": col, "status": "NO_FILE"})
+            continue
+
+        wb = wb_cache[fname]
+        if sheet not in wb.sheetnames:
+            missing.append({**row, "reason": "NO_SHEET"})
+            results.append({"point_id": point_id, "value": None, "file": file_key, "sheet": sheet, "time": t_hhmm, "col": col, "status": "NO_SHEET"})
+            continue
+
+        ws = wb[sheet]
+        val, stt = _extract_value_from_ws(ws, t_hhmm, col)
+        results.append({"point_id": point_id, "value": val, "file": file_key, "sheet": sheet, "time": t_hhmm, "col": col, "status": stt})
+
+        if stt != "OK" or val is None:
+            missing.append({**row, "reason": stt})
+
+    return results, missing
+
 def normalize_number_str(s: str, decimals: int = 0) -> str:
     if not s: return ""
     s = str(s).strip().replace(",", "").replace(" ", "")
@@ -824,3 +1036,130 @@ elif mode == "👮‍♂️ Admin Approval":
                             if updated: st.success("Approved!"); st.rerun()
                             else: st.warning("หา row ไม่เจอ")
                         except Exception as e: st.error(f"Error approve: {e}")
+
+elif mode == "📥 อัปโหลด Excel (SCADA Export)":
+    st.title("📥 อัปโหลด Excel (SCADA Export)")
+    st.caption("โหมดนี้ใช้แทนการถ่ายรูป SCADA: เอาไฟล์ Excel ที่ SCADA export มาอัปโหลด แล้วระบบจะดึงค่า + บันทึกลง WaterReport ให้อัตโนมัติ")
+
+    st.info(
+        "วิธีใช้ (แบบง่าย ป.6)\n"
+        "1) กด 'Browse files' แล้วเลือกไฟล์ Excel ที่ลูกค้าส่งมา (เลือกได้หลายไฟล์)\n"
+        "2) เลือก 'วันที่ของรายงาน' ให้ตรงกับวันที่ใน WaterReport\n"
+        "3) กดปุ่ม 'ดึงค่าจาก Excel' เพื่อให้ระบบอ่านค่า\n"
+        "4) ถ้ามีจุดที่ไม่มีใน Excel -> กรอกเองเฉพาะจุดนั้น\n"
+        "5) กด 'บันทึกลง WaterReport' จบ ✅"
+    )
+
+    # เลือกวันที่รายงาน
+    report_date = st.date_input("📅 วันที่ของรายงาน (ที่จะไปกรอกใน WaterReport)", value=datetime.date.today())
+    report_date_str = report_date.strftime("%Y/%m/%d")
+
+    # โหลด mapping
+    st.subheader("1) ไฟล์ Mapping (DB_Water_Scada.xlsx)")
+    mapping_rows = []
+    if os.path.exists("DB_Water_Scada.xlsx"):
+        st.success("พบไฟล์ DB_Water_Scada.xlsx ในโปรเจกต์ ✅ (จะใช้ไฟล์นี้อัตโนมัติ)")
+        mapping_rows = load_scada_excel_mapping(local_path="DB_Water_Scada.xlsx")
+    else:
+        st.warning("ไม่พบไฟล์ DB_Water_Scada.xlsx ในโปรเจกต์ — กรุณาอัปโหลดไฟล์นี้ก่อน (ไฟล์เล็ก ๆ)")
+        uploaded_map = st.file_uploader("อัปโหลด DB_Water_Scada.xlsx", type=["xlsx"])
+        if uploaded_map is not None:
+            mapping_rows = load_scada_excel_mapping(uploaded_bytes=uploaded_map.getvalue())
+
+    if not mapping_rows:
+        st.stop()
+
+    # อัปโหลด Excel export
+    st.subheader("2) อัปโหลดไฟล์ Excel ที่ SCADA export")
+    exports = st.file_uploader(
+        "เลือกไฟล์ Excel (เลือกได้หลายไฟล์) เช่น ...Daily_Report.xlsx, ...UF_System.xlsx, ...SMMT_Daily_Report.xlsx",
+        type=["xlsx"],
+        accept_multiple_files=True,
+    )
+
+    if not exports:
+        st.stop()
+
+    uploaded_exports = {f.name: f.getvalue() for f in exports}
+
+    # ปุ่มดึงค่า
+    if st.button("🔎 ดึงค่าจาก Excel"):
+        with st.spinner("กำลังอ่านค่าใน Excel..."):
+            results, missing = extract_scada_values_from_exports(mapping_rows, uploaded_exports)
+
+        # แสดงผล
+        ok_count = sum(1 for r in results if r["status"] == "OK" and r["value"] is not None)
+        st.success(f"อ่านได้แล้ว {ok_count}/{len(results)} จุด")
+
+        df_show = pd.DataFrame(results)
+        st.dataframe(df_show, use_container_width=True)
+
+        # เก็บไว้ใน session
+        st.session_state["excel_results"] = results
+        st.session_state["excel_missing"] = missing
+
+    # ถ้ามีผลแล้ว แสดงส่วนแก้/บันทึก
+    if "excel_results" in st.session_state:
+        results = st.session_state["excel_results"]
+        missing = st.session_state.get("excel_missing", [])
+
+        # เตือนจุดที่หาย
+        missing_point_ids = [m["point_id"] for m in missing]
+        if missing_point_ids:
+            st.warning("มีจุดที่ดึงค่าไม่สำเร็จ/ไม่มีใน Excel: " + ", ".join(missing_point_ids))
+
+        # ให้กรอกเองเฉพาะจุดที่หาย
+        manual_inputs = {}
+        with st.expander("✍️ กรอกเองเฉพาะจุดที่ไม่มีใน Excel (ถ้ามี)"):
+            for pid in missing_point_ids:
+                manual_inputs[pid] = st.text_input(f"{pid} (กรอกตัวเลข)", value="")
+
+        # รวมค่า final
+        final_values = {}
+        for r in results:
+            pid = r["point_id"]
+            val = r["value"]
+            if pid in manual_inputs and manual_inputs[pid].strip() != "":
+                val = manual_inputs[pid].strip()
+            final_values[pid] = val
+
+        # ปุ่มบันทึกลง WaterReport
+        st.subheader("3) บันทึกลง WaterReport")
+        st.caption("จะบันทึกเฉพาะจุดที่มีค่า (ไม่ว่าง) ลง WaterReport ตาม report_col ใน PointsMaster")
+
+        if st.button("✅ บันทึกลง WaterReport (อัตโนมัติ)"):
+            saved_ok = 0
+            saved_fail = 0
+            fail_list = []
+
+            with st.spinner("กำลังบันทึกลง WaterReport..."):
+                for pid, val in final_values.items():
+                    if val is None or str(val).strip() == "":
+                        continue
+
+                    cfg = get_meter_config(pid)
+                    if not cfg:
+                        saved_fail += 1
+                        fail_list.append((pid, "NO_CONFIG"))
+                        continue
+
+                    # ส่งเข้ารายงาน
+                    ok, msg = export_to_real_report(pid, val, report_date_str)
+                    if ok:
+                        saved_ok += 1
+                        try:
+                            # บันทึก log ลง DB
+                            save_to_db(pid, cfg.get("name",""), cfg.get("group",""), report_date_str, "", str(val), "AUTO_EXCEL_SCADA", "Admin")
+                        except Exception:
+                            pass
+                    else:
+                        saved_fail += 1
+                        fail_list.append((pid, msg))
+
+            st.success(f"บันทึกสำเร็จ: {saved_ok} จุด")
+            if saved_fail:
+                st.error(f"บันทึกไม่สำเร็จ: {saved_fail} จุด")
+                st.write(fail_list)
+
+        st.divider()
+        st.info("หมายเหตุ: ถ้าลูกค้าบอกว่า 'มีมิเตอร์ไฟ 1 จุดที่ไม่มี export มาใน Excel' -> ใช้ช่องกรอกเองด้านบนได้เลย (เหมือนมิเตอร์น้ำ)")
