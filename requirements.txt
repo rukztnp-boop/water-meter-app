@@ -3,6 +3,6 @@ gspread
 google-auth
 google-cloud-vision
 google-cloud-storage
-google-api-python-client
 opencv-python-headless
 numpy
+openpyxl==3.1.2
