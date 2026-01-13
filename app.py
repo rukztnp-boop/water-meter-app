@@ -320,38 +320,77 @@ def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, targ
 # =========================================================
 
 # ------------------------ SCADA Excel Upload (Export) ------------------------
-def _normalize_scada_time(value):
+def _normalize_scada_time(token):
+    """Normalize SCADA time tokens into 'HH:MM' string.
+
+    Supports:
+      - '23:55', '23.55', '23:55:00'
+      - numbers like 23.55 (meaning 23:55) from DB mappings
+      - Excel time fractions like 0.996527... (meaning 23:55)
+      - datetime/time objects
     """
-    แปลงเวลาให้เป็นรูปแบบ 'HH:MM' เพื่อเทียบกันง่าย (รองรับ time/datetime/str/float)
-    """
-    import datetime as _dt
-    if value is None:
+    if token is None:
         return None
 
-    # Excel time (เช่น 0.9965) = สัดส่วนของวัน
-    if isinstance(value, (int, float)) and 0 <= float(value) < 1:
-        seconds = int(round(float(value) * 24 * 60 * 60))
-        h = (seconds // 3600) % 24
-        m = (seconds % 3600) // 60
-        return f"{h:02d}:{m:02d}"
+    # datetime objects
+    try:
+        import datetime as _dt
+        if isinstance(token, _dt.datetime):
+            return f"{token.hour:02d}:{token.minute:02d}"
+        if isinstance(token, _dt.time):
+            return f"{token.hour:02d}:{token.minute:02d}"
+    except Exception:
+        pass
 
-    if isinstance(value, _dt.datetime):
-        value = value.time()
-    if isinstance(value, _dt.time):
-        return f"{value.hour:02d}:{value.minute:02d}"
+    # Numeric tokens
+    if isinstance(token, (int, float)):
+        x = float(token)
 
-    s = str(value).strip()
-    # 23.55
-    if re.match(r"^\d{1,2}\.\d{2}$", s):
-        h, m = s.split(".")
-        return f"{int(h):02d}:{int(m):02d}"
-    # 23:55 or 23:55:00
-    if re.match(r"^\d{1,2}:\d{2}", s):
-        parts = s.split(":")
-        return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+        # 1) HH.MM style (e.g., 23.55 -> 23:55, 0.10 -> 00:10)
+        #    We detect it by "2-digit minutes" pattern: fractional part * 100 is close to an integer < 60.
+        hh = int(x) if x >= 0 else None
+        frac = x - (hh or 0)
+        mm_candidate = int(round(frac * 100))
+
+        # tolerance for binary float issues
+        if hh is not None:
+            approx = (hh + (mm_candidate / 100.0))
+            if 0 <= hh <= 23 and 0 <= mm_candidate <= 59 and abs(x - approx) < 1e-6:
+                return f"{hh:02d}:{mm_candidate:02d}"
+
+        # 2) Excel fraction-of-day (0..1)
+        if 0 <= x < 1:
+            minutes = int(round(x * 24 * 60))
+            hh2 = (minutes // 60) % 24
+            mm2 = minutes % 60
+            return f"{hh2:02d}:{mm2:02d}"
+
+        return None
+
+    # String tokens
+    s = str(token).strip()
+    if not s:
+        return None
+
+    # allow dot separator
+    s = s.replace(".", ":")
+
+    import re as _re
+    m = _re.match(r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$", s)
+    if m:
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return f"{hh:02d}:{mm:02d}"
+
+    m = _re.match(r"^(\d{1,2})(\d{2})$", s)
+    if m:
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return f"{hh:02d}:{mm:02d}"
 
     return None
-
 
 def _strip_date_prefix(name: str) -> str:
     """
