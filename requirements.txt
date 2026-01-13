@@ -5,4 +5,5 @@ google-cloud-vision
 google-cloud-storage
 opencv-python-headless
 numpy
-openpyxl==3.1.2
+openpyxl
+pandas
