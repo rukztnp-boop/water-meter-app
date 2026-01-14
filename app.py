@@ -638,56 +638,121 @@ def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict):
       - results: list[dict] สำหรับแสดงในตาราง
       - missing: list[dict] รายการที่ดึงไม่สำเร็จ
     """
-    # โหลด workbook ทีละไฟล์ (cache ใน dict)
-    wb_cache = {}
-    for fname, b in uploaded_exports.items():
-        try:
-            wb_cache[fname] = openpyxl.load_workbook(io.BytesIO(b), data_only=True)
-        except Exception:
-            wb_cache[fname] = None
 
-    # helper: หาไฟล์ที่ตรงกับ file_key
+    # หมายเหตุ:
+    # - ใช้ read_only=True เพื่อลด RAM/เวลา โดยเฉพาะไฟล์ใหญ่ (เช่น 50–100MB)
+    # - เปิด workbook แบบ lazy: เปิดเฉพาะไฟล์ที่ mapping ใช้งานจริง
+
+    if not uploaded_exports:
+        return [], []
+
+    # index: normalized_name -> [filenames]
+    norm_to_files = {}
+    for fname in uploaded_exports.keys():
+        n = _strip_date_prefix(fname)
+        norm_to_files.setdefault(n, []).append(fname)
+
     def pick_file_for_key(file_key: str):
-        if not uploaded_exports:
+        key_norm = _strip_date_prefix(file_key or "")
+        if not key_norm:
+            # fallback: ถ้ามีไฟล์เดียว ใช้อันนั้น
+            if len(uploaded_exports) == 1:
+                return list(uploaded_exports.keys())[0]
             return None
-        key_norm = _strip_date_prefix(file_key)
-        # exact by contains
-        for fname in uploaded_exports.keys():
-            if key_norm and key_norm in _strip_date_prefix(fname):
-                return fname
-        # fallback: ถ้ามีไฟล์เดียว ใช้อันนั้น
+
+        # 1) exact match on normalized
+        if key_norm in norm_to_files and norm_to_files[key_norm]:
+            return norm_to_files[key_norm][0]
+
+        # 2) contains match (บางครั้ง file_key อาจมีคำเพิ่ม/ขาด)
+        for n, files in norm_to_files.items():
+            if key_norm in n or n in key_norm:
+                return files[0]
+
+        # 3) fallback: ถ้ามีไฟล์เดียว ใช้อันนั้น
         if len(uploaded_exports) == 1:
             return list(uploaded_exports.keys())[0]
         return None
+
+    # lazy workbook cache
+    wb_cache = {}
+
+    def get_wb(fname: str):
+        if fname in wb_cache:
+            return wb_cache[fname]
+        b = uploaded_exports.get(fname)
+        if not b:
+            wb_cache[fname] = None
+            return None
+        try:
+            bio = io.BytesIO(b)
+            bio.seek(0)
+            wb_cache[fname] = openpyxl.load_workbook(bio, data_only=True, read_only=True)
+        except Exception:
+            wb_cache[fname] = None
+        return wb_cache[fname]
 
     results = []
     missing = []
 
     for row in mapping_rows:
-        point_id = row["point_id"]
-        file_key = row["file_key"]
+        point_id = row.get("point_id")
+        file_key = row.get("file_key", "")
         sheet = row.get("sheet") or "Sheet1"
         col = row.get("col") or ""
         t_hhmm = _normalize_scada_time(row.get("time"))
 
         fname = pick_file_for_key(file_key)
-        if not fname or not wb_cache.get(fname):
+        wb = get_wb(fname) if fname else None
+
+        if not fname or wb is None:
             missing.append({**row, "reason": "NO_MATCH_FILE"})
-            results.append({"point_id": point_id, "value": None, "file": file_key, "sheet": sheet, "time": t_hhmm, "col": col, "status": "NO_FILE"})
+            results.append({
+                "point_id": point_id,
+                "value": None,
+                "file": file_key,
+                "sheet": sheet,
+                "time": t_hhmm,
+                "col": col,
+                "status": "NO_FILE"
+            })
             continue
 
-        wb = wb_cache[fname]
         if sheet not in wb.sheetnames:
             missing.append({**row, "reason": "NO_SHEET"})
-            results.append({"point_id": point_id, "value": None, "file": file_key, "sheet": sheet, "time": t_hhmm, "col": col, "status": "NO_SHEET"})
+            results.append({
+                "point_id": point_id,
+                "value": None,
+                "file": file_key,
+                "sheet": sheet,
+                "time": t_hhmm,
+                "col": col,
+                "status": "NO_SHEET"
+            })
             continue
 
         ws = wb[sheet]
         val, stt = _extract_value_from_ws(ws, t_hhmm, col)
-        results.append({"point_id": point_id, "value": val, "file": file_key, "sheet": sheet, "time": t_hhmm, "col": col, "status": stt})
+        results.append({
+            "point_id": point_id,
+            "value": val,
+            "file": file_key,
+            "sheet": sheet,
+            "time": t_hhmm,
+            "col": col,
+            "status": stt
+        })
 
         if stt != "OK" or val is None:
             missing.append({**row, "reason": stt})
+
+    # ปิด workbook ที่เปิด (ช่วยลด resource บน Streamlit Cloud)
+    for wb in wb_cache.values():
+        try:
+            if wb:
+                wb.close()
+        except Exception:
+            pass
 
     return results, missing
 
