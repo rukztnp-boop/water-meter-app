@@ -745,38 +745,101 @@ def extract_scada_values_from_exports(
         if not uploaded_exports:
             return None
 
+        # normalize key (ตัดวันที่ด้านหน้าออกก่อน เพื่อตรงกับชื่อไฟล์ที่อัปโหลดคนละวัน)
         key_norm = _strip_date_prefix(file_key)
         key_norm2 = _norm_filekey(key_norm)
+        key_norm_full = _norm_filekey(file_key)
+
+        fnames = list(uploaded_exports.keys())
+
+        def _strip(fname: str) -> str:
+            return _strip_date_prefix(fname)
+
+        def _norm(fname: str) -> str:
+            # normalize จากชื่อที่ตัดวันที่แล้ว
+            return _norm_filekey(_strip(fname))
 
         # 0) ถ้าผู้ใช้บังคับ map ไว้ ใช้อันนั้นก่อน
-        forced = file_key_map.get(key_norm) or file_key_map.get(key_norm2)
+        forced = (
+            file_key_map.get(key_norm)
+            or file_key_map.get(key_norm2)
+            or file_key_map.get(key_norm_full)
+        )
         if forced and forced in uploaded_exports:
             return forced
 
-        # 1) match จากชื่อไฟล์ (contains แบบ normalize)
-        for fname in uploaded_exports.keys():
-            if key_norm and key_norm in _strip_date_prefix(fname):
-                return fname
-        for fname in uploaded_exports.keys():
-            if key_norm2 and key_norm2 in _norm_filekey(fname):
-                return fname
+        # 1) match แบบ "ตรงชื่อเป๊ะ" ก่อน (แก้เคส Daily_Report ชนกับ SMMT_Daily_Report)
+        if key_norm:
+            exact = [f for f in fnames if _strip(f) == key_norm]
+            if exact:
+                # ถ้า key ไม่ใช่ SMMT ให้เลี่ยงไฟล์ที่มี smmt
+                if "smmt" not in key_norm2:
+                    non_smmt = [f for f in exact if "smmt" not in _norm(f)]
+                    if non_smmt:
+                        return non_smmt[0]
+                return exact[0]
+
+        if key_norm2:
+            exact2 = [f for f in fnames if _norm(f) == key_norm2]
+            if exact2:
+                if "smmt" not in key_norm2:
+                    non_smmt = [f for f in exact2 if "smmt" not in _norm(f)]
+                    if non_smmt:
+                        return non_smmt[0]
+                return exact2[0]
 
         # 2) UF_System → (สำคัญ) อย่าเปิดไฟล์ทุกตัวเพื่อเดา เพราะไฟล์ใหญ่มากจะช้า
-        #    เดาจาก "ชื่อไฟล์" ก่อน (ถ้า user ไม่ได้บังคับ map)
         if "uf_system" in key_norm2 or "ufsystem" in key_norm2:
-            for fname in uploaded_exports.keys():
+            for fname in fnames:
                 fn = _norm_filekey(fname)
                 if "uf_system" in fn or "ufsystem" in fn:
                     return fname
-            # fallback แบบเบา: ถ้ามี AF_Report/Report_Gen ให้ใช้ (แต่จะช้า/ใหญ่)
-            for fname in uploaded_exports.keys():
+            # fallback: ถ้ามี AF_Report/Report_Gen ให้ใช้แทน UF_System
+            for fname in fnames:
                 fn = _norm_filekey(fname)
-                if "af_report" in fn or "report_gen" in fn or "gen" in fn:
+                if "af_report" in fn or "report_gen" in fn or "reportgen" in fn:
                     return fname
 
-        # 3) fallback: ถ้ามีไฟล์เดียว ใช้อันนั้น
-        if len(uploaded_exports) == 1:
-            return list(uploaded_exports.keys())[0]
+        # 3) match แบบ contains + scoring (กรณีชื่อไม่ตรงเป๊ะ)
+        def _score(fname: str) -> int:
+            s = _strip(fname)
+            n = _norm(fname)
+            sc = 0
+            if key_norm and key_norm in s:
+                sc += 6
+                if s == key_norm:
+                    sc += 10
+                if s.endswith(key_norm):
+                    sc += 3
+            if key_norm2 and key_norm2 in n:
+                sc += 6
+                if n == key_norm2:
+                    sc += 10
+                if n.endswith(key_norm2):
+                    sc += 3
+
+            # ลงโทษเคสชน SMMT
+            if ("smmt" in n) != ("smmt" in key_norm2):
+                sc -= 6
+
+            # prefer ใกล้เคียงความยาว (กัน matching กว้างเกิน)
+            sc -= abs(len(n) - len(key_norm2))
+            return sc
+
+        cand = []
+        for fname in fnames:
+            s = _strip(fname)
+            n = _norm(fname)
+            if (key_norm and key_norm in s) or (key_norm2 and key_norm2 in n) or (key_norm_full and key_norm_full in _norm_filekey(fname)):
+                cand.append(fname)
+
+        if cand:
+            cand.sort(key=_score, reverse=True)
+            return cand[0]
+
+        # 4) fallback: ถ้ามีไฟล์เดียว ให้คืนไฟล์นั้น
+        if len(fnames) == 1:
+            return fnames[0]
 
         return None
 
