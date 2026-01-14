@@ -692,31 +692,53 @@ def _resolve_sheet_name_for_export(wb, desired_sheet: str, point_id: str) -> str
         return desired_sheet
 
 
-def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict, file_key_map: dict | None = None):
+def extract_scada_values_from_exports(
+    mapping_rows,
+    uploaded_exports: dict,
+    file_key_map: dict | None = None,
+    target_date=None,
+):
     """
     mapping_rows: list[dict] จาก load_scada_excel_mapping
     uploaded_exports: dict filename->bytes ของไฟล์ Excel ที่อัปโหลด
     file_key_map: (optional) dict ของ key_norm -> filename เพื่อบังคับจับคู่ไฟล์ (กันกรณีลูกค้าเปลี่ยนชื่อไฟล์)
+    target_date: (optional) datetime.date ที่ผู้ใช้เลือกในหน้า SCADA Export
+                 - ถ้าไฟล์มีคอลัมน์ Date (เช่น AF_Report_Gen...) จะใช้กรองให้ตรงวันก่อนเลือกเวลา
 
     คืนค่า:
       - results: list[dict] สำหรับแสดงในตาราง
       - missing: list[dict] รายการที่ดึงไม่สำเร็จ
     """
-
     file_key_map = file_key_map or {}
 
-    # โหลด workbook ทีละไฟล์ (cache ใน dict)
+    # ---- lazy workbook cache (กันโหลดไฟล์ใหญ่โดยไม่จำเป็น) ----
     wb_cache: dict[str, openpyxl.Workbook | None] = {}
     wb_is_ufgen: dict[str, bool] = {}
 
-    for fname, b in uploaded_exports.items():
+    def get_wb(fname: str):
+        if fname in wb_cache:
+            return wb_cache[fname]
+
+        b = uploaded_exports.get(fname)
+        if b is None:
+            wb_cache[fname] = None
+            wb_is_ufgen[fname] = False
+            return None
+
+        # ไฟล์ใหญ่มาก (เช่น AF_Report) ให้ใช้ read_only เพื่อลด RAM
+        read_only = len(b) >= 20_000_000
         try:
-            wb = openpyxl.load_workbook(io.BytesIO(b), data_only=True, read_only=True)
+            wb = openpyxl.load_workbook(io.BytesIO(b), data_only=True, read_only=read_only)
             wb_cache[fname] = wb
-            wb_is_ufgen[fname] = _is_uf_gen_report_workbook(wb)
+            try:
+                wb_is_ufgen[fname] = _is_uf_gen_report_workbook(wb)
+            except Exception:
+                wb_is_ufgen[fname] = False
+            return wb
         except Exception:
             wb_cache[fname] = None
             wb_is_ufgen[fname] = False
+            return None
 
     # helper: หาไฟล์ที่ตรงกับ file_key
     def pick_file_for_key(file_key: str):
@@ -735,13 +757,21 @@ def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict, file
         for fname in uploaded_exports.keys():
             if key_norm and key_norm in _strip_date_prefix(fname):
                 return fname
+        for fname in uploaded_exports.keys():
             if key_norm2 and key_norm2 in _norm_filekey(fname):
                 return fname
 
-        # 2) heuristic: UF_System แต่ลูกค้าเปลี่ยนชื่อไฟล์ -> หาไฟล์ที่เป็น UF gen report
-        if "uf" in key_norm2 or "ufsystem" in key_norm2 or "uf_system" in key_norm2:
+        # 2) UF_System → (สำคัญ) อย่าเปิดไฟล์ทุกตัวเพื่อเดา เพราะไฟล์ใหญ่มากจะช้า
+        #    เดาจาก "ชื่อไฟล์" ก่อน (ถ้า user ไม่ได้บังคับ map)
+        if "uf_system" in key_norm2 or "ufsystem" in key_norm2:
             for fname in uploaded_exports.keys():
-                if wb_is_ufgen.get(fname, False):
+                fn = _norm_filekey(fname)
+                if "uf_system" in fn or "ufsystem" in fn:
+                    return fname
+            # fallback แบบเบา: ถ้ามี AF_Report/Report_Gen ให้ใช้ (แต่จะช้า/ใหญ่)
+            for fname in uploaded_exports.keys():
+                fn = _norm_filekey(fname)
+                if "af_report" in fn or "report_gen" in fn or "gen" in fn:
                     return fname
 
         # 3) fallback: ถ้ามีไฟล์เดียว ใช้อันนั้น
@@ -750,15 +780,27 @@ def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict, file
 
         return None
 
-    # ===== Scan time rows ต่อ sheet แค่ครั้งเดียว (กันไฟล์ใหญ่/ช้า) =====
-    sheet_ctx_cache = {}  # (fname, sheet) -> ctx
+    # ===== Scan time rows ต่อ sheet แค่ครั้งเดียว =====
+    # key ต้องรวม target_date เพราะไฟล์ AF_Report มีหลายวัน
+    sheet_ctx_cache = {}  # (fname, sheet, target_date) -> ctx
 
-    def get_sheet_ctx(fname: str, wb, sheet: str):
-        key = (fname, sheet)
+    import datetime as dt
+
+    def _coerce_date(v):
+        if v is None:
+            return None
+        if isinstance(v, dt.datetime):
+            return v.date()
+        if isinstance(v, dt.date):
+            return v
+        return None
+
+    def get_sheet_ctx(fname: str, wb, sheet: str, target_date_local):
+        key = (fname, sheet, target_date_local)
         if key in sheet_ctx_cache:
             return sheet_ctx_cache[key]
 
-        if sheet not in (wb.sheetnames or []):
+        if not wb or sheet not in (wb.sheetnames or []):
             ctx = {"status": "NO_SHEET"}
             sheet_ctx_cache[key] = ctx
             return ctx
@@ -772,24 +814,96 @@ def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict, file
 
         hdr_row, time_col = hdr
 
-        # สแกนคอลัมน์เวลาแบบจำกัดแถว (กันไฟล์ใหญ่ max_row หลอก)
-        time_rows = []
+        # หา Date header ที่อยู่แถวเดียวกับ Time (ถ้ามี)
+        date_col = None
+        try:
+            if time_col > 1:
+                left = ws.cell(hdr_row, time_col - 1).value
+                if isinstance(left, str) and left.strip().lower() == "date":
+                    date_col = time_col - 1
+            if not date_col:
+                # ลองหาในหัวแถวเดียวกัน
+                max_c = min(ws.max_column or 0, 40)
+                for c in range(1, max_c + 1):
+                    v = ws.cell(hdr_row, c).value
+                    if isinstance(v, str) and v.strip().lower() == "date":
+                        date_col = c
+                        break
+        except Exception:
+            date_col = None
+
+        time_rows: list[tuple[int, int]] = []  # (row_idx, minutes)
         blank_streak = 0
-        max_scan_rows = 5000
-        max_r = min(ws.max_row or 0, hdr_row + max_scan_rows)
 
-        for r in range(hdr_row + 1, max_r + 1):
-            v = ws.cell(r, time_col).value
-            hhmm = _normalize_scada_time(v)
-            mm = _hhmm_to_minutes(hhmm) if hhmm else None
+        # ถ้ามี Date column และผู้ใช้เลือกวัน → สแกนจนเจอวันนั้น และหยุดเมื่อเลยวัน (ลดเวลา)
+        if date_col and target_date_local:
+            started = False
+            max_r = ws.max_row or 0
+            min_c = min(date_col, time_col)
+            max_c = max(date_col, time_col)
 
-            if mm is not None:
-                time_rows.append((r, mm))
-                blank_streak = 0
-            else:
-                blank_streak += 1
-                if blank_streak >= 80 and time_rows:
-                    break
+            for r, rowvals in enumerate(
+                ws.iter_rows(
+                    min_row=hdr_row + 1,
+                    max_row=max_r,
+                    min_col=min_c,
+                    max_col=max_c,
+                    values_only=True,
+                ),
+                start=hdr_row + 1,
+            ):
+                # map ค่าออกมาตามคอลัมน์จริง
+                # rowvals จัดตาม min_c..max_c
+                def _val_at_col(col):
+                    return rowvals[col - min_c]
+
+                dval = _coerce_date(_val_at_col(date_col))
+                if dval is None:
+                    continue
+
+                if dval < target_date_local:
+                    continue
+
+                if dval > target_date_local:
+                    if started and time_rows:
+                        break
+                    continue
+
+                started = True
+                tval = _val_at_col(time_col)
+                hhmm = _normalize_scada_time(tval)
+                mm = _hhmm_to_minutes(hhmm) if hhmm else None
+                if mm is not None:
+                    time_rows.append((r, mm))
+                    blank_streak = 0
+                else:
+                    blank_streak += 1
+                    if blank_streak >= 200 and time_rows:
+                        break
+        else:
+            # ไฟล์ทั่วไป (Daily/SMMT): จำกัด scan 5000 แถวกัน max_row หลอก
+            max_scan_rows = 5000
+            max_r = min(ws.max_row or 0, hdr_row + max_scan_rows)
+
+            for r, (tval,) in enumerate(
+                ws.iter_rows(
+                    min_row=hdr_row + 1,
+                    max_row=max_r,
+                    min_col=time_col,
+                    max_col=time_col,
+                    values_only=True,
+                ),
+                start=hdr_row + 1,
+            ):
+                hhmm = _normalize_scada_time(tval)
+                mm = _hhmm_to_minutes(hhmm) if hhmm else None
+                if mm is not None:
+                    time_rows.append((r, mm))
+                    blank_streak = 0
+                else:
+                    blank_streak += 1
+                    if blank_streak >= 80 and time_rows:
+                        break
 
         if not time_rows:
             ctx = {"status": "NO_DATA_ROW"}
@@ -800,13 +914,16 @@ def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict, file
             "status": "OK",
             "ws": ws,
             "hdr_row": hdr_row,
-            "time_rows": time_rows,  # list[(row, minutes)]
+            "time_col": time_col,
+            "date_col": date_col,
+            "time_rows": time_rows,
             "target_row_cache": {},  # hhmm -> row
         }
         sheet_ctx_cache[key] = ctx
         return ctx
 
     def pick_target_row(ctx, target_time_hhmm: str | None):
+        # ถ้าไม่กำหนดเวลา → ใช้แถวสุดท้ายของช่วงที่สแกนได้
         if not target_time_hhmm:
             return ctx["time_rows"][-1][0]
 
@@ -822,8 +939,12 @@ def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict, file
         ctx["target_row_cache"][target_time_hhmm] = row
         return row
 
-    results = []
-    missing = []
+    # ---- สำคัญ: ห้าม ws.cell() กับ read_only workbook เพราะช้ามาก (O(n) ทุกครั้ง) ----
+    # จะอ่าน "ทั้งแถว" ด้วย iter_rows แค่ 1 ครั้ง แล้วหยิบค่าคอลัมน์ที่ต้องการ
+    row_cache: dict[tuple[str, str, int], tuple] = {}
+
+    results: list[dict] = []
+    missing: list[dict] = []
 
     for row in mapping_rows:
         point_id = row["point_id"]
@@ -833,54 +954,121 @@ def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict, file
         t_hhmm = _normalize_scada_time(row.get("time"))
 
         fname = pick_file_for_key(file_key)
-        if not fname or not wb_cache.get(fname):
+        if not fname:
             missing.append({**row, "reason": "NO_MATCH_FILE"})
-            results.append({"point_id": point_id, "value": None, "file": file_key, "sheet": desired_sheet, "time": t_hhmm, "col": col, "status": "NO_FILE"})
+            results.append({
+                "point_id": point_id,
+                "value": None,
+                "file": file_key,
+                "sheet": desired_sheet,
+                "time": t_hhmm,
+                "col": col,
+                "status": "NO_FILE",
+            })
             continue
 
-        wb = wb_cache[fname]
-        sheet = _resolve_sheet_name_for_export(wb, desired_sheet, point_id)
+        wb = get_wb(fname)
+        if not wb:
+            missing.append({**row, "reason": "OPEN_FAIL"})
+            results.append({
+                "point_id": point_id,
+                "value": None,
+                "file": file_key,
+                "sheet": desired_sheet,
+                "time": t_hhmm,
+                "col": col,
+                "status": "OPEN_FAIL",
+            })
+            continue
 
-        ctx = get_sheet_ctx(fname, wb, sheet)
+        sheet = _resolve_sheet_name_for_export(wb, desired_sheet, point_id)
+        ctx = get_sheet_ctx(fname, wb, sheet, target_date)
+
         if ctx.get("status") != "OK":
             stt = ctx.get("status")
             missing.append({**row, "reason": stt})
-            results.append({"point_id": point_id, "value": None, "file": file_key, "sheet": sheet, "time": t_hhmm, "col": col, "status": stt})
+            results.append({
+                "point_id": point_id,
+                "value": None,
+                "file": file_key,
+                "sheet": sheet,
+                "time": t_hhmm,
+                "col": col,
+                "status": stt,
+            })
             continue
 
         # เลือกแถวที่ใกล้เวลาเป้าหมายที่สุด
         target_row = pick_target_row(ctx, t_hhmm)
 
-        # คอลัมน์ค่า
+        # แปลงคอลัมน์ตัวอักษร -> index
         try:
             col_idx = column_index_from_string(str(col).strip().upper())
         except Exception:
             missing.append({**row, "reason": "BAD_COLUMN"})
-            results.append({"point_id": point_id, "value": None, "file": file_key, "sheet": sheet, "time": t_hhmm, "col": col, "status": "BAD_COLUMN"})
+            results.append({
+                "point_id": point_id,
+                "value": None,
+                "file": file_key,
+                "sheet": sheet,
+                "time": t_hhmm,
+                "col": col,
+                "status": "BAD_COLUMN",
+            })
             continue
 
-        ws = ctx["ws"]
-        hdr_row = ctx["hdr_row"]
+        # ดึงทั้งแถวครั้งเดียว (เร็วกว่า ws.cell มาก)
+        row_key = (fname, sheet, target_row)
+        rowvals = row_cache.get(row_key)
+        if rowvals is None:
+            try:
+                rowvals = next(ctx["ws"].iter_rows(min_row=target_row, max_row=target_row, values_only=True))
+                row_cache[row_key] = rowvals
+            except StopIteration:
+                rowvals = None
+            except Exception:
+                rowvals = None
 
-        # ดึงค่า + fallback ไล่ขึ้นไป
-        val = ws.cell(target_row, col_idx).value
-        if val in (None, "", " "):
-            found = None
-            for rr in range(target_row - 1, max(hdr_row + 1, target_row - 60) - 1, -1):
-                vv = ws.cell(rr, col_idx).value
-                if vv not in (None, "", " "):
-                    found = vv
-                    break
-            val = found
+        if not rowvals or col_idx > len(rowvals):
+            missing.append({**row, "reason": "OUT_OF_RANGE"})
+            results.append({
+                "point_id": point_id,
+                "value": None,
+                "file": file_key,
+                "sheet": sheet,
+                "time": t_hhmm,
+                "col": col,
+                "status": "OUT_OF_RANGE",
+            })
+            continue
 
-        stt = "OK" if val not in (None, "", " ") else "EMPTY_CELL"
-        results.append({"point_id": point_id, "value": val, "file": file_key, "sheet": sheet, "time": t_hhmm, "col": col, "status": stt})
+        value = rowvals[col_idx - 1]
 
+        # ทำให้เป็นเลข (ถ้าเป็น string)
+        try:
+            if isinstance(value, str):
+                vv = value.strip().replace(",", "")
+                value = float(vv) if vv != "" else None
+            elif isinstance(value, (int, float)):
+                value = float(value)
+        except Exception:
+            pass
+
+        stt = "OK" if value is not None else "EMPTY"
         if stt != "OK":
             missing.append({**row, "reason": stt})
 
-    return results, missing
+        results.append({
+            "point_id": point_id,
+            "value": value,
+            "file": file_key,
+            "sheet": sheet,
+            "time": t_hhmm,
+            "col": col,
+            "status": stt,
+        })
 
+    return results, missing
 def normalize_number_str(s: str, decimals: int = 0) -> str:
     if not s: return ""
     s = str(s).strip().replace(",", "").replace(" ", "")
@@ -1494,31 +1682,7 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
 
                     st.caption("ทิป: ถ้า UF/System เปลี่ยนชื่อไฟล์ ให้เลือกไฟล์ AF_Report_Gen.. มาแทนคีย์ UF_System")
 
-            results, missing = extract_scada_values_from_exports(mapping_rows, uploaded_exports, file_key_map=file_key_map)
-
-        # แสดงผล
-        ok_count = sum(1 for r in results if r["status"] == "OK")
-        st.success(f"อ่านได้แล้ว {ok_count}/{len(results)} จุด")
-        df = pd.DataFrame(results)
-        st.dataframe(df, use_container_width=True)
-
-        missing_ids = [r["point_id"] for r in results if r["status"] != "OK"]
-        if missing_ids:
-            st.warning("มีจุดที่ดึงค่าไม่สำเร็จ/ไม่มีใน Excel: " + ", ".join(missing_ids))
-            st.session_state["scada_missing_ids"] = missing_ids
-        else:
-            st.session_state["scada_missing_ids"] = []
-        st.session_state["scada_results"] = results
-
-
-
-        # แสดงผล
-        ok_count = sum(1 for r in results if r["status"] == "OK" and r["value"] is not None)
-        st.success(f"อ่านได้แล้ว {ok_count}/{len(results)} จุด")
-
-        df_show = pd.DataFrame(results)
-        st.dataframe(df_show, use_container_width=True)
-
+            results, missing = extract_scada_values_from_exports(mapping_rows, uploaded_exports, file_key_map=file_key_map, target_date=report_date)
         # เก็บไว้ใน session
         st.session_state["excel_results"] = results
         st.session_state["excel_missing"] = missing
@@ -1527,6 +1691,17 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
     if "excel_results" in st.session_state:
         results = st.session_state["excel_results"]
         missing = st.session_state.get("excel_missing", [])
+
+        # แสดงผลสรุป + ตาราง (แสดงครั้งเดียว)
+        ok_count = sum(1 for r in results if r.get("status") == "OK" and r.get("value") is not None)
+        st.success(f"อ่านได้แล้ว {ok_count}/{len(results)} จุด")
+
+        show_only_missing = st.checkbox("🚫 แสดงเฉพาะจุดที่ไม่มีใน Excel", value=False)
+        df_show = pd.DataFrame(results)
+        if show_only_missing and (not df_show.empty) and ("status" in df_show.columns):
+            df_show = df_show[df_show["status"] != "OK"]
+        st.dataframe(df_show, use_container_width=True)
+
 
         # เตือนจุดที่หาย
         missing_point_ids = [m["point_id"] for m in missing]
