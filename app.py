@@ -10,6 +10,8 @@ import json
 import cv2
 import numpy as np
 import pandas as pd
+import random
+import time as pytime
 import math
 from google.oauth2 import service_account
 from google.cloud import vision
@@ -301,6 +303,151 @@ def export_to_real_report(point_id, read_value, inspector, report_col, target_da
 
 
 # ✅ แก้ไข: รับ target_date เพื่อลง Timestamp ให้ถูกวัน
+
+# =========================================================
+# --- 🚀 QUOTA-SAFE BATCH HELPERS (Sheets) ---
+# =========================================================
+def _is_quota_429(err: Exception) -> bool:
+    msg = str(err)
+    return ("429" in msg) or ("Quota exceeded" in msg) or ("Read requests" in msg)
+
+def _with_retry(fn, *args, max_retries: int = 6, base_sleep: float = 0.8, **kwargs):
+    """
+    Retry wrapper for Google Sheets calls that may hit 429 quota.
+    - Exponential backoff + jitter
+    """
+    last_err = None
+    for i in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            if _is_quota_429(e) and i < max_retries - 1:
+                # backoff: 0.8, 1.6, 3.2, ...
+                sleep_s = base_sleep * (2 ** i) + random.random() * 0.4
+                pytime.sleep(sleep_s)
+                continue
+            raise
+    if last_err:
+        raise last_err
+
+def export_many_to_real_report_batch(items: list, target_date, debug: bool = False):
+    """
+    Export หลายจุดลง WaterReport ด้วย 1 batch_update (ลด Read/Write requests มาก ๆ)
+    items: list[dict] ต้องมี keys: point_id, value, report_col
+    คืนค่า:
+      - ok_pids: list[str]
+      - fail_list: list[tuple(pid, reason)]
+    """
+    ok_pids = []
+    fail_list = []
+
+    if not items:
+        return ok_pids, fail_list
+
+    # เปิดชีทครั้งเดียว + retry กัน quota
+    try:
+        sh = _with_retry(gc.open, REAL_REPORT_SHEET)
+    except Exception as e:
+        reason = f"เปิดชีท '{REAL_REPORT_SHEET}' ไม่ได้: {e}"
+        for it in items:
+            fail_list.append((it.get("point_id", ""), reason))
+        return ok_pids, fail_list
+
+    # หาแท็บเดือนครั้งเดียว
+    sheet_name = None
+    try:
+        sheet_name = get_thai_sheet_name(sh, target_date)
+    except Exception:
+        sheet_name = None
+
+    # fallback แบบฟัซซี่ (ครั้งเดียว)
+    if not sheet_name:
+        try:
+            thai_months = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
+            m_idx = target_date.month - 1
+            yy2 = str(target_date.year + 543)[-2:]
+            yy4 = str(target_date.year + 543)
+            m_norm = thai_months[m_idx].replace(".", "").replace(" ", "")
+
+            def norm(x):
+                return str(x).replace(".", "").replace(" ", "").strip()
+
+            for t in [s.title for s in sh.worksheets()]:
+                tn = norm(t)
+                if (m_norm in tn) and (yy2 in tn or yy4 in tn):
+                    sheet_name = t
+                    break
+        except Exception:
+            sheet_name = None
+
+    # เปิด worksheet ครั้งเดียว + retry
+    try:
+        ws = _with_retry(sh.worksheet, sheet_name) if sheet_name else _with_retry(sh.get_worksheet, 0)
+    except Exception as e:
+        reason = f"เปิดแท็บ '{sheet_name}' ไม่ได้: {e}"
+        for it in items:
+            fail_list.append((it.get("point_id", ""), reason))
+        return ok_pids, fail_list
+
+    # ✅ ลด Read requests: ใช้สูตร row แบบคงที่ (ถ้า template เปลี่ยนค่อยเปิด find_day_row_exact อีกที)
+    try:
+        target_row = 6 + int(target_date.day)
+    except Exception:
+        target_row = 6 + 1
+
+    # เตรียม batch ranges
+    data = []
+    for it in items:
+        pid = str(it.get("point_id", "")).strip().upper()
+        report_col = str(it.get("report_col", "")).strip()
+        val = it.get("value", "")
+
+        if not report_col or report_col in ("-", "—", "–"):
+            fail_list.append((pid, "report_col ว่าง/เป็น '-' ใน PointsMaster"))
+            continue
+
+        target_col = col_to_index(report_col)
+        if target_col <= 0:
+            fail_list.append((pid, f"report_col '{report_col}' แปลงคอลัมน์ไม่ได้"))
+            continue
+
+        # A1 เช่น "Y18"
+        a1 = gspread.utils.rowcol_to_a1(target_row, target_col)
+        data.append({"range": a1, "values": [[val]]})
+        ok_pids.append(pid)
+
+    if not data:
+        return [], fail_list
+
+    # batch_update ครั้งเดียว + retry กัน quota
+    try:
+        _with_retry(ws.batch_update, data, value_input_option="USER_ENTERED")
+        return ok_pids, fail_list
+    except Exception as e:
+        # ถ้า batch fail → ถือว่าทั้งหมด fail (ให้ user กดใหม่ได้)
+        reason = f"เขียนค่าไม่สำเร็จ (batch_update): {e}"
+        for pid in ok_pids:
+            fail_list.append((pid, reason))
+        return [], fail_list
+
+def append_rows_dailyreadings_batch(rows: list):
+    """
+    append_rows ลง DailyReadings ครั้งเดียว (ลด requests)
+    rows: list[list] แต่ละแถวต้องตรงกับ schema DailyReadings
+    คืนค่า (ok:bool, message:str)
+    """
+    if not rows:
+        return True, "NO_ROWS"
+
+    try:
+        sh = _with_retry(gc.open, DB_SHEET_NAME)
+        ws = _with_retry(sh.worksheet, "DailyReadings")
+        _with_retry(ws.append_rows, rows, value_input_option="USER_ENTERED")
+        return True, f"APPENDED {len(rows)}"
+    except Exception as e:
+        return False, str(e)
+
 def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, target_date, image_url="-"):
     try:
         sh = gc.open(DB_SHEET_NAME)
@@ -765,7 +912,7 @@ mode = st.sidebar.radio(
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
     st.markdown("### Water treatment Plant - Borthongindustrial")
-    st.caption("Version 6.1 (QR-first for Mobile)")
+    st.caption("Version 6.2 (QR-first for Mobile + Skip Confirm)")
 
     # --- session state ---
     if 'confirm_mode' not in st.session_state: st.session_state.confirm_mode = False
@@ -808,7 +955,7 @@ if mode == "📝 พนักงานจดมิเตอร์":
             pid = decode_qr(qr_pic.getvalue())
             if pid:
                 st.session_state.emp_point_id = pid
-                st.session_state.emp_step = "CONFIRM_POINT"
+                st.session_state.emp_step = "INPUT"
                 st.rerun()
             else:
                 st.warning("ยังอ่าน QR ไม่ได้ ลองถ่ายใหม่ให้ชัดขึ้น/ใกล้ขึ้น")
@@ -819,7 +966,7 @@ if mode == "📝 พนักงานจดมิเตอร์":
             if st.button("ยืนยันรหัส", use_container_width=True, key="emp_manual_ok"):
                 if manual_pid.strip():
                     st.session_state.emp_point_id = manual_pid.strip().upper()
-                    st.session_state.emp_step = "CONFIRM_POINT"
+                    st.session_state.emp_step = "INPUT"
                     st.rerun()
                 else:
                     st.warning("กรุณาพิมพ์รหัสก่อน")
@@ -902,6 +1049,14 @@ if mode == "📝 พนักงานจดมิเตอร์":
         fmt = "%.0f" if decimals == 0 else ("%.1f" if decimals == 1 else "%.2f")
         st.caption("ถ่ายรูปแล้ว AI จะเสนอค่าด้านล่าง")
 
+    # --- (Optional) แสดงรูปตัวอย่างของจุดนี้ เพื่อช่วยเช็คว่าถ่ายถูกมิเตอร์ ---
+    with st.expander("🖼️ ดูรูปตัวอย่างของจุดนี้ (ถ้าต้องการเช็ค)"):
+        ref_bytes, ref_path = load_ref_image_bytes_any(point_id)
+        if ref_bytes:
+            st.image(ref_bytes, caption="Reference: " + str(ref_path), use_container_width=True)
+        else:
+            st.info("ยังไม่มีรูปตัวอย่าง (Reference) ของจุดนี้ใน bucket")
+
     tab_cam, tab_up = st.tabs(["📷 ถ่ายรูป", "📂 อัปโหลด"])
 
     with tab_cam:
@@ -915,7 +1070,7 @@ if mode == "📝 พนักงานจดมิเตอร์":
     img_file = img_cam if img_cam is not None else img_up
 
     st.write("---")
-    st.subheader("ขั้นที่ 3: AI เสนอค่า และบันทึก")
+    st.subheader("ขั้นที่ 2: ถ่ายภาพ/อัปโหลด → AI เสนอค่า → บันทึก")
 
     # --- กัน OCR รันซ้ำเวลาหน้า rerun ---
     if "emp_ai_value" not in st.session_state:
@@ -924,7 +1079,7 @@ if mode == "📝 พนักงานจดมิเตอร์":
         st.session_state.emp_img_hash = ""
 
     if img_file is None:
-        st.info("📷 ถ่ายรูป หรืออัปโหลดรูป แล้ว AI จะอ่านค่าให้เองอัตโนมัติ")
+        st.info("📷 ถ่ายรูป (หรืออัปโหลดรูป) แล้ว AI จะอ่านค่าให้เองอัตโนมัติ")
         st.stop()
 
     img_bytes = img_file.getvalue()
@@ -1147,68 +1302,89 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
         st.subheader("3) บันทึกลง WaterReport")
         st.caption("จะบันทึกเฉพาะจุดที่มีค่า (ไม่ว่าง) ลง WaterReport ตาม report_col ใน PointsMaster")
 
+        
         if st.button("✅ บันทึกลง WaterReport (อัตโนมัติ)"):
-            saved_ok = 0
-            saved_fail = 0
-            fail_list = []
+            inspector_name = "Admin"
 
-            inspector_name = "Admin"  # จะเปลี่ยนเป็นช่องกรอกก็ได้
+            # 1) เตรียมรายการที่จะบันทึก (validate + แปลงค่า)
+            report_items = []   # ส่งเข้า WaterReport
+            db_rows = []        # log ลง DailyReadings
+            fail_list = []      # [(pid, reason), ...]
 
+            for pid, val in final_values.items():
+                pid_u = str(pid).strip().upper()
+                if val is None or str(val).strip() == "":
+                    continue
+
+                cfg = get_meter_config(pid_u)
+                if not cfg:
+                    fail_list.append((pid_u, "NO_CONFIG_IN_POINTSMaster"))
+                    continue
+
+                report_col = str(cfg.get("report_col", "") or "").strip()
+                if (not report_col) or (report_col in ("-", "—", "–")):
+                    fail_list.append((pid_u, "NO_REPORT_COL_IN_POINTSMaster"))
+                    continue
+
+                # แปลงค่าให้เป็นตัวเลขถ้าเป็นไปได้
+                write_val = val
+                try:
+                    write_val = float(str(val).replace(",", "").strip())
+                except Exception:
+                    write_val = str(val).strip()
+
+                report_items.append({
+                    "point_id": pid_u,
+                    "value": write_val,
+                    "report_col": report_col
+                })
+
+                # ทำ log ลง DB (DailyReadings) — timestamp = วันที่รายงาน + เวลาปัจจุบัน (ไทย)
+                try:
+                    meter_type = infer_meter_type(cfg)
+                except Exception:
+                    meter_type = "Electric"
+
+                try:
+                    current_time = get_thai_time().time()
+                    record_ts = datetime.combine(report_date, current_time).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    record_ts = get_thai_time().strftime("%Y-%m-%d %H:%M:%S")
+
+                db_rows.append([
+                    record_ts,
+                    meter_type,
+                    pid_u,
+                    inspector_name,
+                    write_val,   # Manual_Value
+                    write_val,   # AI_Value
+                    "AUTO_EXCEL_SCADA",
+                    "-"          # image_url
+                ])
+
+            if not report_items:
+                st.warning("ไม่มีข้อมูลให้บันทึก (ค่าทั้งหมดว่าง)")
+                st.stop()
+
+            # 2) log ลง DB แบบ batch (ลด requests)
+            ok_db, db_msg = append_rows_dailyreadings_batch(db_rows)
+            db_ok_count = len(db_rows) if ok_db else 0
+            if not ok_db:
+                # ไม่หยุดระบบ แค่แจ้งให้รู้ว่าล็อก DB ไม่สำเร็จ
+                st.warning(f"⚠️ Log ลง DailyReadings ไม่สำเร็จ: {db_msg}")
+
+            # 3) export ลง WaterReport แบบ batch (ลด Read requests)
             with st.spinner("กำลังบันทึกลง WaterReport..."):
-                for pid, val in final_values.items():
-                    # ข้ามค่าที่ว่าง
-                    if val is None or str(val).strip() == "":
-                        continue
+                ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True)
 
-                    cfg = get_meter_config(pid)
-                    if not cfg:
-                        saved_fail += 1
-                        fail_list.append((pid, "NO_CONFIG_IN_POINTSMaster"))
-                        continue
+            report_ok = len(ok_pids)
+            report_fail = fail_list + list(fail_report)
 
-                    report_col = str(cfg.get("report_col", "") or "").strip()
+            st.success(f"✅ บันทึกลง WaterReport สำเร็จ: {report_ok} จุด")
+            st.info(f"🗃️ Log ลง DailyReadings สำเร็จ: {db_ok_count} จุด")
 
-                    # แปลงให้เป็นตัวเลขถ้าทำได้ (กัน ',' หรือช่องว่าง)
-                    write_val = val
-                    try:
-                        write_val = float(str(val).replace(",", "").strip())
-                    except Exception:
-                        write_val = str(val).strip()
-
-                    # ✅ ส่งเข้ารายงาน (ต้องส่ง: point_id, value, inspector, report_col, target_date)
-                    ok_r, msg_r = export_to_real_report(
-                        pid,
-                        write_val,
-                        inspector_name,
-                        report_col,
-                        report_date,
-                        debug=True
-                    )
-
-                    if ok_r:
-                        saved_ok += 1
-                        # (ไม่บังคับ) เก็บ Log ลง DailyReadings
-                        try:
-                            meter_type = infer_meter_type(cfg)
-                            save_to_db(
-                                pid,
-                                inspector_name,
-                                meter_type,
-                                write_val,   # manual_val
-                                write_val,   # ai_val (ในโหมด Excel ให้เท่ากัน)
-                                "AUTO_EXCEL_SCADA",
-                                report_date,
-                                image_url="-"
-                            )
-                        except Exception:
-                            pass
-                    else:
-                        saved_fail += 1
-                        fail_list.append((pid, msg_r))
-
-            st.success(f"บันทึกสำเร็จ: {saved_ok} จุด")
-            if saved_fail:
-                st.error(f"บันทึกไม่สำเร็จ: {saved_fail} จุด")
-                st.write(fail_list)
+            if report_fail:
+                st.error(f"❌ บันทึกไม่สำเร็จ: {len(report_fail)} จุด")
+                st.write([[pid, reason] for pid, reason in report_fail])
         st.divider()
         st.info("หมายเหตุ: ถ้าลูกค้าบอกว่า 'มีมิเตอร์ไฟ 1 จุดที่ไม่มี export มาใน Excel' -> ใช้ช่องกรอกเองด้านบนได้เลย (เหมือนมิเตอร์น้ำ)")
