@@ -1072,71 +1072,8 @@ def get_ref_image_url(point_id: str) -> str:
     pid = str(point_id).strip().upper()
     return f"https://storage.googleapis.com/{BUCKET_NAME}/{REF_IMAGE_FOLDER}/{pid}.jpg"
 
-
-def _extract_point_id_from_text(raw: str, valid_ids=None):
-    """พยายามดึง point_id จากข้อความใน QR (รองรับ URL/JSON/ข้อความยาว)"""
-    if raw is None:
-        return None
-    txt = str(raw).strip()
-    if not txt:
-        return None
-
-    up = txt.strip().upper()
-
-    # 1) ตรงตัว
-    if valid_ids and up in valid_ids:
-        return up
-
-    # 2) URL: query / path
-    try:
-        from urllib.parse import urlparse, parse_qs
-        u = urlparse(txt)
-        qs = parse_qs(u.query)
-        for k in ("point_id", "pointid", "pid", "point", "id", "meter", "code"):
-            if k in qs and qs[k]:
-                cand = str(qs[k][0]).strip().upper()
-                cand = cand.replace('-', '_')
-                if (not valid_ids) or (cand in valid_ids):
-                    return cand
-        # path segments (ท้าย ๆ ก่อน)
-        for seg in reversed([s for s in u.path.split('/') if s]):
-            cand = str(seg).strip().upper().replace('-', '_')
-            if cand and ((not valid_ids) or (cand in valid_ids)):
-                return cand
-    except Exception:
-        pass
-
-    # 3) JSON
-    try:
-        import json
-        obj = json.loads(txt)
-        if isinstance(obj, dict):
-            for k in ("point_id", "pointId", "pointid", "pid", "id"):
-                if k in obj:
-                    cand = str(obj[k]).strip().upper().replace('-', '_')
-                    if (not valid_ids) or (cand in valid_ids):
-                        return cand
-    except Exception:
-        pass
-
-    # 4) regex token
-    toks = re.findall(r"[A-Z0-9_\-]{4,}", up)
-    for t in toks:
-        cand = t.replace('-', '_')
-        if valid_ids and cand in valid_ids:
-            return cand
-
-    # 5) fallback (ดีที่สุดที่มี)
-    if toks:
-        return toks[0].replace('-', '_')
-    return up
-
-
-def decode_qr(image_bytes: bytes, valid_ids=None):
-    """คืนค่า point_id จาก QR (ถ้าอ่านไม่ได้จะคืน None)
-
-    - valid_ids: set ของ point_id ที่มีอยู่จริงใน PointsMaster เพื่อช่วย match
-    """
+def decode_qr(image_bytes: bytes):
+    """คืนค่า point_id จาก QR (ถ้าอ่านไม่ได้จะคืน None)"""
     try:
         arr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -1145,12 +1082,9 @@ def decode_qr(image_bytes: bytes, valid_ids=None):
         detector = cv2.QRCodeDetector()
         data, _, _ = detector.detectAndDecode(img)
         data = (data or "").strip()
-        if not data:
-            return None
-        return _extract_point_id_from_text(data, valid_ids=valid_ids)
-    except Exception:
+        return data.upper() if data else None
+    except:
         return None
-
 
 def infer_meter_type(config: dict) -> str:
     """เดา meter_type จาก config เพื่อกันกรอกผิด"""
@@ -1160,24 +1094,314 @@ def infer_meter_type(config: dict) -> str:
     return "Electric"
 
 
-def allow_negative_for_point(point_id: str, config: dict) -> bool:
-    """เงื่อนไขคร่าว ๆ ว่าจุดนี้ยอมให้ติดลบได้ไหม (กัน error + กันล็อกค่าที่ควรติดลบ เช่น flowrate)"""
-    pid = str(point_id or "").strip().upper()
-    name = str((config or {}).get("name", "") or "").upper()
-    typ = str((config or {}).get("type", "") or "").upper()
-    blob = f"{typ} {name} {pid}"
+# =========================================================
+# --- 🖥️ DASHBOARD SCREENSHOT OCR (FLOW 1-3) ---
+# =========================================================
 
-    # flowrate มักมี m3/h และบางครั้งติดลบได้
-    if ("M3/H" in blob) or ("M³/H" in blob) or ("FLOWRATE" in blob) or ("_M_H_" in blob) or ("M_H" in pid):
-        return True
+_DASH_DEFAULT_POINT_MAP = {
+    # FLOW 1
+    (1, "pressure_bar"): "C_Bar_FLOW_1",
+    (1, "flowrate_m3h"): "D_m_h_FLOW_1",
+    (1, "flow_total_m3"): "J_FLOW_1",
+    # FLOW 2
+    (2, "pressure_bar"): "E_Bar_FLOW_2",
+    (2, "flowrate_m3h"): "F_m_h_FLOW_2",
+    (2, "flow_total_m3"): "K_FLOW_2",
+    # FLOW 3
+    (3, "pressure_bar"): "G_Bar_FLOW_3",
+    (3, "flowrate_m3h"): "H_m_h_FLOW_3",
+    (3, "flow_total_m3"): "L_FLOW_3",
+}
 
-    return False
+_NUM_RE = re.compile(r"^[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?$|^[-+]?\d+(?:\.\d+)?$")
+
+
+def _looks_like_number(s: str) -> bool:
+    if s is None:
+        return False
+    s = str(s).strip()
+    if not s:
+        return False
+    # กันค่าเวลาหรือวันที่ที่มี ':' หรือ '-'
+    if ":" in s or "/" in s:
+        return False
+    # แก้ OCR error ที่เจอ O/○ เป็น 0 แบบเบา ๆ
+    s2 = s.replace("O", "0").replace("o", "0")
+    return bool(_NUM_RE.match(s2))
+
+
+def _parse_number(s: str):
+    if s is None:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    s = s.replace("O", "0").replace("o", "0")
+    s = s.replace(",", "")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _cv2_decode_bytes(image_bytes: bytes):
+    arr = np.frombuffer(image_bytes, np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+def _cv2_encode_jpg(img, quality: int = 92) -> bytes:
+    ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    return buf.tobytes() if ok else b""
+
+
+def _upscale_for_ocr(img, max_side: int = 2200):
+    if img is None:
+        return img
+    h, w = img.shape[:2]
+    if h == 0 or w == 0:
+        return img
+    scale = 2.0
+    if max(h, w) * scale > max_side:
+        scale = max_side / float(max(h, w))
+    if scale <= 1.05:
+        return img
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+
+
+def _vision_tokens(image_bytes: bytes, lang_hints=("en",)):
+    """คืน list ของ token จาก Google Vision OCR: [{text,x1,y1,x2,y2,cx,cy}]"""
+    image = vision.Image(content=image_bytes)
+    ctx = vision.ImageContext(language_hints=list(lang_hints))
+    resp = VISION_CLIENT.text_detection(image=image, image_context=ctx)
+    if resp.error.message:
+        raise RuntimeError(resp.error.message)
+
+    ann = resp.text_annotations
+    tokens = []
+    for a in ann[1:]:
+        txt = (a.description or "").strip()
+        if not txt:
+            continue
+        vs = a.bounding_poly.vertices
+        xs = [v.x for v in vs]
+        ys = [v.y for v in vs]
+        x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+        tokens.append({
+            "text": txt,
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "cx": (x1 + x2) / 2.0,
+            "cy": (y1 + y2) / 2.0,
+            "h": max(1.0, (y2 - y1)),
+            "w": max(1.0, (x2 - x1)),
+        })
+    full_text = ann[0].description if ann else ""
+    return tokens, full_text
+
+
+def _norm_token_text(s: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(s).upper())
+
+
+def _suggest_dashboard_crop(tokens, w: int, h: int):
+    """คาดเดา ROI ตาราง Flow โดยดู anchor คำว่า FLOW/Pressure/Flowrate/Flow_Total"""
+    # default crop: ตัด sidebar + top bar
+    def_roi = (int(w * 0.18), int(h * 0.18), int(w * 0.99), int(h * 0.92))
+
+    if not tokens:
+        return def_roi
+
+    anchors = []
+    for t in tokens:
+        tn = _norm_token_text(t.get("text", ""))
+        if any(k in tn for k in ["FLOW", "PRESSURE", "FLOWRATE", "FLOWTOTAL", "TOTALM3", "M3H", "BAR"]):
+            anchors.append(t)
+
+    if not anchors:
+        return def_roi
+
+    x1 = min(t["x1"] for t in anchors)
+    y1 = min(t["y1"] for t in anchors)
+    x2 = max(t["x2"] for t in anchors)
+    y2 = max(t["y2"] for t in anchors)
+
+    # ขยายกรอบให้ครอบคลุมตัวเลขด้านขวา + แถว FLOW 1-3 ด้านล่าง
+    pad_x_left = int(0.05 * w)
+    pad_x_right = int(0.35 * w)
+    pad_y_top = int(0.10 * h)
+    pad_y_bottom = int(0.45 * h)
+
+    rx1 = max(0, x1 - pad_x_left)
+    ry1 = max(0, y1 - pad_y_top)
+    rx2 = min(w, x2 + pad_x_right)
+    ry2 = min(h, y2 + pad_y_bottom)
+
+    # sanity
+    if (rx2 - rx1) < int(0.35 * w) or (ry2 - ry1) < int(0.20 * h):
+        return def_roi
+
+    return (rx1, ry1, rx2, ry2)
+
+
+def _join_adjacent_numeric_tokens(num_tokens, gap_px: int = 12):
+    """รวม token ที่อยู่ติดกันมาก ๆ (เผื่อ OCR แยกเลขเป็นชิ้น)"""
+    if not num_tokens:
+        return []
+    num_tokens = sorted(num_tokens, key=lambda t: t["x1"])
+    merged = []
+    cur = dict(num_tokens[0])
+    for t in num_tokens[1:]:
+        gap = t["x1"] - cur["x2"]
+        if gap >= 0 and gap <= gap_px:
+            # ต่อข้อความ
+            cur["text"] = f"{cur['text']}{t['text']}"
+            cur["x2"] = max(cur["x2"], t["x2"])
+            cur["y1"] = min(cur["y1"], t["y1"])
+            cur["y2"] = max(cur["y2"], t["y2"])
+        else:
+            merged.append(cur)
+            cur = dict(t)
+    merged.append(cur)
+    # recalc centers
+    for m in merged:
+        m["cx"] = (m["x1"] + m["x2"]) / 2.0
+        m["cy"] = (m["y1"] + m["y2"]) / 2.0
+    return merged
+
+
+def extract_dashboard_flow_values(image_bytes: bytes, debug: bool = False):
+    """อ่านค่า FLOW 1-3 จากรูป Dashboard
+
+    คืนค่า:
+      - rows: list[dict] [{flow, pressure_bar, flowrate_m3h, flow_total_m3, status}]
+      - debug_obj: dict (ถ้า debug=True)
+    """
+    img = _cv2_decode_bytes(image_bytes)
+    if img is None:
+        rows = [
+            {"flow": f"FLOW {i}", "pressure_bar": None, "flowrate_m3h": None, "flow_total_m3": None, "status": "BAD_IMAGE"}
+            for i in (1, 2, 3)
+        ]
+        return (rows, {"reason": "cv2_decode_failed"}) if debug else rows
+
+    h, w = img.shape[:2]
+
+    # pass1: OCR บนภาพเต็มเพื่อหา ROI
+    try:
+        tokens1, full_text1 = _vision_tokens(image_bytes, lang_hints=("en",))
+    except Exception as e:
+        rows = [
+            {"flow": f"FLOW {i}", "pressure_bar": None, "flowrate_m3h": None, "flow_total_m3": None, "status": f"VISION_ERROR"}
+            for i in (1, 2, 3)
+        ]
+        dbg = {"error": str(e)}
+        return (rows, dbg) if debug else rows
+
+    # crop
+    x1, y1, x2, y2 = _suggest_dashboard_crop(tokens1, w, h)
+    crop = img[y1:y2, x1:x2].copy()
+    crop = _upscale_for_ocr(crop)
+    crop_bytes = _cv2_encode_jpg(crop, quality=92)
+
+    # pass2: OCR บน crop เพื่ออ่านตัวเลขชัดขึ้น
+    try:
+        tokens, full_text = _vision_tokens(crop_bytes, lang_hints=("en",))
+    except Exception as e:
+        tokens, full_text = tokens1, full_text1
+
+    # หาแถว FLOW 1-3
+    flow_rows = {}  # n -> dict(y, h, x_right)
+
+    # case A: token แบบ FLOW1
+    for t in tokens:
+        tn = _norm_token_text(t.get("text", ""))
+        m = re.match(r"^FLOW([123])$", tn)
+        if m:
+            n = int(m.group(1))
+            flow_rows[n] = {
+                "y": t["cy"],
+                "h": t["h"],
+                "x_right": t["x2"],
+            }
+
+    # case B: FLOW + digit แยกกัน
+    if len(flow_rows) < 3:
+        flow_tokens = [t for t in tokens if _norm_token_text(t.get("text", "")) == "FLOW"]
+        digit_tokens = [t for t in tokens if str(t.get("text", "")).strip() in ("1", "2", "3")]
+        for d in digit_tokens:
+            n = int(str(d["text"]))
+            if n in flow_rows:
+                continue
+            # หา FLOW ที่ใกล้ที่สุด (ส่วนใหญ่จะอยู่เหนือเลข หรือใกล้ ๆ)
+            best = None
+            best_score = 1e9
+            for f in flow_tokens:
+                dx = abs(d["cx"] - f["cx"])
+                dy = abs(d["cy"] - f["cy"])
+                score = dx + dy * 1.2
+                if score < best_score and dx < 120 and dy < 120:
+                    best = f
+                    best_score = score
+            if best:
+                y = (best["cy"] + d["cy"]) / 2.0
+                hh = max(best["h"], d["h"]) * 1.8
+                xr = max(best["x2"], d["x2"])
+                flow_rows[n] = {"y": y, "h": hh, "x_right": xr}
+
+    # สร้างผลลัพธ์
+    out_rows = []
+    for n in (1, 2, 3):
+        row = {"flow": f"FLOW {n}", "pressure_bar": None, "flowrate_m3h": None, "flow_total_m3": None, "status": "NOT_FOUND"}
+        meta = flow_rows.get(n)
+        if not meta:
+            out_rows.append(row)
+            continue
+
+        band = max(22.0, meta["h"] * 1.2)
+        x_min = meta["x_right"] + 8
+
+        # เลือก token ที่อยู่ในแนวเดียวกัน
+        row_tokens = [t for t in tokens if (abs(t["cy"] - meta["y"]) <= band and t["x1"] >= x_min)]
+
+        num_tokens = [t for t in row_tokens if _looks_like_number(t.get("text", ""))]
+        # รวม token ที่ติดกัน เผื่อเลขแยก
+        num_tokens = _join_adjacent_numeric_tokens(num_tokens, gap_px=14)
+        # filter อีกทีหลังรวม
+        num_tokens = [t for t in num_tokens if _looks_like_number(t.get("text", ""))]
+        num_tokens = sorted(num_tokens, key=lambda t: t["cx"])
+
+        if len(num_tokens) >= 3:
+            p = _parse_number(num_tokens[0]["text"])
+            fr = _parse_number(num_tokens[1]["text"])
+            tot = _parse_number(num_tokens[2]["text"])
+            row.update({
+                "pressure_bar": p,
+                "flowrate_m3h": fr,
+                "flow_total_m3": tot,
+                "status": "OK" if (p is not None and fr is not None and tot is not None) else "PARTIAL",
+            })
+        out_rows.append(row)
+
+    dbg = {
+        "roi": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+        "flow_rows": flow_rows,
+        "full_text": full_text[:4000] if full_text else "",
+        "full_text_pass1": full_text1[:4000] if full_text1 else "",
+        "tokens_count": len(tokens),
+    }
+
+    return (out_rows, dbg) if debug else out_rows
+
 # =========================================================
 # --- UI LOGIC ---
 # =========================================================
 mode = st.sidebar.radio(
     "🔧 เลือกโหมดการทำงาน",
-    ["📝 พนักงานจดมิเตอร์", "📥 อัปโหลด Excel (SCADA Export)", "👮‍♂️ Admin Approval"]
+    ["📝 พนักงานจดมิเตอร์", "📥 อัปโหลด Excel (SCADA Export)", "🖥️ Dashboard Screenshot (OCR)", "👮‍♂️ Admin Approval"]
 )
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
@@ -1220,29 +1444,15 @@ if mode == "📝 พนักงานจดมิเตอร์":
         st.subheader("ขั้นที่ 1: สแกน QR ที่มิเตอร์")
         st.write("📌 ถ่ายให้ใกล้ ๆ และชัด (ประมาณ 15–25 ซม.)")
 
-        valid_ids = set(str(x.get('point_id','')).strip().upper() for x in all_meters if str(x.get('point_id','')).strip())
-
-        tab_qr_cam, tab_qr_up = st.tabs(["📷 สแกนด้วยกล้อง", "📂 อัปโหลดรูป QR"])
-
-        pid = None
-        with tab_qr_cam:
-            qr_pic = st.camera_input("ถ่าย QR ให้ชัด", key="emp_qr_cam")
-            if qr_pic is not None:
-                pid = decode_qr(qr_pic.getvalue(), valid_ids=valid_ids)
-                if not pid:
-                    st.warning("ยังอ่าน QR ไม่ได้ ลองถ่ายใหม่ให้ชัดขึ้น/ใกล้ขึ้น")
-
-        with tab_qr_up:
-            qr_up = st.file_uploader("อัปโหลดรูป QR (JPG/PNG)", type=['jpg','jpeg','png'], key="emp_qr_upload")
-            if qr_up is not None:
-                pid = decode_qr(qr_up.getvalue(), valid_ids=valid_ids)
-                if not pid:
-                    st.warning("ยังอ่าน QR ไม่ได้ ลองอัปโหลดรูปที่ชัดขึ้น")
-
-        if pid:
-            st.session_state.emp_point_id = str(pid).strip().upper()
-            st.session_state.emp_step = "INPUT"
-            st.rerun()
+        qr_pic = st.camera_input("ถ่าย QR ให้ชัด", key="emp_qr_cam")
+        if qr_pic is not None:
+            pid = decode_qr(qr_pic.getvalue())
+            if pid:
+                st.session_state.emp_point_id = pid
+                st.session_state.emp_step = "INPUT"
+                st.rerun()
+            else:
+                st.warning("ยังอ่าน QR ไม่ได้ ลองถ่ายใหม่ให้ชัดขึ้น/ใกล้ขึ้น")
 
         # --- ทางหนีฉุกเฉิน (ซ่อน) ---
         with st.expander("สแกนไม่ได้? พิมพ์รหัสเอง"):
@@ -1341,23 +1551,17 @@ if mode == "📝 พนักงานจดมิเตอร์":
         else:
             st.info("ยังไม่มีรูปตัวอย่าง (Reference) ของจุดนี้ใน bucket")
 
-    tab_cam, tab_flash, tab_up = st.tabs(["📷 ถ่ายรูป (ปกติ)", "⚡ ถ่ายรูป (แฟลช)", "📂 อัปโหลด"])
+    tab_cam, tab_up = st.tabs(["📷 ถ่ายรูป", "📂 อัปโหลด"])
 
     with tab_cam:
         img_cam = st.camera_input("ถ่ายภาพมิเตอร์", key="emp_meter_cam")
 
-    with tab_flash:
-        st.info("ถ้าหน้างานมืด (เช่น ตี 5) แนะนำแท็บนี้: กด 'Browse files' → เลือก 'Take Photo' แล้วเปิดแฟลชจากหน้ากล้องของมือถือ")
-        img_flash = st.file_uploader("ถ่ายรูปด้วยแฟลช (Take Photo)", type=['jpg','png','jpeg'], key="emp_meter_flash")
-        if img_flash is not None:
-            st.image(img_flash, caption=f"รูปที่ถ่าย/เลือก: {getattr(img_flash, 'name', 'flash')}", use_container_width=True)
-
     with tab_up:
-        img_up = st.file_uploader("เลือกรูปภาพจากเครื่อง", type=['jpg', 'png', 'jpeg'], key="emp_meter_upload")
+        img_up = st.file_uploader("เลือกรูปภาพ", type=['jpg', 'png', 'jpeg'], key="emp_meter_upload")
         if img_up is not None:
             st.image(img_up, caption=f"รูปที่เลือก: {getattr(img_up, 'name', 'upload')}", use_container_width=True)
 
-    img_file = img_cam if img_cam is not None else (img_flash if img_flash is not None else img_up)
+    img_file = img_cam if img_cam is not None else img_up
 
     st.write("---")
     st.subheader("ขั้นที่ 2: ถ่ายภาพ/อัปโหลด → AI เสนอค่า → บันทึก")
@@ -1384,12 +1588,6 @@ if mode == "📝 พนักงานจดมิเตอร์":
     ai_val = float(st.session_state.emp_ai_value or 0.0)
     st.write(f"🤖 **AI เสนอค่า:** {fmt % ai_val}")
 
-    allow_neg = allow_negative_for_point(point_id, config)
-
-    # ถ้า AI อ่านติดลบ แต่จุดนี้ไม่ควรติดลบ → บังคับให้เริ่มต้นเป็น 0 และแนะนำให้แก้เอง
-    if (not allow_neg) and (ai_val < 0):
-        st.warning("⚠️ AI อ่านค่าเป็นลบ ซึ่งผิดปกติสำหรับจุดนี้ — แนะนำให้เลือก 'แก้เอง' แล้วกรอกค่าที่ถูกต้อง")
-
     choice = st.radio(
         "จะบันทึกค่าไหน?",
         ["✅ ใช้ค่า AI", "✍️ แก้เอง"],
@@ -1398,26 +1596,16 @@ if mode == "📝 พนักงานจดมิเตอร์":
     )
 
     if choice == "✍️ แก้เอง":
-        default_val = float(ai_val)
-        min_val = None
-        if not allow_neg:
-            min_val = 0.0
-            if default_val < 0:
-                default_val = 0.0
-
         final_val = st.number_input(
             "พิมพ์ค่าที่ถูกต้อง",
-            value=float(default_val),
-            min_value=min_val,
+            value=float(ai_val),
+            min_value=0.0,
             step=step,
             format=fmt,
             key="emp_override_val"
         )
         status = "CONFIRMED_MANUAL"
     else:
-        if (not allow_neg) and (ai_val < 0):
-            st.error("❌ ค่า AI ติดลบและไม่เหมาะกับจุดนี้ — กรุณาเลือก 'แก้เอง' เพื่อกรอกค่าที่ถูกต้อง")
-            st.stop()
         final_val = float(ai_val)
         status = "CONFIRMED_AI"
 
@@ -1517,6 +1705,183 @@ elif mode == "👮‍♂️ Admin Approval":
                             if updated: st.success("Approved!"); st.rerun()
                             else: st.warning("หา row ไม่เจอ")
                         except Exception as e: st.error(f"Error approve: {e}")
+
+
+
+elif mode == "🖥️ Dashboard Screenshot (OCR)":
+    st.title("🖥️ Dashboard Screenshot → WaterReport")
+    st.caption("อัปโหลดรูปหน้าจอ Monitor (binary28 / Monitor View) แล้วระบบจะอ่านค่า Pressure/Flowrate/Flow_Total ของ FLOW 1-3 ให้อัตโนมัติ")
+
+    c_insp, c_date = st.columns(2)
+    with c_insp:
+        inspector = st.text_input("ชื่อผู้บันทึก", "Admin", key="dash_inspector")
+    with c_date:
+        report_date = st.date_input("📅 วันที่ของรายงาน (ที่จะไปกรอกใน WaterReport)", value=get_thai_time().date(), key="dash_date")
+
+    up = st.file_uploader("อัปโหลดรูปหน้าจอ Dashboard (JPG/PNG)", type=["jpg", "jpeg", "png"], key="dash_img")
+    if not up:
+        st.info("อัปโหลดรูปก่อน แล้วกดปุ่มอ่านค่า")
+        st.stop()
+
+    img_bytes = up.getvalue()
+    st.image(img_bytes, caption=f"ภาพที่อัปโหลด: {getattr(up, 'name', 'dashboard')} ", use_container_width=True)
+
+    # กัน OCR รันซ้ำเมื่อ rerun
+    if "dash_img_hash" not in st.session_state:
+        st.session_state.dash_img_hash = ""
+    if "dash_rows" not in st.session_state:
+        st.session_state.dash_rows = None
+    if "dash_dbg" not in st.session_state:
+        st.session_state.dash_dbg = None
+
+    img_hash = hashlib.md5(img_bytes).hexdigest()
+    if img_hash != st.session_state.dash_img_hash:
+        st.session_state.dash_img_hash = img_hash
+        st.session_state.dash_rows = None
+        st.session_state.dash_dbg = None
+
+    if st.button("🔎 อ่านค่าจากรูป (OCR)"):
+        with st.spinner("กำลังอ่านค่าจากรูป..."):
+            rows, dbg = extract_dashboard_flow_values(img_bytes, debug=True)
+        st.session_state.dash_rows = rows
+        st.session_state.dash_dbg = dbg
+
+    rows = st.session_state.dash_rows
+    if not rows:
+        st.stop()
+
+    df = pd.DataFrame(rows)
+    st.subheader("ผลการอ่านค่าจากรูป")
+    st.dataframe(df, use_container_width=True)
+
+    # เตรียมรายการ point_id ทั้งหมด (สำหรับ dropdown)
+    pm = load_points_master()
+    all_pids = [str(r.get('point_id','')).strip().upper() for r in pm if r.get('point_id')]
+    all_pids = sorted(list({p for p in all_pids if p}))
+
+    # map ค่า -> point_id (default)
+    st.subheader("แปลงค่าที่อ่านได้ → point_id (PointsMaster)")
+    st.caption("ระบบจะเติมค่า point_id ให้เองตามมาตรฐาน (C/D/J, E/F/K, G/H/L). ถ้าต้องการเปลี่ยนค่อยแก้จาก dropdown")
+
+    picked = []  # list[{point_id, value}]
+
+    for r in rows:
+        flow_label = r.get('flow', '')
+        try:
+            n = int(str(flow_label).strip().split()[-1])
+        except Exception:
+            n = None
+
+        st.markdown(f"#### {flow_label}")
+        cols = st.columns(3)
+
+        metrics = [
+            ("pressure_bar", "Pressure (bar)"),
+            ("flowrate_m3h", "Flowrate (m3/h)"),
+            ("flow_total_m3", "Flow_Total (m3)"),
+        ]
+
+        for i, (k, label) in enumerate(metrics):
+            v = r.get(k)
+            with cols[i]:
+                st.caption(label)
+                st.write(v)
+                default_pid = (_DASH_DEFAULT_POINT_MAP.get((n, k), "") if n else "").strip().upper()
+
+                options = ["(ไม่บันทึก)"] + all_pids
+                default_idx = 0
+                if default_pid and default_pid in options:
+                    default_idx = options.index(default_pid)
+
+                sel = st.selectbox(
+                    "point_id",
+                    options=options,
+                    index=default_idx,
+                    key=f"dash_pid_{flow_label}_{k}")
+
+                if sel != "(ไม่บันทึก)" and v is not None:
+                    picked.append({"point_id": sel, "value": v})
+
+    # --- debug OCR ---
+    with st.expander("แสดงข้อความ OCR (debug)"):
+        if st.session_state.dash_dbg:
+            st.json(st.session_state.dash_dbg)
+        else:
+            st.info("ไม่มี debug")
+
+    st.subheader("บันทึกลง WaterReport")
+    st.caption("จะบันทึกเฉพาะ point_id ที่เลือกไว้ และมีค่าไม่ว่าง")
+
+    if st.button("✅ บันทึกลง WaterReport (อัตโนมัติ)"):
+        inspector_name = inspector or "Admin"
+
+        report_items = []
+        db_rows = []
+        fail_list = []
+
+        for it in picked:
+            pid_u = str(it.get('point_id','')).strip().upper()
+            val = it.get('value', None)
+            if not pid_u or val is None or str(val).strip() == "":
+                continue
+
+            cfg = get_meter_config(pid_u)
+            if not cfg:
+                fail_list.append((pid_u, "NO_CONFIG_IN_POINTSMaster"))
+                continue
+
+            report_col = str(cfg.get('report_col','') or '').strip()
+            if (not report_col) or (report_col in ("-", "—", "–")):
+                fail_list.append((pid_u, "NO_REPORT_COL_IN_POINTSMaster"))
+                continue
+
+            # แปลงค่า
+            write_val = val
+            try:
+                write_val = float(str(val).replace(",", "").strip())
+            except Exception:
+                write_val = str(val).strip()
+
+            report_items.append({"point_id": pid_u, "value": write_val, "report_col": report_col})
+
+            # log DB
+            try:
+                meter_type = infer_meter_type(cfg)
+            except Exception:
+                meter_type = "Electric"
+
+            try:
+                current_time = get_thai_time().time()
+                record_ts = datetime.combine(report_date, current_time).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                record_ts = get_thai_time().strftime("%Y-%m-%d %H:%M:%S")
+
+            db_rows.append([
+                record_ts,
+                meter_type,
+                pid_u,
+                inspector_name,
+                write_val,
+                write_val,
+                "AUTO_DASHBOARD_OCR",
+                "-",
+            ])
+
+        if not report_items:
+            st.warning("ไม่มีข้อมูลให้บันทึก (ยังไม่ได้เลือก point_id หรือค่าทั้งหมดว่าง)")
+            st.stop()
+
+        ok_db, db_msg = append_rows_dailyreadings_batch(db_rows)
+        if not ok_db:
+            st.warning(f"⚠️ Log ลง DailyReadings ไม่สำเร็จ: {db_msg}")
+
+        with st.spinner("กำลังบันทึกลง WaterReport..."):
+            ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True)
+
+        st.success(f"✅ บันทึกลง WaterReport สำเร็จ: {len(ok_pids)} จุด")
+        if fail_list or fail_report:
+            st.error(f"❌ บันทึกไม่สำเร็จ: {len(fail_list) + len(fail_report)} จุด")
+            st.write([[pid, reason] for pid, reason in (fail_list + list(fail_report))])
 
 elif mode == "📥 อัปโหลด Excel (SCADA Export)":
     st.title("📥 อัปโหลด Excel (SCADA Export)")
