@@ -711,7 +711,11 @@ def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict, file
 
     for fname, b in uploaded_exports.items():
         try:
-            wb = openpyxl.load_workbook(io.BytesIO(b), data_only=True, read_only=True)
+            try:
+                wb = openpyxl.load_workbook(io.BytesIO(b), data_only=True, read_only=True, keep_links=False)
+            except TypeError:
+                # openpyxl รุ่นเก่าอาจไม่มี keep_links
+                wb = openpyxl.load_workbook(io.BytesIO(b), data_only=True, read_only=True)
             wb_cache[fname] = wb
             wb_is_ufgen[fname] = _is_uf_gen_report_workbook(wb)
         except Exception:
@@ -878,6 +882,15 @@ def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict, file
 
         if stt != "OK":
             missing.append({**row, "reason": stt})
+    # ปิด workbook เพื่อลด memory/handle ค้าง (ไฟล์ใหญ่จะหนักมาก)
+    for _wb in wb_cache.values():
+        try:
+            if _wb:
+                _wb.close()
+        except Exception:
+            pass
+
+
 
     return results, missing
 
@@ -1936,84 +1949,82 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
     if not exports:
         st.stop()
 
-    uploaded_exports = {f.name: f.getvalue() for f in exports}
+    # เก็บไฟล์ไว้ก่อน (อย่าเพิ่งอ่าน bytes ตรงนี้ กัน rerun แล้วโหลดไฟล์ซ้ำ)
+    export_files = exports
+    export_filenames = [getattr(f, 'name', '') for f in export_files if getattr(f, 'name', None)]
 
-    # ปุ่มดึงค่า
-    if st.button("🔎 ดึงค่าจาก Excel"):
-        with st.spinner("กำลังอ่านค่าใน Excel..."):
-            uploaded_exports = {f.name: f.getvalue() for f in exports}
+    # === (Optional) จับคู่ไฟล์กรณีลูกค้าเปลี่ยนชื่อ ===
+    # ปกติระบบจะเดาจากชื่อไฟล์เอง แต่ถ้าขึ้น NO_FILE ให้ตั้งค่าตรงนี้
+    file_key_map = {}
+    key_norms = sorted({_strip_date_prefix(r.get("file_key", "")) for r in mapping_rows if r.get("file_key")})
 
-            # === (Optional) จับคู่ไฟล์กรณีลูกค้าเปลี่ยนชื่อ ===
-            # ปกติระบบจะเดาจากชื่อไฟล์เอง แต่ถ้าขึ้น NO_FILE ให้ตั้งค่าตรงนี้
-            file_key_map = {}
-            key_norms = sorted({_strip_date_prefix(r.get("file_key", "")) for r in mapping_rows if r.get("file_key")})
+    with st.expander("⚙️ ตั้งค่าจับคู่ไฟล์ (ใช้เมื่อขึ้น NO_FILE / ลูกค้าเปลี่ยนชื่อไฟล์)"):
+        if not key_norms:
+            st.info("ไม่พบ file_key ใน mapping")
+        else:
+            options = ["(Auto)"] + list(export_filenames)
+            for kn in key_norms:
+                if not kn:
+                    continue
 
-            with st.expander("⚙️ ตั้งค่าจับคู่ไฟล์ (ใช้เมื่อขึ้น NO_FILE / ลูกค้าเปลี่ยนชื่อไฟล์)"):
-                if not key_norms:
-                    st.info("ไม่พบ file_key ใน mapping")
-                else:
-                    options = ["(Auto)"] + list(uploaded_exports.keys())
-                    for kn in key_norms:
-                        if not kn:
-                            continue
+                # เดาค่า default
+                default_choice = "(Auto)"
+                for fname in export_filenames:
+                    if kn in _strip_date_prefix(fname) or _norm_filekey(kn) in _norm_filekey(fname):
+                        default_choice = fname
+                        break
 
-                        # เดาค่า default
-                        default_choice = "(Auto)"
-                        for fname in uploaded_exports.keys():
-                            if kn in _strip_date_prefix(fname) or _norm_filekey(kn) in _norm_filekey(fname):
+                # UF_System: ถ้าชื่อไฟล์ไม่ตรง ให้เดาไฟล์ AF_Report/Report_Gen
+                if default_choice == "(Auto)":
+                    kn2 = _norm_filekey(kn)
+                    if "uf" in kn2 or "uf_system" in kn2 or "ufsystem" in kn2:
+                        for fname in export_filenames:
+                            fn2 = _norm_filekey(fname)
+                            if fn2.startswith("af_report") or "report_gen" in fn2:
                                 default_choice = fname
                                 break
 
-                        # UF_System: ถ้าชื่อไฟล์ไม่ตรง ให้เดาไฟล์ AF_Report/Report_Gen
-                        if default_choice == "(Auto)":
-                            kn2 = _norm_filekey(kn)
-                            if "uf" in kn2 or "uf_system" in kn2 or "ufsystem" in kn2:
-                                for fname in uploaded_exports.keys():
-                                    fn2 = _norm_filekey(fname)
-                                    if fn2.startswith("af_report") or "report_gen" in fn2:
-                                        default_choice = fname
-                                        break
+                sel = st.selectbox(
+                    f"ไฟล์ที่ใช้สำหรับ '{kn}'",
+                    options=options,
+                    index=options.index(default_choice) if default_choice in options else 0,
+                    key=f"filemap_{kn}"
+                )
+                if sel != "(Auto)":
+                    file_key_map[kn] = sel
 
-                        sel = st.selectbox(
-                            f"ไฟล์ที่ใช้สำหรับ '{kn}'",
-                            options=options,
-                            index=options.index(default_choice) if default_choice in options else 0,
-                            key=f"filemap_{kn}"
-                        )
-                        if sel != "(Auto)":
-                            file_key_map[kn] = sel
+            st.caption("ทิป: ถ้า UF/System เปลี่ยนชื่อไฟล์ ให้เลือกไฟล์ AF_Report_Gen.. มาแทนคีย์ UF_System")
 
-                    st.caption("ทิป: ถ้า UF/System เปลี่ยนชื่อไฟล์ ให้เลือกไฟล์ AF_Report_Gen.. มาแทนคีย์ UF_System")
+    # ปุ่มดึงค่า
+    if st.button("🔎 ดึงค่าจาก Excel"):
+        # signature กัน rerun แล้วอ่าน bytes ซ้ำ (ไฟล์ใหญ่จะช้ามาก)
+        sig = tuple((f.name, getattr(f, 'size', None)) for f in export_files)
 
+        if st.session_state.get("scada_exports_sig") != sig:
+            st.session_state["scada_exports_sig"] = sig
+            with st.spinner("กำลังโหลดไฟล์ Excel (ครั้งแรกเท่านั้น)..."):
+                st.session_state["scada_exports_bytes"] = {f.name: f.getvalue() for f in export_files}
+
+        uploaded_exports = st.session_state.get("scada_exports_bytes", {})
+
+        with st.spinner("กำลังอ่านค่าใน Excel..."):
             results, missing = extract_scada_values_from_exports(mapping_rows, uploaded_exports, file_key_map=file_key_map)
 
         # แสดงผล
-        ok_count = sum(1 for r in results if r["status"] == "OK")
-        st.success(f"อ่านได้แล้ว {ok_count}/{len(results)} จุด")
-        df = pd.DataFrame(results)
-        st.dataframe(df, use_container_width=True)
-
-        missing_ids = [r["point_id"] for r in results if r["status"] != "OK"]
-        if missing_ids:
-            st.warning("มีจุดที่ดึงค่าไม่สำเร็จ/ไม่มีใน Excel: " + ", ".join(missing_ids))
-            st.session_state["scada_missing_ids"] = missing_ids
-        else:
-            st.session_state["scada_missing_ids"] = []
-        st.session_state["scada_results"] = results
-
-
-
-        # แสดงผล
-        ok_count = sum(1 for r in results if r["status"] == "OK" and r["value"] is not None)
+        ok_count = sum(1 for r in results if r.get("status") == "OK" and r.get("value") is not None)
         st.success(f"อ่านได้แล้ว {ok_count}/{len(results)} จุด")
 
         df_show = pd.DataFrame(results)
         st.dataframe(df_show, use_container_width=True)
 
+        # เตือนจุดที่หาย
+        missing_point_ids = [m.get("point_id") for m in (missing or []) if m.get("point_id")]
+        if missing_point_ids:
+            st.warning("มีจุดที่ดึงค่าไม่สำเร็จ/ไม่มีใน Excel: " + ", ".join(missing_point_ids))
+
         # เก็บไว้ใน session
         st.session_state["excel_results"] = results
         st.session_state["excel_missing"] = missing
-
     # ถ้ามีผลแล้ว แสดงส่วนแก้/บันทึก
     if "excel_results" in st.session_state:
         results = st.session_state["excel_results"]
