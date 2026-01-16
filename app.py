@@ -1585,7 +1585,14 @@ if mode == "📝 พนักงานจดมิเตอร์":
         with st.spinner("🤖 AI กำลังอ่านค่า..."):
             st.session_state.emp_ai_value = float(ocr_process(img_bytes, config, debug=False))
 
+    # --- FIX: กันค่า AI ติดลบไม่ให้ st.number_input ล้ม ---
     ai_val = float(st.session_state.emp_ai_value or 0.0)
+
+    min_allowed = 0.0
+    prefill_val = ai_val if ai_val >= min_allowed else min_allowed
+    if ai_val < min_allowed:
+        st.warning("⚠️ AI อ่านค่าได้ติดลบ (น่าจะอ่านผิด) — ระบบจะให้แก้เองก่อนบันทึก")
+
     st.write(f"🤖 **AI เสนอค่า:** {fmt % ai_val}")
 
     choice = st.radio(
@@ -1598,14 +1605,17 @@ if mode == "📝 พนักงานจดมิเตอร์":
     if choice == "✍️ แก้เอง":
         final_val = st.number_input(
             "พิมพ์ค่าที่ถูกต้อง",
-            value=float(ai_val),
-            min_value=0.0,
+            value=float(prefill_val),
+            min_value=min_allowed,
             step=step,
             format=fmt,
             key="emp_override_val"
         )
         status = "CONFIRMED_MANUAL"
     else:
+        if ai_val < min_allowed:
+            st.error("❌ AI อ่านค่าได้ติดลบ จึงไม่อนุญาตให้บันทึกแบบ 'ใช้ค่า AI' — กรุณาเลือก '✍️ แก้เอง'")
+            st.stop()
         final_val = float(ai_val)
         status = "CONFIRMED_AI"
 
