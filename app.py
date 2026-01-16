@@ -1123,7 +1123,7 @@ def _looks_like_number(s: str) -> bool:
     if not s:
         return False
     # กันค่าเวลาหรือวันที่ที่มี ':' หรือ '-'
-    if ":" in s or "-" in s or "/" in s:
+    if ":" in s or "/" in s:
         return False
     # แก้ OCR error ที่เจอ O/○ เป็น 0 แบบเบา ๆ
     s2 = s.replace("O", "0").replace("o", "0")
@@ -1786,7 +1786,7 @@ elif mode == "🖥️ Dashboard Screenshot (OCR)":
             with cols[i]:
                 st.caption(label)
                 st.write(v)
-                default_pid = _DASH_DEFAULT_POINT_MAP.get((n, k), "") if n else ""
+                default_pid = (_DASH_DEFAULT_POINT_MAP.get((n, k), "") if n else "").strip().upper()
 
                 options = ["(ไม่บันทึก)"] + all_pids
                 default_idx = 0
