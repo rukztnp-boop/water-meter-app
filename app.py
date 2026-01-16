@@ -1350,11 +1350,261 @@ def infer_meter_type(config: dict) -> str:
         return "Water"
     return "Electric"
 # =========================================================
+# --- 🖥️ DASHBOARD SCREENSHOT OCR (FLOW 1-3) ---
+# =========================================================
+
+# ปรับ point_id default ให้ตรงกับ PointsMaster ของคุณได้เลย
+_DASH_DEFAULT_POINT_MAP = {
+    # FLOW 1
+    (1, "pressure_bar"): "C_Bar_FLOW_1",
+    (1, "flowrate_m3h"): "D_m_h_FLOW_1",
+    (1, "flow_total_m3"): "J_FLOW_1",
+    # FLOW 2
+    (2, "pressure_bar"): "E_Bar_FLOW_2",
+    (2, "flowrate_m3h"): "F_m_h_FLOW_2",
+    (2, "flow_total_m3"): "K_FLOW_2",
+    # FLOW 3
+    (3, "pressure_bar"): "G_Bar_FLOW_3",
+    (3, "flowrate_m3h"): "H_m_h_FLOW_3",
+    (3, "flow_total_m3"): "L_FLOW_3",
+}
+
+_NUM_RE = re.compile(r"^[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?$|^[-+]?\d+(?:\.\d+)?$")
+
+def _looks_like_number(s: str) -> bool:
+    if s is None:
+        return False
+    s = str(s).strip()
+    if not s:
+        return False
+    if ":" in s or "/" in s:
+        return False
+    s2 = s.replace("O", "0").replace("o", "0")
+    return bool(_NUM_RE.match(s2))
+
+def _parse_number(s: str):
+    if s is None:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    s = s.replace("O", "0").replace("o", "0").replace(",", "")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def _cv2_decode_bytes(image_bytes: bytes):
+    arr = np.frombuffer(image_bytes, np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+def _cv2_encode_jpg(img, quality: int = 92) -> bytes:
+    ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    return buf.tobytes() if ok else b""
+
+def _upscale_for_ocr(img, max_side: int = 2200):
+    if img is None:
+        return img
+    h, w = img.shape[:2]
+    scale = 2.0
+    if max(h, w) * scale > max_side:
+        scale = max_side / float(max(h, w))
+    if scale <= 1.05:
+        return img
+    return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+
+def _vision_tokens(image_bytes: bytes, lang_hints=("en",)):
+    image = vision.Image(content=image_bytes)
+    ctx = vision.ImageContext(language_hints=list(lang_hints))
+    resp = VISION_CLIENT.text_detection(image=image, image_context=ctx)
+    if resp.error.message:
+        raise RuntimeError(resp.error.message)
+
+    ann = resp.text_annotations
+    tokens = []
+    for a in ann[1:]:
+        txt = (a.description or "").strip()
+        if not txt:
+            continue
+        vs = a.bounding_poly.vertices
+        xs = [v.x for v in vs]
+        ys = [v.y for v in vs]
+        x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+        tokens.append({
+            "text": txt,
+            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+            "cx": (x1 + x2) / 2.0,
+            "cy": (y1 + y2) / 2.0,
+            "h": max(1.0, (y2 - y1)),
+        })
+    full_text = ann[0].description if ann else ""
+    return tokens, full_text
+
+def _norm_token_text(s: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(s).upper())
+
+def _suggest_dashboard_crop(tokens, w: int, h: int):
+    # default crop: ตัด sidebar + top bar
+    def_roi = (int(w * 0.18), int(h * 0.18), int(w * 0.99), int(h * 0.92))
+    if not tokens:
+        return def_roi
+
+    anchors = []
+    for t in tokens:
+        tn = _norm_token_text(t.get("text", ""))
+        if any(k in tn for k in ["FLOW", "PRESSURE", "FLOWRATE", "FLOWTOTAL", "TOTALM3", "M3H", "BAR"]):
+            anchors.append(t)
+
+    if not anchors:
+        return def_roi
+
+    x1 = min(t["x1"] for t in anchors)
+    y1 = min(t["y1"] for t in anchors)
+    x2 = max(t["x2"] for t in anchors)
+    y2 = max(t["y2"] for t in anchors)
+
+    pad_x_left  = int(0.05 * w)
+    pad_x_right = int(0.35 * w)
+    pad_y_top   = int(0.10 * h)
+    pad_y_bot   = int(0.45 * h)
+
+    rx1 = max(0, x1 - pad_x_left)
+    ry1 = max(0, y1 - pad_y_top)
+    rx2 = min(w, x2 + pad_x_right)
+    ry2 = min(h, y2 + pad_y_bot)
+
+    if (rx2 - rx1) < int(0.35 * w) or (ry2 - ry1) < int(0.20 * h):
+        return def_roi
+    return (rx1, ry1, rx2, ry2)
+
+def _join_adjacent_numeric_tokens(num_tokens, gap_px: int = 14):
+    if not num_tokens:
+        return []
+    num_tokens = sorted(num_tokens, key=lambda t: t["x1"])
+    merged = []
+    cur = dict(num_tokens[0])
+    for t in num_tokens[1:]:
+        gap = t["x1"] - cur["x2"]
+        if gap >= 0 and gap <= gap_px:
+            cur["text"] = f"{cur['text']}{t['text']}"
+            cur["x2"] = max(cur["x2"], t["x2"])
+            cur["y1"] = min(cur.get("y1", 0), t.get("y1", 0))
+            cur["y2"] = max(cur.get("y2", 0), t.get("y2", 0))
+        else:
+            merged.append(cur)
+            cur = dict(t)
+    merged.append(cur)
+
+    for m in merged:
+        m["cx"] = (m["x1"] + m["x2"]) / 2.0
+        m["cy"] = (m["y1"] + m["y2"]) / 2.0
+        m["h"] = max(1.0, (m["y2"] - m["y1"]))
+    return merged
+
+def extract_dashboard_flow_values(image_bytes: bytes, debug: bool = False):
+    """อ่านค่า FLOW 1-3 จากภาพ Dashboard
+    คืนค่า list[dict]: flow, pressure_bar, flowrate_m3h, flow_total_m3, status
+    """
+    img = _cv2_decode_bytes(image_bytes)
+    if img is None:
+        rows = [{"flow": f"FLOW {i}", "pressure_bar": None, "flowrate_m3h": None, "flow_total_m3": None, "status": "BAD_IMAGE"} for i in (1,2,3)]
+        return (rows, {"reason": "cv2_decode_failed"}) if debug else rows
+
+    h, w = img.shape[:2]
+
+    # pass1: full OCR เพื่อหา ROI
+    try:
+        tokens1, full_text1 = _vision_tokens(image_bytes, lang_hints=("en",))
+    except Exception as e:
+        rows = [{"flow": f"FLOW {i}", "pressure_bar": None, "flowrate_m3h": None, "flow_total_m3": None, "status": "VISION_ERROR"} for i in (1,2,3)]
+        return (rows, {"error": str(e)}) if debug else rows
+
+    x1, y1, x2, y2 = _suggest_dashboard_crop(tokens1, w, h)
+    crop = img[y1:y2, x1:x2].copy()
+    crop = _upscale_for_ocr(crop)
+    crop_bytes = _cv2_encode_jpg(crop, quality=92)
+
+    # pass2: OCR บน crop
+    try:
+        tokens, full_text = _vision_tokens(crop_bytes, lang_hints=("en",))
+    except Exception:
+        tokens, full_text = tokens1, full_text1
+
+    flow_rows = {}
+    for t in tokens:
+        tn = _norm_token_text(t.get("text", ""))
+        m = re.match(r"^FLOW([123])$", tn)
+        if m:
+            n = int(m.group(1))
+            flow_rows[n] = {"y": t["cy"], "h": t["h"], "x_right": t["x2"]}
+
+    # FLOW + digit แยกกัน
+    if len(flow_rows) < 3:
+        flow_tokens = [t for t in tokens if _norm_token_text(t.get("text","")) == "FLOW"]
+        digit_tokens = [t for t in tokens if str(t.get("text","")).strip() in ("1","2","3")]
+        for d in digit_tokens:
+            n = int(str(d["text"]))
+            if n in flow_rows:
+                continue
+            best = None
+            best_score = 1e9
+            for f in flow_tokens:
+                dx = abs(d["cx"] - f["cx"])
+                dy = abs(d["cy"] - f["cy"])
+                score = dx + dy * 1.2
+                if score < best_score and dx < 120 and dy < 120:
+                    best, best_score = f, score
+            if best:
+                y = (best["cy"] + d["cy"]) / 2.0
+                hh = max(best["h"], d["h"]) * 1.8
+                xr = max(best["x2"], d["x2"])
+                flow_rows[n] = {"y": y, "h": hh, "x_right": xr}
+
+    out_rows = []
+    for n in (1,2,3):
+        row = {"flow": f"FLOW {n}", "pressure_bar": None, "flowrate_m3h": None, "flow_total_m3": None, "status": "NOT_FOUND"}
+        meta = flow_rows.get(n)
+        if not meta:
+            out_rows.append(row)
+            continue
+
+        band = max(22.0, meta["h"] * 1.2)
+        x_min = meta["x_right"] + 8
+
+        row_tokens = [t for t in tokens if abs(t["cy"] - meta["y"]) <= band and t["x1"] >= x_min]
+        num_tokens = [t for t in row_tokens if _looks_like_number(t.get("text",""))]
+        num_tokens = _join_adjacent_numeric_tokens(num_tokens, gap_px=14)
+        num_tokens = [t for t in num_tokens if _looks_like_number(t.get("text",""))]
+        num_tokens = sorted(num_tokens, key=lambda t: t["cx"])
+
+        if len(num_tokens) >= 3:
+            p   = _parse_number(num_tokens[0]["text"])
+            fr  = _parse_number(num_tokens[1]["text"])
+            tot = _parse_number(num_tokens[2]["text"])
+            row.update({
+                "pressure_bar": p,
+                "flowrate_m3h": fr,
+                "flow_total_m3": tot,
+                "status": "OK" if (p is not None and fr is not None and tot is not None) else "PARTIAL",
+            })
+
+        out_rows.append(row)
+
+    dbg = {
+        "roi": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+        "flow_rows": flow_rows,
+        "full_text": (full_text or "")[:2000],
+        "full_text_pass1": (full_text1 or "")[:2000],
+        "tokens_count": len(tokens),
+    }
+    return (out_rows, dbg) if debug else out_rows
+
+# =========================================================
 # --- UI LOGIC ---
 # =========================================================
 mode = st.sidebar.radio(
     "🔧 เลือกโหมดการทำงาน",
-    ["📝 พนักงานจดมิเตอร์", "📥 อัปโหลด Excel (SCADA Export)", "👮‍♂️ Admin Approval"]
+    ["📝 พนักงานจดมิเตอร์", "📥 อัปโหลด Excel (SCADA Export)", "🖥️ Dashboard Screenshot (OCR)", "👮‍♂️ Admin Approval"]
 )
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
@@ -1538,7 +1788,14 @@ if mode == "📝 พนักงานจดมิเตอร์":
         with st.spinner("🤖 AI กำลังอ่านค่า..."):
             st.session_state.emp_ai_value = float(ocr_process(img_bytes, config, debug=False))
 
+    # --- FIX: กันค่า AI ติดลบไม่ให้ st.number_input ล้ม ---
     ai_val = float(st.session_state.emp_ai_value or 0.0)
+
+    min_allowed = 0.0
+    prefill_val = ai_val if ai_val >= min_allowed else min_allowed
+    if ai_val < min_allowed:
+        st.warning("⚠️ AI อ่านค่าได้ติดลบ (น่าจะอ่านผิด) — ระบบจะให้แก้เองก่อนบันทึก")
+
     st.write(f"🤖 **AI เสนอค่า:** {fmt % ai_val}")
 
     choice = st.radio(
@@ -1551,14 +1808,17 @@ if mode == "📝 พนักงานจดมิเตอร์":
     if choice == "✍️ แก้เอง":
         final_val = st.number_input(
             "พิมพ์ค่าที่ถูกต้อง",
-            value=float(ai_val),
-            min_value=0.0,
+            value=float(prefill_val),
+            min_value=min_allowed,
             step=step,
             format=fmt,
             key="emp_override_val"
         )
         status = "CONFIRMED_MANUAL"
     else:
+        if ai_val < min_allowed:
+            st.error("❌ AI อ่านค่าได้ติดลบ จึงไม่อนุญาตให้บันทึกแบบ 'ใช้ค่า AI' — กรุณาเลือก '✍️ แก้เอง'")
+            st.stop()
         final_val = float(ai_val)
         status = "CONFIRMED_AI"
 
@@ -1593,6 +1853,154 @@ if mode == "📝 พนักงานจดมิเตอร์":
         st.session_state.emp_ai_value = None
         st.session_state.emp_img_hash = ""
         st.rerun()
+
+elif mode == "🖥️ Dashboard Screenshot (OCR)":
+    st.title("🖥️ Dashboard Screenshot → WaterReport")
+    st.caption("อัปโหลดรูปหน้าจอ Dashboard แล้วระบบจะอ่านค่า Pressure/Flowrate/Flow_Total ของ FLOW 1-3")
+
+    c_insp, c_date = st.columns(2)
+    with c_insp:
+        inspector = st.text_input("ชื่อผู้บันทึก", "Admin", key="dash_inspector")
+    with c_date:
+        report_date = st.date_input("📅 วันที่ของรายงาน (ที่จะไปกรอกใน WaterReport)", value=get_thai_time().date(), key="dash_date")
+
+    up = st.file_uploader("อัปโหลดรูปหน้าจอ Dashboard (JPG/PNG)", type=["jpg", "jpeg", "png"], key="dash_img")
+    if not up:
+        st.info("อัปโหลดรูปก่อน แล้วกดปุ่มอ่านค่า")
+        st.stop()
+
+    img_bytes = up.getvalue()
+    st.image(img_bytes, caption=f"ภาพที่อัปโหลด: {getattr(up, 'name', 'dashboard')}", use_container_width=True)
+
+    # กัน OCR รันซ้ำตอน rerun
+    if "dash_img_hash" not in st.session_state:
+        st.session_state.dash_img_hash = ""
+    if "dash_rows" not in st.session_state:
+        st.session_state.dash_rows = None
+    if "dash_dbg" not in st.session_state:
+        st.session_state.dash_dbg = None
+
+    img_hash = hashlib.md5(img_bytes).hexdigest()
+    if img_hash != st.session_state.dash_img_hash:
+        st.session_state.dash_img_hash = img_hash
+        st.session_state.dash_rows = None
+        st.session_state.dash_dbg = None
+
+    if st.button("🔎 อ่านค่าจากรูป (OCR)"):
+        with st.spinner("กำลังอ่านค่าจากรูป..."):
+            rows, dbg = extract_dashboard_flow_values(img_bytes, debug=True)
+        st.session_state.dash_rows = rows
+        st.session_state.dash_dbg = dbg
+
+    rows = st.session_state.dash_rows
+    if not rows:
+        st.stop()
+
+    st.subheader("ผลการอ่านค่าจากรูป")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    pm = load_points_master()
+    all_pids = sorted({str(r.get("point_id", "")).strip().upper() for r in pm if r.get("point_id")})
+
+    st.subheader("แปลงค่าที่อ่านได้ → point_id")
+    picked = []
+
+    for r in rows:
+        flow_label = r.get("flow", "")
+        try:
+            n = int(str(flow_label).strip().split()[-1])
+        except Exception:
+            n = None
+
+        st.markdown(f"#### {flow_label}")
+        cols = st.columns(3)
+
+        metrics = [
+            ("pressure_bar", "Pressure (bar)"),
+            ("flowrate_m3h", "Flowrate (m3/h)"),
+            ("flow_total_m3", "Flow_Total (m3)"),
+        ]
+
+        for i, (k, label) in enumerate(metrics):
+            v = r.get(k)
+            with cols[i]:
+                st.caption(label)
+                st.write(v)
+
+                default_pid = (_DASH_DEFAULT_POINT_MAP.get((n, k), "") if n else "")
+                default_pid = str(default_pid).strip().upper()
+
+                options = ["(ไม่บันทึก)"] + all_pids
+                default_idx = options.index(default_pid) if default_pid in options else 0
+
+                sel = st.selectbox(
+                    "point_id",
+                    options=options,
+                    index=default_idx,
+                    key=f"dash_pid_{flow_label}_{k}"
+                )
+
+                if sel != "(ไม่บันทึก)" and v is not None:
+                    picked.append({"point_id": sel, "value": v})
+
+    with st.expander("Debug OCR"):
+        st.json(st.session_state.dash_dbg or {})
+
+    st.subheader("บันทึกลง WaterReport")
+    if st.button("✅ บันทึกลง WaterReport (อัตโนมัติ)"):
+        inspector_name = inspector or "Admin"
+
+        report_items = []
+        db_rows = []
+        fail_list = []
+
+        for it in picked:
+            pid_u = str(it.get("point_id", "")).strip().upper()
+            val = it.get("value", None)
+            if not pid_u or val is None or str(val).strip() == "":
+                continue
+
+            cfg = get_meter_config(pid_u)
+            if not cfg:
+                fail_list.append((pid_u, "NO_CONFIG_IN_POINTSMaster"))
+                continue
+
+            report_col = str(cfg.get("report_col", "") or "").strip()
+            if (not report_col) or (report_col in ("-", "—", "–")):
+                fail_list.append((pid_u, "NO_REPORT_COL_IN_POINTSMaster"))
+                continue
+
+            try:
+                write_val = float(str(val).replace(",", "").strip())
+            except Exception:
+                write_val = str(val).strip()
+
+            report_items.append({"point_id": pid_u, "value": write_val, "report_col": report_col})
+
+            try:
+                meter_type = infer_meter_type(cfg)
+            except Exception:
+                meter_type = "Electric"
+
+            current_time = get_thai_time().time()
+            record_ts = datetime.combine(report_date, current_time).strftime("%Y-%m-%d %H:%M:%S")
+            db_rows.append([record_ts, meter_type, pid_u, inspector_name, write_val, write_val, "AUTO_DASHBOARD_OCR", "-"])
+
+        if not report_items:
+            st.warning("ไม่มีข้อมูลให้บันทึก")
+            st.stop()
+
+        ok_db, db_msg = append_rows_dailyreadings_batch(db_rows)
+        if not ok_db:
+            st.warning(f"⚠️ Log ลง DailyReadings ไม่สำเร็จ: {db_msg}")
+
+        with st.spinner("กำลังบันทึกลง WaterReport..."):
+            ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True)
+
+        st.success(f"✅ บันทึกสำเร็จ: {len(ok_pids)} จุด")
+        if fail_list or fail_report:
+            st.error(f"❌ ไม่สำเร็จ: {len(fail_list) + len(fail_report)} จุด")
+            st.write([[pid, reason] for pid, reason in (fail_list + list(fail_report))])
 
 elif mode == "👮‍♂️ Admin Approval":
     st.title("👮‍♂️ Admin Dashboard")
