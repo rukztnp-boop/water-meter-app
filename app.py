@@ -692,77 +692,178 @@ def _resolve_sheet_name_for_export(wb, desired_sheet: str, point_id: str) -> str
         return desired_sheet
 
 
-def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict, file_key_map: dict | None = None):
+def extract_scada_values_from_exports(
+    mapping_rows,
+    uploaded_exports: dict,
+    file_key_map: dict | None = None,
+    target_date=None,
+):
     """
     mapping_rows: list[dict] จาก load_scada_excel_mapping
     uploaded_exports: dict filename->bytes ของไฟล์ Excel ที่อัปโหลด
     file_key_map: (optional) dict ของ key_norm -> filename เพื่อบังคับจับคู่ไฟล์ (กันกรณีลูกค้าเปลี่ยนชื่อไฟล์)
+    target_date: (optional) datetime.date ที่ผู้ใช้เลือกในหน้า SCADA Export
+                 - ถ้าไฟล์มีคอลัมน์ Date (เช่น AF_Report_Gen...) จะใช้กรองให้ตรงวันก่อนเลือกเวลา
 
     คืนค่า:
       - results: list[dict] สำหรับแสดงในตาราง
       - missing: list[dict] รายการที่ดึงไม่สำเร็จ
     """
-
     file_key_map = file_key_map or {}
 
-    # โหลด workbook ทีละไฟล์ (cache ใน dict)
+    # ---- lazy workbook cache (กันโหลดไฟล์ใหญ่โดยไม่จำเป็น) ----
     wb_cache: dict[str, openpyxl.Workbook | None] = {}
     wb_is_ufgen: dict[str, bool] = {}
 
-    for fname, b in uploaded_exports.items():
+    def get_wb(fname: str):
+        if fname in wb_cache:
+            return wb_cache[fname]
+
+        b = uploaded_exports.get(fname)
+        if b is None:
+            wb_cache[fname] = None
+            wb_is_ufgen[fname] = False
+            return None
+
+        # ไฟล์ใหญ่มาก (เช่น AF_Report) ให้ใช้ read_only เพื่อลด RAM
+        read_only = len(b) >= 20_000_000
         try:
-            try:
-                wb = openpyxl.load_workbook(io.BytesIO(b), data_only=True, read_only=True, keep_links=False)
-            except TypeError:
-                # openpyxl รุ่นเก่าอาจไม่มี keep_links
-                wb = openpyxl.load_workbook(io.BytesIO(b), data_only=True, read_only=True)
+            wb = openpyxl.load_workbook(io.BytesIO(b), data_only=True, read_only=read_only)
             wb_cache[fname] = wb
-            wb_is_ufgen[fname] = _is_uf_gen_report_workbook(wb)
+            try:
+                wb_is_ufgen[fname] = _is_uf_gen_report_workbook(wb)
+            except Exception:
+                wb_is_ufgen[fname] = False
+            return wb
         except Exception:
             wb_cache[fname] = None
             wb_is_ufgen[fname] = False
+            return None
 
     # helper: หาไฟล์ที่ตรงกับ file_key
     def pick_file_for_key(file_key: str):
         if not uploaded_exports:
             return None
 
+        # normalize key (ตัดวันที่ด้านหน้าออกก่อน เพื่อตรงกับชื่อไฟล์ที่อัปโหลดคนละวัน)
         key_norm = _strip_date_prefix(file_key)
         key_norm2 = _norm_filekey(key_norm)
+        key_norm_full = _norm_filekey(file_key)
+
+        fnames = list(uploaded_exports.keys())
+
+        def _strip(fname: str) -> str:
+            return _strip_date_prefix(fname)
+
+        def _norm(fname: str) -> str:
+            # normalize จากชื่อที่ตัดวันที่แล้ว
+            return _norm_filekey(_strip(fname))
 
         # 0) ถ้าผู้ใช้บังคับ map ไว้ ใช้อันนั้นก่อน
-        forced = file_key_map.get(key_norm) or file_key_map.get(key_norm2)
+        forced = (
+            file_key_map.get(key_norm)
+            or file_key_map.get(key_norm2)
+            or file_key_map.get(key_norm_full)
+        )
         if forced and forced in uploaded_exports:
             return forced
 
-        # 1) match จากชื่อไฟล์ (contains แบบ normalize)
-        for fname in uploaded_exports.keys():
-            if key_norm and key_norm in _strip_date_prefix(fname):
-                return fname
-            if key_norm2 and key_norm2 in _norm_filekey(fname):
-                return fname
+        # 1) match แบบ "ตรงชื่อเป๊ะ" ก่อน (แก้เคส Daily_Report ชนกับ SMMT_Daily_Report)
+        if key_norm:
+            exact = [f for f in fnames if _strip(f) == key_norm]
+            if exact:
+                # ถ้า key ไม่ใช่ SMMT ให้เลี่ยงไฟล์ที่มี smmt
+                if "smmt" not in key_norm2:
+                    non_smmt = [f for f in exact if "smmt" not in _norm(f)]
+                    if non_smmt:
+                        return non_smmt[0]
+                return exact[0]
 
-        # 2) heuristic: UF_System แต่ลูกค้าเปลี่ยนชื่อไฟล์ -> หาไฟล์ที่เป็น UF gen report
-        if "uf" in key_norm2 or "ufsystem" in key_norm2 or "uf_system" in key_norm2:
-            for fname in uploaded_exports.keys():
-                if wb_is_ufgen.get(fname, False):
+        if key_norm2:
+            exact2 = [f for f in fnames if _norm(f) == key_norm2]
+            if exact2:
+                if "smmt" not in key_norm2:
+                    non_smmt = [f for f in exact2 if "smmt" not in _norm(f)]
+                    if non_smmt:
+                        return non_smmt[0]
+                return exact2[0]
+
+        # 2) UF_System → (สำคัญ) อย่าเปิดไฟล์ทุกตัวเพื่อเดา เพราะไฟล์ใหญ่มากจะช้า
+        if "uf_system" in key_norm2 or "ufsystem" in key_norm2:
+            for fname in fnames:
+                fn = _norm_filekey(fname)
+                if "uf_system" in fn or "ufsystem" in fn:
+                    return fname
+            # fallback: ถ้ามี AF_Report/Report_Gen ให้ใช้แทน UF_System
+            for fname in fnames:
+                fn = _norm_filekey(fname)
+                if "af_report" in fn or "report_gen" in fn or "reportgen" in fn:
                     return fname
 
-        # 3) fallback: ถ้ามีไฟล์เดียว ใช้อันนั้น
-        if len(uploaded_exports) == 1:
-            return list(uploaded_exports.keys())[0]
+        # 3) match แบบ contains + scoring (กรณีชื่อไม่ตรงเป๊ะ)
+        def _score(fname: str) -> int:
+            s = _strip(fname)
+            n = _norm(fname)
+            sc = 0
+            if key_norm and key_norm in s:
+                sc += 6
+                if s == key_norm:
+                    sc += 10
+                if s.endswith(key_norm):
+                    sc += 3
+            if key_norm2 and key_norm2 in n:
+                sc += 6
+                if n == key_norm2:
+                    sc += 10
+                if n.endswith(key_norm2):
+                    sc += 3
+
+            # ลงโทษเคสชน SMMT
+            if ("smmt" in n) != ("smmt" in key_norm2):
+                sc -= 6
+
+            # prefer ใกล้เคียงความยาว (กัน matching กว้างเกิน)
+            sc -= abs(len(n) - len(key_norm2))
+            return sc
+
+        cand = []
+        for fname in fnames:
+            s = _strip(fname)
+            n = _norm(fname)
+            if (key_norm and key_norm in s) or (key_norm2 and key_norm2 in n) or (key_norm_full and key_norm_full in _norm_filekey(fname)):
+                cand.append(fname)
+
+        if cand:
+            cand.sort(key=_score, reverse=True)
+            return cand[0]
+
+        # 4) fallback: ถ้ามีไฟล์เดียว ให้คืนไฟล์นั้น
+        if len(fnames) == 1:
+            return fnames[0]
 
         return None
 
-    # ===== Scan time rows ต่อ sheet แค่ครั้งเดียว (กันไฟล์ใหญ่/ช้า) =====
-    sheet_ctx_cache = {}  # (fname, sheet) -> ctx
+    # ===== Scan time rows ต่อ sheet แค่ครั้งเดียว =====
+    # key ต้องรวม target_date เพราะไฟล์ AF_Report มีหลายวัน
+    sheet_ctx_cache = {}  # (fname, sheet, target_date) -> ctx
 
-    def get_sheet_ctx(fname: str, wb, sheet: str):
-        key = (fname, sheet)
+    import datetime as dt
+
+    def _coerce_date(v):
+        if v is None:
+            return None
+        if isinstance(v, dt.datetime):
+            return v.date()
+        if isinstance(v, dt.date):
+            return v
+        return None
+
+    def get_sheet_ctx(fname: str, wb, sheet: str, target_date_local):
+        key = (fname, sheet, target_date_local)
         if key in sheet_ctx_cache:
             return sheet_ctx_cache[key]
 
-        if sheet not in (wb.sheetnames or []):
+        if not wb or sheet not in (wb.sheetnames or []):
             ctx = {"status": "NO_SHEET"}
             sheet_ctx_cache[key] = ctx
             return ctx
@@ -776,24 +877,96 @@ def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict, file
 
         hdr_row, time_col = hdr
 
-        # สแกนคอลัมน์เวลาแบบจำกัดแถว (กันไฟล์ใหญ่ max_row หลอก)
-        time_rows = []
+        # หา Date header ที่อยู่แถวเดียวกับ Time (ถ้ามี)
+        date_col = None
+        try:
+            if time_col > 1:
+                left = ws.cell(hdr_row, time_col - 1).value
+                if isinstance(left, str) and left.strip().lower() == "date":
+                    date_col = time_col - 1
+            if not date_col:
+                # ลองหาในหัวแถวเดียวกัน
+                max_c = min(ws.max_column or 0, 40)
+                for c in range(1, max_c + 1):
+                    v = ws.cell(hdr_row, c).value
+                    if isinstance(v, str) and v.strip().lower() == "date":
+                        date_col = c
+                        break
+        except Exception:
+            date_col = None
+
+        time_rows: list[tuple[int, int]] = []  # (row_idx, minutes)
         blank_streak = 0
-        max_scan_rows = 5000
-        max_r = min(ws.max_row or 0, hdr_row + max_scan_rows)
 
-        for r in range(hdr_row + 1, max_r + 1):
-            v = ws.cell(r, time_col).value
-            hhmm = _normalize_scada_time(v)
-            mm = _hhmm_to_minutes(hhmm) if hhmm else None
+        # ถ้ามี Date column และผู้ใช้เลือกวัน → สแกนจนเจอวันนั้น และหยุดเมื่อเลยวัน (ลดเวลา)
+        if date_col and target_date_local:
+            started = False
+            max_r = ws.max_row or 0
+            min_c = min(date_col, time_col)
+            max_c = max(date_col, time_col)
 
-            if mm is not None:
-                time_rows.append((r, mm))
-                blank_streak = 0
-            else:
-                blank_streak += 1
-                if blank_streak >= 80 and time_rows:
-                    break
+            for r, rowvals in enumerate(
+                ws.iter_rows(
+                    min_row=hdr_row + 1,
+                    max_row=max_r,
+                    min_col=min_c,
+                    max_col=max_c,
+                    values_only=True,
+                ),
+                start=hdr_row + 1,
+            ):
+                # map ค่าออกมาตามคอลัมน์จริง
+                # rowvals จัดตาม min_c..max_c
+                def _val_at_col(col):
+                    return rowvals[col - min_c]
+
+                dval = _coerce_date(_val_at_col(date_col))
+                if dval is None:
+                    continue
+
+                if dval < target_date_local:
+                    continue
+
+                if dval > target_date_local:
+                    if started and time_rows:
+                        break
+                    continue
+
+                started = True
+                tval = _val_at_col(time_col)
+                hhmm = _normalize_scada_time(tval)
+                mm = _hhmm_to_minutes(hhmm) if hhmm else None
+                if mm is not None:
+                    time_rows.append((r, mm))
+                    blank_streak = 0
+                else:
+                    blank_streak += 1
+                    if blank_streak >= 200 and time_rows:
+                        break
+        else:
+            # ไฟล์ทั่วไป (Daily/SMMT): จำกัด scan 5000 แถวกัน max_row หลอก
+            max_scan_rows = 5000
+            max_r = min(ws.max_row or 0, hdr_row + max_scan_rows)
+
+            for r, (tval,) in enumerate(
+                ws.iter_rows(
+                    min_row=hdr_row + 1,
+                    max_row=max_r,
+                    min_col=time_col,
+                    max_col=time_col,
+                    values_only=True,
+                ),
+                start=hdr_row + 1,
+            ):
+                hhmm = _normalize_scada_time(tval)
+                mm = _hhmm_to_minutes(hhmm) if hhmm else None
+                if mm is not None:
+                    time_rows.append((r, mm))
+                    blank_streak = 0
+                else:
+                    blank_streak += 1
+                    if blank_streak >= 80 and time_rows:
+                        break
 
         if not time_rows:
             ctx = {"status": "NO_DATA_ROW"}
@@ -804,13 +977,16 @@ def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict, file
             "status": "OK",
             "ws": ws,
             "hdr_row": hdr_row,
-            "time_rows": time_rows,  # list[(row, minutes)]
+            "time_col": time_col,
+            "date_col": date_col,
+            "time_rows": time_rows,
             "target_row_cache": {},  # hhmm -> row
         }
         sheet_ctx_cache[key] = ctx
         return ctx
 
     def pick_target_row(ctx, target_time_hhmm: str | None):
+        # ถ้าไม่กำหนดเวลา → ใช้แถวสุดท้ายของช่วงที่สแกนได้
         if not target_time_hhmm:
             return ctx["time_rows"][-1][0]
 
@@ -826,8 +1002,12 @@ def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict, file
         ctx["target_row_cache"][target_time_hhmm] = row
         return row
 
-    results = []
-    missing = []
+    # ---- สำคัญ: ห้าม ws.cell() กับ read_only workbook เพราะช้ามาก (O(n) ทุกครั้ง) ----
+    # จะอ่าน "ทั้งแถว" ด้วย iter_rows แค่ 1 ครั้ง แล้วหยิบค่าคอลัมน์ที่ต้องการ
+    row_cache: dict[tuple[str, str, int], tuple] = {}
+
+    results: list[dict] = []
+    missing: list[dict] = []
 
     for row in mapping_rows:
         point_id = row["point_id"]
@@ -837,63 +1017,127 @@ def extract_scada_values_from_exports(mapping_rows, uploaded_exports: dict, file
         t_hhmm = _normalize_scada_time(row.get("time"))
 
         fname = pick_file_for_key(file_key)
-        if not fname or not wb_cache.get(fname):
+        if not fname:
             missing.append({**row, "reason": "NO_MATCH_FILE"})
-            results.append({"point_id": point_id, "value": None, "file": file_key, "sheet": desired_sheet, "time": t_hhmm, "col": col, "status": "NO_FILE"})
+            results.append({
+                "point_id": point_id,
+                "value": None,
+                "file": file_key,
+                "matched_file": None,
+                "sheet": desired_sheet,
+                "time": t_hhmm,
+                "col": col,
+                "status": "NO_FILE",
+            })
             continue
 
-        wb = wb_cache[fname]
-        sheet = _resolve_sheet_name_for_export(wb, desired_sheet, point_id)
+        wb = get_wb(fname)
+        if not wb:
+            missing.append({**row, "reason": "OPEN_FAIL"})
+            results.append({
+                "point_id": point_id,
+                "value": None,
+                "file": file_key,
+                "matched_file": fname,
+                "sheet": desired_sheet,
+                "time": t_hhmm,
+                "col": col,
+                "status": "OPEN_FAIL",
+            })
+            continue
 
-        ctx = get_sheet_ctx(fname, wb, sheet)
+        sheet = _resolve_sheet_name_for_export(wb, desired_sheet, point_id)
+        ctx = get_sheet_ctx(fname, wb, sheet, target_date)
+
         if ctx.get("status") != "OK":
             stt = ctx.get("status")
             missing.append({**row, "reason": stt})
-            results.append({"point_id": point_id, "value": None, "file": file_key, "sheet": sheet, "time": t_hhmm, "col": col, "status": stt})
+            results.append({
+                "point_id": point_id,
+                "value": None,
+                "file": file_key,
+                "matched_file": fname,
+                "sheet": sheet,
+                "time": t_hhmm,
+                "col": col,
+                "status": stt,
+            })
             continue
 
         # เลือกแถวที่ใกล้เวลาเป้าหมายที่สุด
         target_row = pick_target_row(ctx, t_hhmm)
 
-        # คอลัมน์ค่า
+        # แปลงคอลัมน์ตัวอักษร -> index
         try:
             col_idx = column_index_from_string(str(col).strip().upper())
         except Exception:
             missing.append({**row, "reason": "BAD_COLUMN"})
-            results.append({"point_id": point_id, "value": None, "file": file_key, "sheet": sheet, "time": t_hhmm, "col": col, "status": "BAD_COLUMN"})
+            results.append({
+                "point_id": point_id,
+                "value": None,
+                "file": file_key,
+                "matched_file": fname,
+                "sheet": sheet,
+                "time": t_hhmm,
+                "col": col,
+                "status": "BAD_COLUMN",
+            })
             continue
 
-        ws = ctx["ws"]
-        hdr_row = ctx["hdr_row"]
+        # ดึงทั้งแถวครั้งเดียว (เร็วกว่า ws.cell มาก)
+        row_key = (fname, sheet, target_row)
+        rowvals = row_cache.get(row_key)
+        if rowvals is None:
+            try:
+                rowvals = next(ctx["ws"].iter_rows(min_row=target_row, max_row=target_row, values_only=True))
+                row_cache[row_key] = rowvals
+            except StopIteration:
+                rowvals = None
+            except Exception:
+                rowvals = None
 
-        # ดึงค่า + fallback ไล่ขึ้นไป
-        val = ws.cell(target_row, col_idx).value
-        if val in (None, "", " "):
-            found = None
-            for rr in range(target_row - 1, max(hdr_row + 1, target_row - 60) - 1, -1):
-                vv = ws.cell(rr, col_idx).value
-                if vv not in (None, "", " "):
-                    found = vv
-                    break
-            val = found
+        if not rowvals or col_idx > len(rowvals):
+            missing.append({**row, "reason": "OUT_OF_RANGE"})
+            results.append({
+                "point_id": point_id,
+                "value": None,
+                "file": file_key,
+                "matched_file": fname,
+                "sheet": sheet,
+                "time": t_hhmm,
+                "col": col,
+                "status": "OUT_OF_RANGE",
+            })
+            continue
 
-        stt = "OK" if val not in (None, "", " ") else "EMPTY_CELL"
-        results.append({"point_id": point_id, "value": val, "file": file_key, "sheet": sheet, "time": t_hhmm, "col": col, "status": stt})
+        value = rowvals[col_idx - 1]
 
-        if stt != "OK":
-            missing.append({**row, "reason": stt})
-    # ปิด workbook เพื่อลด memory/handle ค้าง (ไฟล์ใหญ่จะหนักมาก)
-    for _wb in wb_cache.values():
+        # ทำให้เป็นเลข (ถ้าเป็น string)
         try:
-            if _wb:
-                _wb.close()
+            if isinstance(value, str):
+                vv = value.strip().replace(",", "")
+                value = float(vv) if vv != "" else None
+            elif isinstance(value, (int, float)):
+                value = float(value)
         except Exception:
             pass
 
+        stt = "OK" if value is not None else "EMPTY"
+        if stt != "OK":
+            missing.append({**row, "reason": stt})
 
+        results.append({
+            "point_id": point_id,
+            "value": value,
+            "file": file_key,
+                "matched_file": fname,
+            "sheet": sheet,
+            "time": t_hhmm,
+            "col": col,
+            "status": stt,
+        })
 
     return results, missing
-
 def normalize_number_str(s: str, decimals: int = 0) -> str:
     if not s: return ""
     s = str(s).strip().replace(",", "").replace(" ", "")
@@ -1105,316 +1349,12 @@ def infer_meter_type(config: dict) -> str:
     if ("น้ำ" in blob) or ("water" in blob) or ("ประปา" in blob):
         return "Water"
     return "Electric"
-
-
-# =========================================================
-# --- 🖥️ DASHBOARD SCREENSHOT OCR (FLOW 1-3) ---
-# =========================================================
-
-_DASH_DEFAULT_POINT_MAP = {
-    # FLOW 1
-    (1, "pressure_bar"): "C_Bar_FLOW_1",
-    (1, "flowrate_m3h"): "D_m_h_FLOW_1",
-    (1, "flow_total_m3"): "J_FLOW_1",
-    # FLOW 2
-    (2, "pressure_bar"): "E_Bar_FLOW_2",
-    (2, "flowrate_m3h"): "F_m_h_FLOW_2",
-    (2, "flow_total_m3"): "K_FLOW_2",
-    # FLOW 3
-    (3, "pressure_bar"): "G_Bar_FLOW_3",
-    (3, "flowrate_m3h"): "H_m_h_FLOW_3",
-    (3, "flow_total_m3"): "L_FLOW_3",
-}
-
-_NUM_RE = re.compile(r"^[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?$|^[-+]?\d+(?:\.\d+)?$")
-
-
-def _looks_like_number(s: str) -> bool:
-    if s is None:
-        return False
-    s = str(s).strip()
-    if not s:
-        return False
-    # กันค่าเวลาหรือวันที่ที่มี ':' หรือ '-'
-    if ":" in s or "/" in s:
-        return False
-    # แก้ OCR error ที่เจอ O/○ เป็น 0 แบบเบา ๆ
-    s2 = s.replace("O", "0").replace("o", "0")
-    return bool(_NUM_RE.match(s2))
-
-
-def _parse_number(s: str):
-    if s is None:
-        return None
-    s = str(s).strip()
-    if not s:
-        return None
-    s = s.replace("O", "0").replace("o", "0")
-    s = s.replace(",", "")
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-
-def _cv2_decode_bytes(image_bytes: bytes):
-    arr = np.frombuffer(image_bytes, np.uint8)
-    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
-
-
-def _cv2_encode_jpg(img, quality: int = 92) -> bytes:
-    ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-    return buf.tobytes() if ok else b""
-
-
-def _upscale_for_ocr(img, max_side: int = 2200):
-    if img is None:
-        return img
-    h, w = img.shape[:2]
-    if h == 0 or w == 0:
-        return img
-    scale = 2.0
-    if max(h, w) * scale > max_side:
-        scale = max_side / float(max(h, w))
-    if scale <= 1.05:
-        return img
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
-    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-
-
-def _vision_tokens(image_bytes: bytes, lang_hints=("en",)):
-    """คืน list ของ token จาก Google Vision OCR: [{text,x1,y1,x2,y2,cx,cy}]"""
-    image = vision.Image(content=image_bytes)
-    ctx = vision.ImageContext(language_hints=list(lang_hints))
-    resp = VISION_CLIENT.text_detection(image=image, image_context=ctx)
-    if resp.error.message:
-        raise RuntimeError(resp.error.message)
-
-    ann = resp.text_annotations
-    tokens = []
-    for a in ann[1:]:
-        txt = (a.description or "").strip()
-        if not txt:
-            continue
-        vs = a.bounding_poly.vertices
-        xs = [v.x for v in vs]
-        ys = [v.y for v in vs]
-        x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
-        tokens.append({
-            "text": txt,
-            "x1": x1,
-            "y1": y1,
-            "x2": x2,
-            "y2": y2,
-            "cx": (x1 + x2) / 2.0,
-            "cy": (y1 + y2) / 2.0,
-            "h": max(1.0, (y2 - y1)),
-            "w": max(1.0, (x2 - x1)),
-        })
-    full_text = ann[0].description if ann else ""
-    return tokens, full_text
-
-
-def _norm_token_text(s: str) -> str:
-    return re.sub(r"[^A-Z0-9]", "", str(s).upper())
-
-
-def _suggest_dashboard_crop(tokens, w: int, h: int):
-    """คาดเดา ROI ตาราง Flow โดยดู anchor คำว่า FLOW/Pressure/Flowrate/Flow_Total"""
-    # default crop: ตัด sidebar + top bar
-    def_roi = (int(w * 0.18), int(h * 0.18), int(w * 0.99), int(h * 0.92))
-
-    if not tokens:
-        return def_roi
-
-    anchors = []
-    for t in tokens:
-        tn = _norm_token_text(t.get("text", ""))
-        if any(k in tn for k in ["FLOW", "PRESSURE", "FLOWRATE", "FLOWTOTAL", "TOTALM3", "M3H", "BAR"]):
-            anchors.append(t)
-
-    if not anchors:
-        return def_roi
-
-    x1 = min(t["x1"] for t in anchors)
-    y1 = min(t["y1"] for t in anchors)
-    x2 = max(t["x2"] for t in anchors)
-    y2 = max(t["y2"] for t in anchors)
-
-    # ขยายกรอบให้ครอบคลุมตัวเลขด้านขวา + แถว FLOW 1-3 ด้านล่าง
-    pad_x_left = int(0.05 * w)
-    pad_x_right = int(0.35 * w)
-    pad_y_top = int(0.10 * h)
-    pad_y_bottom = int(0.45 * h)
-
-    rx1 = max(0, x1 - pad_x_left)
-    ry1 = max(0, y1 - pad_y_top)
-    rx2 = min(w, x2 + pad_x_right)
-    ry2 = min(h, y2 + pad_y_bottom)
-
-    # sanity
-    if (rx2 - rx1) < int(0.35 * w) or (ry2 - ry1) < int(0.20 * h):
-        return def_roi
-
-    return (rx1, ry1, rx2, ry2)
-
-
-def _join_adjacent_numeric_tokens(num_tokens, gap_px: int = 12):
-    """รวม token ที่อยู่ติดกันมาก ๆ (เผื่อ OCR แยกเลขเป็นชิ้น)"""
-    if not num_tokens:
-        return []
-    num_tokens = sorted(num_tokens, key=lambda t: t["x1"])
-    merged = []
-    cur = dict(num_tokens[0])
-    for t in num_tokens[1:]:
-        gap = t["x1"] - cur["x2"]
-        if gap >= 0 and gap <= gap_px:
-            # ต่อข้อความ
-            cur["text"] = f"{cur['text']}{t['text']}"
-            cur["x2"] = max(cur["x2"], t["x2"])
-            cur["y1"] = min(cur["y1"], t["y1"])
-            cur["y2"] = max(cur["y2"], t["y2"])
-        else:
-            merged.append(cur)
-            cur = dict(t)
-    merged.append(cur)
-    # recalc centers
-    for m in merged:
-        m["cx"] = (m["x1"] + m["x2"]) / 2.0
-        m["cy"] = (m["y1"] + m["y2"]) / 2.0
-    return merged
-
-
-def extract_dashboard_flow_values(image_bytes: bytes, debug: bool = False):
-    """อ่านค่า FLOW 1-3 จากรูป Dashboard
-
-    คืนค่า:
-      - rows: list[dict] [{flow, pressure_bar, flowrate_m3h, flow_total_m3, status}]
-      - debug_obj: dict (ถ้า debug=True)
-    """
-    img = _cv2_decode_bytes(image_bytes)
-    if img is None:
-        rows = [
-            {"flow": f"FLOW {i}", "pressure_bar": None, "flowrate_m3h": None, "flow_total_m3": None, "status": "BAD_IMAGE"}
-            for i in (1, 2, 3)
-        ]
-        return (rows, {"reason": "cv2_decode_failed"}) if debug else rows
-
-    h, w = img.shape[:2]
-
-    # pass1: OCR บนภาพเต็มเพื่อหา ROI
-    try:
-        tokens1, full_text1 = _vision_tokens(image_bytes, lang_hints=("en",))
-    except Exception as e:
-        rows = [
-            {"flow": f"FLOW {i}", "pressure_bar": None, "flowrate_m3h": None, "flow_total_m3": None, "status": f"VISION_ERROR"}
-            for i in (1, 2, 3)
-        ]
-        dbg = {"error": str(e)}
-        return (rows, dbg) if debug else rows
-
-    # crop
-    x1, y1, x2, y2 = _suggest_dashboard_crop(tokens1, w, h)
-    crop = img[y1:y2, x1:x2].copy()
-    crop = _upscale_for_ocr(crop)
-    crop_bytes = _cv2_encode_jpg(crop, quality=92)
-
-    # pass2: OCR บน crop เพื่ออ่านตัวเลขชัดขึ้น
-    try:
-        tokens, full_text = _vision_tokens(crop_bytes, lang_hints=("en",))
-    except Exception as e:
-        tokens, full_text = tokens1, full_text1
-
-    # หาแถว FLOW 1-3
-    flow_rows = {}  # n -> dict(y, h, x_right)
-
-    # case A: token แบบ FLOW1
-    for t in tokens:
-        tn = _norm_token_text(t.get("text", ""))
-        m = re.match(r"^FLOW([123])$", tn)
-        if m:
-            n = int(m.group(1))
-            flow_rows[n] = {
-                "y": t["cy"],
-                "h": t["h"],
-                "x_right": t["x2"],
-            }
-
-    # case B: FLOW + digit แยกกัน
-    if len(flow_rows) < 3:
-        flow_tokens = [t for t in tokens if _norm_token_text(t.get("text", "")) == "FLOW"]
-        digit_tokens = [t for t in tokens if str(t.get("text", "")).strip() in ("1", "2", "3")]
-        for d in digit_tokens:
-            n = int(str(d["text"]))
-            if n in flow_rows:
-                continue
-            # หา FLOW ที่ใกล้ที่สุด (ส่วนใหญ่จะอยู่เหนือเลข หรือใกล้ ๆ)
-            best = None
-            best_score = 1e9
-            for f in flow_tokens:
-                dx = abs(d["cx"] - f["cx"])
-                dy = abs(d["cy"] - f["cy"])
-                score = dx + dy * 1.2
-                if score < best_score and dx < 120 and dy < 120:
-                    best = f
-                    best_score = score
-            if best:
-                y = (best["cy"] + d["cy"]) / 2.0
-                hh = max(best["h"], d["h"]) * 1.8
-                xr = max(best["x2"], d["x2"])
-                flow_rows[n] = {"y": y, "h": hh, "x_right": xr}
-
-    # สร้างผลลัพธ์
-    out_rows = []
-    for n in (1, 2, 3):
-        row = {"flow": f"FLOW {n}", "pressure_bar": None, "flowrate_m3h": None, "flow_total_m3": None, "status": "NOT_FOUND"}
-        meta = flow_rows.get(n)
-        if not meta:
-            out_rows.append(row)
-            continue
-
-        band = max(22.0, meta["h"] * 1.2)
-        x_min = meta["x_right"] + 8
-
-        # เลือก token ที่อยู่ในแนวเดียวกัน
-        row_tokens = [t for t in tokens if (abs(t["cy"] - meta["y"]) <= band and t["x1"] >= x_min)]
-
-        num_tokens = [t for t in row_tokens if _looks_like_number(t.get("text", ""))]
-        # รวม token ที่ติดกัน เผื่อเลขแยก
-        num_tokens = _join_adjacent_numeric_tokens(num_tokens, gap_px=14)
-        # filter อีกทีหลังรวม
-        num_tokens = [t for t in num_tokens if _looks_like_number(t.get("text", ""))]
-        num_tokens = sorted(num_tokens, key=lambda t: t["cx"])
-
-        if len(num_tokens) >= 3:
-            p = _parse_number(num_tokens[0]["text"])
-            fr = _parse_number(num_tokens[1]["text"])
-            tot = _parse_number(num_tokens[2]["text"])
-            row.update({
-                "pressure_bar": p,
-                "flowrate_m3h": fr,
-                "flow_total_m3": tot,
-                "status": "OK" if (p is not None and fr is not None and tot is not None) else "PARTIAL",
-            })
-        out_rows.append(row)
-
-    dbg = {
-        "roi": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-        "flow_rows": flow_rows,
-        "full_text": full_text[:4000] if full_text else "",
-        "full_text_pass1": full_text1[:4000] if full_text1 else "",
-        "tokens_count": len(tokens),
-    }
-
-    return (out_rows, dbg) if debug else out_rows
-
 # =========================================================
 # --- UI LOGIC ---
 # =========================================================
 mode = st.sidebar.radio(
     "🔧 เลือกโหมดการทำงาน",
-    ["📝 พนักงานจดมิเตอร์", "📥 อัปโหลด Excel (SCADA Export)", "🖥️ Dashboard Screenshot (OCR)", "👮‍♂️ Admin Approval"]
+    ["📝 พนักงานจดมิเตอร์", "📥 อัปโหลด Excel (SCADA Export)", "👮‍♂️ Admin Approval"]
 )
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
@@ -1598,14 +1538,7 @@ if mode == "📝 พนักงานจดมิเตอร์":
         with st.spinner("🤖 AI กำลังอ่านค่า..."):
             st.session_state.emp_ai_value = float(ocr_process(img_bytes, config, debug=False))
 
-    # --- FIX: กันค่า AI ติดลบไม่ให้ st.number_input ล้ม ---
     ai_val = float(st.session_state.emp_ai_value or 0.0)
-
-    min_allowed = 0.0
-    prefill_val = ai_val if ai_val >= min_allowed else min_allowed
-    if ai_val < min_allowed:
-        st.warning("⚠️ AI อ่านค่าได้ติดลบ (น่าจะอ่านผิด) — ระบบจะให้แก้เองก่อนบันทึก")
-
     st.write(f"🤖 **AI เสนอค่า:** {fmt % ai_val}")
 
     choice = st.radio(
@@ -1618,17 +1551,14 @@ if mode == "📝 พนักงานจดมิเตอร์":
     if choice == "✍️ แก้เอง":
         final_val = st.number_input(
             "พิมพ์ค่าที่ถูกต้อง",
-            value=float(prefill_val),
-            min_value=min_allowed,
+            value=float(ai_val),
+            min_value=0.0,
             step=step,
             format=fmt,
             key="emp_override_val"
         )
         status = "CONFIRMED_MANUAL"
     else:
-        if ai_val < min_allowed:
-            st.error("❌ AI อ่านค่าได้ติดลบ จึงไม่อนุญาตให้บันทึกแบบ 'ใช้ค่า AI' — กรุณาเลือก '✍️ แก้เอง'")
-            st.stop()
         final_val = float(ai_val)
         status = "CONFIRMED_AI"
 
@@ -1729,183 +1659,6 @@ elif mode == "👮‍♂️ Admin Approval":
                             else: st.warning("หา row ไม่เจอ")
                         except Exception as e: st.error(f"Error approve: {e}")
 
-
-
-elif mode == "🖥️ Dashboard Screenshot (OCR)":
-    st.title("🖥️ Dashboard Screenshot → WaterReport")
-    st.caption("อัปโหลดรูปหน้าจอ Monitor (binary28 / Monitor View) แล้วระบบจะอ่านค่า Pressure/Flowrate/Flow_Total ของ FLOW 1-3 ให้อัตโนมัติ")
-
-    c_insp, c_date = st.columns(2)
-    with c_insp:
-        inspector = st.text_input("ชื่อผู้บันทึก", "Admin", key="dash_inspector")
-    with c_date:
-        report_date = st.date_input("📅 วันที่ของรายงาน (ที่จะไปกรอกใน WaterReport)", value=get_thai_time().date(), key="dash_date")
-
-    up = st.file_uploader("อัปโหลดรูปหน้าจอ Dashboard (JPG/PNG)", type=["jpg", "jpeg", "png"], key="dash_img")
-    if not up:
-        st.info("อัปโหลดรูปก่อน แล้วกดปุ่มอ่านค่า")
-        st.stop()
-
-    img_bytes = up.getvalue()
-    st.image(img_bytes, caption=f"ภาพที่อัปโหลด: {getattr(up, 'name', 'dashboard')} ", use_container_width=True)
-
-    # กัน OCR รันซ้ำเมื่อ rerun
-    if "dash_img_hash" not in st.session_state:
-        st.session_state.dash_img_hash = ""
-    if "dash_rows" not in st.session_state:
-        st.session_state.dash_rows = None
-    if "dash_dbg" not in st.session_state:
-        st.session_state.dash_dbg = None
-
-    img_hash = hashlib.md5(img_bytes).hexdigest()
-    if img_hash != st.session_state.dash_img_hash:
-        st.session_state.dash_img_hash = img_hash
-        st.session_state.dash_rows = None
-        st.session_state.dash_dbg = None
-
-    if st.button("🔎 อ่านค่าจากรูป (OCR)"):
-        with st.spinner("กำลังอ่านค่าจากรูป..."):
-            rows, dbg = extract_dashboard_flow_values(img_bytes, debug=True)
-        st.session_state.dash_rows = rows
-        st.session_state.dash_dbg = dbg
-
-    rows = st.session_state.dash_rows
-    if not rows:
-        st.stop()
-
-    df = pd.DataFrame(rows)
-    st.subheader("ผลการอ่านค่าจากรูป")
-    st.dataframe(df, use_container_width=True)
-
-    # เตรียมรายการ point_id ทั้งหมด (สำหรับ dropdown)
-    pm = load_points_master()
-    all_pids = [str(r.get('point_id','')).strip().upper() for r in pm if r.get('point_id')]
-    all_pids = sorted(list({p for p in all_pids if p}))
-
-    # map ค่า -> point_id (default)
-    st.subheader("แปลงค่าที่อ่านได้ → point_id (PointsMaster)")
-    st.caption("ระบบจะเติมค่า point_id ให้เองตามมาตรฐาน (C/D/J, E/F/K, G/H/L). ถ้าต้องการเปลี่ยนค่อยแก้จาก dropdown")
-
-    picked = []  # list[{point_id, value}]
-
-    for r in rows:
-        flow_label = r.get('flow', '')
-        try:
-            n = int(str(flow_label).strip().split()[-1])
-        except Exception:
-            n = None
-
-        st.markdown(f"#### {flow_label}")
-        cols = st.columns(3)
-
-        metrics = [
-            ("pressure_bar", "Pressure (bar)"),
-            ("flowrate_m3h", "Flowrate (m3/h)"),
-            ("flow_total_m3", "Flow_Total (m3)"),
-        ]
-
-        for i, (k, label) in enumerate(metrics):
-            v = r.get(k)
-            with cols[i]:
-                st.caption(label)
-                st.write(v)
-                default_pid = (_DASH_DEFAULT_POINT_MAP.get((n, k), "") if n else "").strip().upper()
-
-                options = ["(ไม่บันทึก)"] + all_pids
-                default_idx = 0
-                if default_pid and default_pid in options:
-                    default_idx = options.index(default_pid)
-
-                sel = st.selectbox(
-                    "point_id",
-                    options=options,
-                    index=default_idx,
-                    key=f"dash_pid_{flow_label}_{k}")
-
-                if sel != "(ไม่บันทึก)" and v is not None:
-                    picked.append({"point_id": sel, "value": v})
-
-    # --- debug OCR ---
-    with st.expander("แสดงข้อความ OCR (debug)"):
-        if st.session_state.dash_dbg:
-            st.json(st.session_state.dash_dbg)
-        else:
-            st.info("ไม่มี debug")
-
-    st.subheader("บันทึกลง WaterReport")
-    st.caption("จะบันทึกเฉพาะ point_id ที่เลือกไว้ และมีค่าไม่ว่าง")
-
-    if st.button("✅ บันทึกลง WaterReport (อัตโนมัติ)"):
-        inspector_name = inspector or "Admin"
-
-        report_items = []
-        db_rows = []
-        fail_list = []
-
-        for it in picked:
-            pid_u = str(it.get('point_id','')).strip().upper()
-            val = it.get('value', None)
-            if not pid_u or val is None or str(val).strip() == "":
-                continue
-
-            cfg = get_meter_config(pid_u)
-            if not cfg:
-                fail_list.append((pid_u, "NO_CONFIG_IN_POINTSMaster"))
-                continue
-
-            report_col = str(cfg.get('report_col','') or '').strip()
-            if (not report_col) or (report_col in ("-", "—", "–")):
-                fail_list.append((pid_u, "NO_REPORT_COL_IN_POINTSMaster"))
-                continue
-
-            # แปลงค่า
-            write_val = val
-            try:
-                write_val = float(str(val).replace(",", "").strip())
-            except Exception:
-                write_val = str(val).strip()
-
-            report_items.append({"point_id": pid_u, "value": write_val, "report_col": report_col})
-
-            # log DB
-            try:
-                meter_type = infer_meter_type(cfg)
-            except Exception:
-                meter_type = "Electric"
-
-            try:
-                current_time = get_thai_time().time()
-                record_ts = datetime.combine(report_date, current_time).strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                record_ts = get_thai_time().strftime("%Y-%m-%d %H:%M:%S")
-
-            db_rows.append([
-                record_ts,
-                meter_type,
-                pid_u,
-                inspector_name,
-                write_val,
-                write_val,
-                "AUTO_DASHBOARD_OCR",
-                "-",
-            ])
-
-        if not report_items:
-            st.warning("ไม่มีข้อมูลให้บันทึก (ยังไม่ได้เลือก point_id หรือค่าทั้งหมดว่าง)")
-            st.stop()
-
-        ok_db, db_msg = append_rows_dailyreadings_batch(db_rows)
-        if not ok_db:
-            st.warning(f"⚠️ Log ลง DailyReadings ไม่สำเร็จ: {db_msg}")
-
-        with st.spinner("กำลังบันทึกลง WaterReport..."):
-            ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True)
-
-        st.success(f"✅ บันทึกลง WaterReport สำเร็จ: {len(ok_pids)} จุด")
-        if fail_list or fail_report:
-            st.error(f"❌ บันทึกไม่สำเร็จ: {len(fail_list) + len(fail_report)} จุด")
-            st.write([[pid, reason] for pid, reason in (fail_list + list(fail_report))])
-
 elif mode == "📥 อัปโหลด Excel (SCADA Export)":
     st.title("📥 อัปโหลด Excel (SCADA Export)")
     st.caption("โหมดนี้ใช้แทนการถ่ายรูป SCADA: เอาไฟล์ Excel ที่ SCADA export มาอัปโหลด แล้วระบบจะดึงค่า + บันทึกลง WaterReport ให้อัตโนมัติ")
@@ -1949,86 +1702,127 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
     if not exports:
         st.stop()
 
-    # เก็บไฟล์ไว้ก่อน (อย่าเพิ่งอ่าน bytes ตรงนี้ กัน rerun แล้วโหลดไฟล์ซ้ำ)
-    export_files = exports
-    export_filenames = [getattr(f, 'name', '') for f in export_files if getattr(f, 'name', None)]
-
-    # === (Optional) จับคู่ไฟล์กรณีลูกค้าเปลี่ยนชื่อ ===
-    # ปกติระบบจะเดาจากชื่อไฟล์เอง แต่ถ้าขึ้น NO_FILE ให้ตั้งค่าตรงนี้
-    file_key_map = {}
-    key_norms = sorted({_strip_date_prefix(r.get("file_key", "")) for r in mapping_rows if r.get("file_key")})
-
-    with st.expander("⚙️ ตั้งค่าจับคู่ไฟล์ (ใช้เมื่อขึ้น NO_FILE / ลูกค้าเปลี่ยนชื่อไฟล์)"):
-        if not key_norms:
-            st.info("ไม่พบ file_key ใน mapping")
-        else:
-            options = ["(Auto)"] + list(export_filenames)
-            for kn in key_norms:
-                if not kn:
-                    continue
-
-                # เดาค่า default
-                default_choice = "(Auto)"
-                for fname in export_filenames:
-                    if kn in _strip_date_prefix(fname) or _norm_filekey(kn) in _norm_filekey(fname):
-                        default_choice = fname
-                        break
-
-                # UF_System: ถ้าชื่อไฟล์ไม่ตรง ให้เดาไฟล์ AF_Report/Report_Gen
-                if default_choice == "(Auto)":
-                    kn2 = _norm_filekey(kn)
-                    if "uf" in kn2 or "uf_system" in kn2 or "ufsystem" in kn2:
-                        for fname in export_filenames:
-                            fn2 = _norm_filekey(fname)
-                            if fn2.startswith("af_report") or "report_gen" in fn2:
-                                default_choice = fname
-                                break
-
-                sel = st.selectbox(
-                    f"ไฟล์ที่ใช้สำหรับ '{kn}'",
-                    options=options,
-                    index=options.index(default_choice) if default_choice in options else 0,
-                    key=f"filemap_{kn}"
-                )
-                if sel != "(Auto)":
-                    file_key_map[kn] = sel
-
-            st.caption("ทิป: ถ้า UF/System เปลี่ยนชื่อไฟล์ ให้เลือกไฟล์ AF_Report_Gen.. มาแทนคีย์ UF_System")
+    uploaded_exports = {f.name: f.getvalue() for f in exports}
 
     # ปุ่มดึงค่า
     if st.button("🔎 ดึงค่าจาก Excel"):
-        # signature กัน rerun แล้วอ่าน bytes ซ้ำ (ไฟล์ใหญ่จะช้ามาก)
-        sig = tuple((f.name, getattr(f, 'size', None)) for f in export_files)
-
-        if st.session_state.get("scada_exports_sig") != sig:
-            st.session_state["scada_exports_sig"] = sig
-            with st.spinner("กำลังโหลดไฟล์ Excel (ครั้งแรกเท่านั้น)..."):
-                st.session_state["scada_exports_bytes"] = {f.name: f.getvalue() for f in export_files}
-
-        uploaded_exports = st.session_state.get("scada_exports_bytes", {})
-
         with st.spinner("กำลังอ่านค่าใน Excel..."):
-            results, missing = extract_scada_values_from_exports(mapping_rows, uploaded_exports, file_key_map=file_key_map)
+            uploaded_exports = {f.name: f.getvalue() for f in exports}
 
-        # แสดงผล
-        ok_count = sum(1 for r in results if r.get("status") == "OK" and r.get("value") is not None)
-        st.success(f"อ่านได้แล้ว {ok_count}/{len(results)} จุด")
+            # === (Optional) จับคู่ไฟล์กรณีลูกค้าเปลี่ยนชื่อ ===
+            # ปกติระบบจะเดาจากชื่อไฟล์เอง แต่ถ้าขึ้น NO_FILE ให้ตั้งค่าตรงนี้
+            file_key_map = {}
+            key_norms = sorted({_strip_date_prefix(r.get("file_key", "")) for r in mapping_rows if r.get("file_key")})
 
-        df_show = pd.DataFrame(results)
-        st.dataframe(df_show, use_container_width=True)
+            with st.expander("⚙️ ตั้งค่าจับคู่ไฟล์ (ใช้เมื่อขึ้น NO_FILE / ลูกค้าเปลี่ยนชื่อไฟล์)"):
+                if not key_norms:
+                    st.info("ไม่พบ file_key ใน mapping")
+                else:
+                    options = ["(Auto)"] + list(uploaded_exports.keys())
+                    for kn in key_norms:
+                        if not kn:
+                            continue
 
-        # เตือนจุดที่หาย
-        missing_point_ids = [m.get("point_id") for m in (missing or []) if m.get("point_id")]
-        if missing_point_ids:
-            st.warning("มีจุดที่ดึงค่าไม่สำเร็จ/ไม่มีใน Excel: " + ", ".join(missing_point_ids))
+                        # เดาค่า default (สำคัญ: ห้ามใช้ contains แบบกว้าง ๆ เพราะ 'Daily_Report' จะชนกับ 'SMMT_Daily_Report')
+                        default_choice = "(Auto)"
+                        kn_strip = (kn or "").strip().lower()
+                        kn_norm = _norm_filekey(kn_strip)
 
+                        # 1) หาแบบ "ตรงชื่อที่ตัดวันที่แล้ว" ก่อน (ปลอดภัยสุด)
+                        exact_cands = []
+                        for fname in uploaded_exports.keys():
+                            f_strip = _strip_date_prefix(fname)  # ตัดวันที่ + ตัดนามสกุลแล้ว
+                            if f_strip == kn_strip:
+                                exact_cands.append(fname)
+
+                        # ถ้าไม่เจอ ลองเทียบแบบ normalize (ยังไม่ใช้ contains)
+                        if not exact_cands and kn_norm:
+                            for fname in uploaded_exports.keys():
+                                f_strip = _strip_date_prefix(fname)
+                                if _norm_filekey(f_strip) == kn_norm:
+                                    exact_cands.append(fname)
+
+                        # เลือก candidate ที่เหมาะสุด (กัน SMMT ชน Daily_Report)
+                        if exact_cands:
+                            # ถ้า key ไม่ได้มี smmt ให้เลี่ยงไฟล์ที่มี smmt
+                            if "smmt" not in kn_norm:
+                                non_smmt = [f for f in exact_cands if "smmt" not in _norm_filekey(_strip_date_prefix(f))]
+                                if non_smmt:
+                                    default_choice = non_smmt[0]
+                                else:
+                                    default_choice = exact_cands[0]
+                            else:
+                                default_choice = exact_cands[0]
+                        else:
+                            # 2) fallback แบบ scoring (ยังกัน smmt mismatch)
+                            best = None
+                            best_score = -10**9
+                            for fname in uploaded_exports.keys():
+                                f_strip = _strip_date_prefix(fname)
+                                f_norm = _norm_filekey(f_strip)
+                                score = 0
+                                if f_strip == kn_strip:
+                                    score += 1000
+                                if f_norm == kn_norm and kn_norm:
+                                    score += 900
+                                # contains ให้แต้มต่ำ ๆ เท่านั้น
+                                if kn_strip and kn_strip in f_strip:
+                                    score += 80
+                                if kn_norm and kn_norm in f_norm:
+                                    score += 60
+                                # penalize smmt mismatch
+                                if ("smmt" in f_norm) != ("smmt" in kn_norm):
+                                    score -= 500
+                                # แต้มเพิ่มถ้าเริ่มต้นด้วยคำเดียวกัน
+                                if kn_norm and f_norm.startswith(kn_norm):
+                                    score += 40
+                                if score > best_score:
+                                    best_score = score
+                                    best = fname
+                            if best is not None and best_score >= 200:
+                                default_choice = best
+
+                        # UF_System: ถ้าชื่อไฟล์ไม่ตรง ให้เดาไฟล์ AF_Report/Report_Gen
+                        if default_choice == "(Auto)":
+                            kn2 = _norm_filekey(kn)
+                            if "uf" in kn2 or "uf_system" in kn2 or "ufsystem" in kn2:
+                                for fname in uploaded_exports.keys():
+                                    fn2 = _norm_filekey(fname)
+                                    if fn2.startswith("af_report") or "report_gen" in fn2:
+                                        default_choice = fname
+                                        break
+
+                        sel = st.selectbox(
+                            f"ไฟล์ที่ใช้สำหรับ '{kn}'",
+                            options=options,
+                            index=options.index(default_choice) if default_choice in options else 0,
+                            key=f"filemap_{kn}"
+                        )
+                        if sel != "(Auto)":
+                            file_key_map[kn] = sel
+
+                    st.caption("ทิป: ถ้า UF/System เปลี่ยนชื่อไฟล์ ให้เลือกไฟล์ AF_Report_Gen.. มาแทนคีย์ UF_System")
+
+            results, missing = extract_scada_values_from_exports(mapping_rows, uploaded_exports, file_key_map=file_key_map, target_date=report_date)
         # เก็บไว้ใน session
         st.session_state["excel_results"] = results
         st.session_state["excel_missing"] = missing
+
     # ถ้ามีผลแล้ว แสดงส่วนแก้/บันทึก
     if "excel_results" in st.session_state:
         results = st.session_state["excel_results"]
         missing = st.session_state.get("excel_missing", [])
+
+        # แสดงผลสรุป + ตาราง (แสดงครั้งเดียว)
+        ok_count = sum(1 for r in results if r.get("status") == "OK" and r.get("value") is not None)
+        st.success(f"อ่านได้แล้ว {ok_count}/{len(results)} จุด")
+
+        show_only_missing = st.checkbox("🚫 แสดงเฉพาะจุดที่ไม่มีใน Excel", value=False)
+        df_show = pd.DataFrame(results)
+        if show_only_missing and (not df_show.empty) and ("status" in df_show.columns):
+            df_show = df_show[df_show["status"] != "OK"]
+        st.dataframe(df_show, use_container_width=True)
+
 
         # เตือนจุดที่หาย
         missing_point_ids = [m["point_id"] for m in missing]
