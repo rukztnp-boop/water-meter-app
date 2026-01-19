@@ -848,14 +848,45 @@ def extract_scada_values_from_exports(
     sheet_ctx_cache = {}  # (fname, sheet, target_date) -> ctx
 
     import datetime as dt
+    from openpyxl.utils.datetime import from_excel
 
     def _coerce_date(v):
+        """แปลงค่า 'วันที่' จากไฟล์ Excel ให้เป็น date
+
+        รองรับหลายแบบเพื่อกันเคสไฟล์ SCADA ใส่วันที่เป็น:
+        - datetime / date
+        - Excel serial number (เช่น 45291)
+        - string (เช่น 2026/01/19, 2026-01-19, 19/01/2026)
+        """
         if v is None:
             return None
         if isinstance(v, dt.datetime):
             return v.date()
         if isinstance(v, dt.date):
             return v
+
+        # Excel serial date
+        if isinstance(v, (int, float)):
+            try:
+                # บางไฟล์เป็น float เล็ก ๆ ที่ไม่ใช่ serial จริง
+                if float(v) > 1:
+                    return from_excel(v).date()
+            except Exception:
+                pass
+
+        # String date
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            # เอาแค่ 10 ตัวแรก เผื่อมีเวลาแนบท้าย
+            s10 = s[:10]
+            for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y"):
+                try:
+                    return dt.datetime.strptime(s10, fmt).date()
+                except Exception:
+                    continue
+
         return None
 
     def get_sheet_ctx(fname: str, wb, sheet: str, target_date_local):
@@ -901,7 +932,9 @@ def extract_scada_values_from_exports(
         # ถ้ามี Date column และผู้ใช้เลือกวัน → สแกนจนเจอวันนั้น และหยุดเมื่อเลยวัน (ลดเวลา)
         if date_col and target_date_local:
             started = False
-            max_r = ws.max_row or 0
+            # กันเคสไฟล์ใหญ่มาก (AF_Report_Gen) ที่ ws.max_row หลอกจนค้าง
+            max_scan_rows = 50000  # ปรับได้ตามความเหมาะสม
+            max_r = min(ws.max_row or 0, hdr_row + max_scan_rows)
             min_c = min(date_col, time_col)
             max_c = max(date_col, time_col)
 
