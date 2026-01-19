@@ -331,7 +331,7 @@ def _with_retry(fn, *args, max_retries: int = 6, base_sleep: float = 0.8, **kwar
     if last_err:
         raise last_err
 
-def export_many_to_real_report_batch(items: list, target_date, debug: bool = False):
+def export_many_to_real_report_batch(items: list, target_date, debug: bool = False, write_mode: str = "overwrite"):
     """
     Export หลายจุดลง WaterReport ด้วย 1 batch_update (ลด Read/Write requests มาก ๆ)
     items: list[dict] ต้องมี keys: point_id, value, report_col
@@ -396,6 +396,15 @@ def export_many_to_real_report_batch(items: list, target_date, debug: bool = Fal
     except Exception:
         target_row = 6 + 1
 
+    # ---- กันเขียนทับ: ถ้าเลือก 'เขียนเฉพาะช่องว่าง' จะอ่านค่าเดิมในแถวนี้ก่อน 1 ครั้ง ----
+    existing_row = None
+    wm = str(write_mode or 'overwrite').strip().lower()
+    if wm in ('empty_only', 'skip_non_empty', 'no_overwrite', 'nooverwrite', 'blank_only'):
+        try:
+            existing_row = _with_retry(ws.row_values, target_row)
+        except Exception:
+            existing_row = None
+
     # เตรียม batch ranges
     data = []
     for it in items:
@@ -411,6 +420,16 @@ def export_many_to_real_report_batch(items: list, target_date, debug: bool = Fal
         if target_col <= 0:
             fail_list.append((pid, f"report_col '{report_col}' แปลงคอลัมน์ไม่ได้"))
             continue
+
+        # ถ้าเลือก 'เขียนเฉพาะช่องว่าง' และช่องมีข้อมูลแล้ว -> ข้าม
+        if existing_row is not None:
+            try:
+                existing_val = existing_row[target_col - 1] if (target_col - 1) < len(existing_row) else ''
+                if str(existing_val).strip() != '':
+                    fail_list.append((pid, 'SKIP_NON_EMPTY'))
+                    continue
+            except Exception:
+                pass
 
         # A1 เช่น "Y18"
         a1 = gspread.utils.rowcol_to_a1(target_row, target_col)
@@ -697,6 +716,7 @@ def extract_scada_values_from_exports(
     uploaded_exports: dict,
     file_key_map: dict | None = None,
     target_date=None,
+    allow_single_file_fallback: bool = True,
 ):
     """
     mapping_rows: list[dict] จาก load_scada_excel_mapping
@@ -837,8 +857,8 @@ def extract_scada_values_from_exports(
             cand.sort(key=_score, reverse=True)
             return cand[0]
 
-        # 4) fallback: ถ้ามีไฟล์เดียว ให้คืนไฟล์นั้น
-        if len(fnames) == 1:
+        # 4) fallback: ถ้ามีไฟล์เดียว ให้คืนไฟล์นั้น (ปิดได้เพื่อกัน match ผิดตอนประมวลผลไฟล์ใหม่แค่ไฟล์เดียว)
+        if allow_single_file_fallback and len(fnames) == 1:
             return fnames[0]
 
         return None
@@ -2148,24 +2168,119 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
     if not mapping_rows:
         st.stop()
 
-    # อัปโหลด Excel export
-    st.subheader("2) อัปโหลดไฟล์ Excel ที่ SCADA export")
-    exports = st.file_uploader(
+    # อัปโหลด Excel export (จำไฟล์ได้ / เพิ่มไฟล์ทีหลังได้)
+    st.subheader("2) อัปโหลดไฟล์ Excel ที่ SCADA export (เพิ่มทีหลังได้)")
+
+    import hashlib, time
+
+    # --- โหลดย้อนหลังไฟล์ที่เคยอัปโหลด (ในรอบนี้) ---
+    if "scada_files" not in st.session_state:
+        # filename -> {bytes, sha1, size, added_at, processed_sha1}
+        st.session_state["scada_files"] = {}
+    if "excel_updated_pids_last_run" not in st.session_state:
+        st.session_state["excel_updated_pids_last_run"] = []
+
+    # 2.1 อัปโหลดไฟล์ใหม่ (จะถูก 'เพิ่ม' เข้า list เดิม ไม่ทับ)
+    exports_new = st.file_uploader(
         "เลือกไฟล์ Excel (เลือกได้หลายไฟล์) เช่น ...Daily_Report.xlsx, ...UF_System.xlsx, ...SMMT_Daily_Report.xlsx",
         type=["xlsx"],
         accept_multiple_files=True,
+        key="scada_exports_uploader",
     )
 
-    if not exports:
+    added_count = 0
+    if exports_new:
+        for f in exports_new:
+            b = f.getvalue()
+            h = hashlib.sha1(b).hexdigest()
+            old = st.session_state["scada_files"].get(f.name)
+            if (old is None) or (old.get("sha1") != h):
+                st.session_state["scada_files"][f.name] = {
+                    "bytes": b,
+                    "sha1": h,
+                    "size": len(b),
+                    "added_at": time.time(),
+                    "processed_sha1": (old or {}).get("processed_sha1"),
+                }
+                added_count += 1
+
+    if added_count:
+        st.success(f"เพิ่มไฟล์ใหม่ {added_count} ไฟล์ ✅ (ไฟล์เดิมยังอยู่)")
+
+    files_dict = st.session_state.get("scada_files", {})
+    if not files_dict:
+        st.info("ยังไม่มีไฟล์ Excel — กรุณาอัปโหลดอย่างน้อย 1 ไฟล์")
         st.stop()
 
-    uploaded_exports = {f.name: f.getvalue() for f in exports}
+    # 2.2 แสดงรายการไฟล์ที่มีอยู่
+    def _is_new_file(meta: dict) -> bool:
+        return (meta or {}).get("processed_sha1") != (meta or {}).get("sha1")
+
+    file_rows = []
+    for name, meta in files_dict.items():
+        file_rows.append({
+            "ไฟล์": name,
+            "ขนาด(MB)": round((meta.get("size", 0) or 0) / 1_000_000, 2),
+            "สถานะ": "NEW" if _is_new_file(meta) else "มีแล้ว",
+        })
+
+    st.dataframe(pd.DataFrame(file_rows), use_container_width=True)
+
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        remove_sel = st.multiselect("เลือกลบไฟล์ (ถ้าต้องการ)", options=list(files_dict.keys()), default=[])
+    with c2:
+        if st.button("🗑️ ลบไฟล์ที่เลือก"):
+            for fn in remove_sel:
+                files_dict.pop(fn, None)
+            st.session_state["scada_files"] = files_dict
+            st.rerun()
+    with c3:
+        if st.button("🧹 ล้างไฟล์ทั้งหมด"):
+            st.session_state["scada_files"] = {}
+            st.session_state.pop("excel_results", None)
+            st.session_state.pop("excel_missing", None)
+            st.session_state["excel_updated_pids_last_run"] = []
+            st.rerun()
+
+    # 2.3 เลือกว่าจะให้ระบบอ่านไฟล์แบบไหน
+    st.markdown("### 2.3 เลือกโหมดการอ่านไฟล์")
+    process_mode = st.radio(
+        "จะให้ระบบอ่านไฟล์แบบไหน?",
+        ["📚 อ่านทุกไฟล์ที่มี", "➕ อ่านเฉพาะไฟล์ใหม่ (NEW)", "🎯 อ่านเฉพาะไฟล์ที่เลือก"],
+        index=0,
+        horizontal=True,
+        key="scada_process_mode",
+    )
+
+    all_files = list(files_dict.keys())
+    new_files = [fn for fn in all_files if _is_new_file(files_dict.get(fn, {}))]
+
+    proc_files = []
+    if process_mode.startswith("📚"):
+        proc_files = all_files
+    elif process_mode.startswith("➕"):
+        proc_files = new_files
+        if not proc_files:
+            st.warning("ยังไม่มีไฟล์ NEW ให้ประมวลผล (เพิ่มไฟล์ใหม่ก่อน หรือเลือกโหมดอื่น)")
+    else:
+        proc_files = st.multiselect(
+            "เลือกไฟล์ที่จะให้ระบบอ่าน",
+            options=all_files,
+            default=all_files,
+            key="scada_selected_files",
+        )
+
+    # สร้าง dict เฉพาะไฟล์ที่ต้องอ่าน (เพื่อให้ 'เพิ่มไฟล์ใหม่ทีหลัง' ไม่ต้องประมวลผลไฟล์เก่า)
+    uploaded_exports_proc = {fn: files_dict[fn]["bytes"] for fn in proc_files if fn in files_dict}
 
     # ปุ่มดึงค่า
     if st.button("🔎 ดึงค่าจาก Excel"):
-        with st.spinner("กำลังอ่านค่าใน Excel..."):
-            uploaded_exports = {f.name: f.getvalue() for f in exports}
+        if not uploaded_exports_proc:
+            st.warning("ยังไม่ได้เลือกไฟล์ให้ประมวลผล")
+            st.stop()
 
+        with st.spinner("กำลังอ่านค่าใน Excel..."):
             # === (Optional) จับคู่ไฟล์กรณีลูกค้าเปลี่ยนชื่อ ===
             # ปกติระบบจะเดาจากชื่อไฟล์เอง แต่ถ้าขึ้น NO_FILE ให้ตั้งค่าตรงนี้
             file_key_map = {}
@@ -2175,46 +2290,42 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
                 if not key_norms:
                     st.info("ไม่พบ file_key ใน mapping")
                 else:
-                    options = ["(Auto)"] + list(uploaded_exports.keys())
+                    # **สำคัญ**: ให้เลือกได้เฉพาะไฟล์ที่กำลังประมวลผลในรอบนี้
+                    options = ["(Auto)"] + list(uploaded_exports_proc.keys())
+
                     for kn in key_norms:
                         if not kn:
                             continue
 
-                        # เดาค่า default (สำคัญ: ห้ามใช้ contains แบบกว้าง ๆ เพราะ 'Daily_Report' จะชนกับ 'SMMT_Daily_Report')
                         default_choice = "(Auto)"
                         kn_strip = (kn or "").strip().lower()
                         kn_norm = _norm_filekey(kn_strip)
 
-                        # 1) หาแบบ "ตรงชื่อที่ตัดวันที่แล้ว" ก่อน (ปลอดภัยสุด)
+                        # 1) ตรงชื่อแบบตัดวันที่แล้ว
                         exact_cands = []
-                        for fname in uploaded_exports.keys():
-                            f_strip = _strip_date_prefix(fname)  # ตัดวันที่ + ตัดนามสกุลแล้ว
+                        for fname in uploaded_exports_proc.keys():
+                            f_strip = _strip_date_prefix(fname)
                             if f_strip == kn_strip:
                                 exact_cands.append(fname)
 
-                        # ถ้าไม่เจอ ลองเทียบแบบ normalize (ยังไม่ใช้ contains)
+                        # 2) ตรงแบบ normalize
                         if not exact_cands and kn_norm:
-                            for fname in uploaded_exports.keys():
+                            for fname in uploaded_exports_proc.keys():
                                 f_strip = _strip_date_prefix(fname)
                                 if _norm_filekey(f_strip) == kn_norm:
                                     exact_cands.append(fname)
 
-                        # เลือก candidate ที่เหมาะสุด (กัน SMMT ชน Daily_Report)
                         if exact_cands:
-                            # ถ้า key ไม่ได้มี smmt ให้เลี่ยงไฟล์ที่มี smmt
                             if "smmt" not in kn_norm:
                                 non_smmt = [f for f in exact_cands if "smmt" not in _norm_filekey(_strip_date_prefix(f))]
-                                if non_smmt:
-                                    default_choice = non_smmt[0]
-                                else:
-                                    default_choice = exact_cands[0]
+                                default_choice = non_smmt[0] if non_smmt else exact_cands[0]
                             else:
                                 default_choice = exact_cands[0]
                         else:
-                            # 2) fallback แบบ scoring (ยังกัน smmt mismatch)
+                            # 3) fallback แบบ scoring
                             best = None
                             best_score = -10**9
-                            for fname in uploaded_exports.keys():
+                            for fname in uploaded_exports_proc.keys():
                                 f_strip = _strip_date_prefix(fname)
                                 f_norm = _norm_filekey(f_strip)
                                 score = 0
@@ -2222,15 +2333,12 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
                                     score += 1000
                                 if f_norm == kn_norm and kn_norm:
                                     score += 900
-                                # contains ให้แต้มต่ำ ๆ เท่านั้น
                                 if kn_strip and kn_strip in f_strip:
                                     score += 80
                                 if kn_norm and kn_norm in f_norm:
                                     score += 60
-                                # penalize smmt mismatch
                                 if ("smmt" in f_norm) != ("smmt" in kn_norm):
                                     score -= 500
-                                # แต้มเพิ่มถ้าเริ่มต้นด้วยคำเดียวกัน
                                 if kn_norm and f_norm.startswith(kn_norm):
                                     score += 40
                                 if score > best_score:
@@ -2239,11 +2347,11 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
                             if best is not None and best_score >= 200:
                                 default_choice = best
 
-                        # UF_System: ถ้าชื่อไฟล์ไม่ตรง ให้เดาไฟล์ AF_Report/Report_Gen
+                        # UF_System: ถ้าไม่มีไฟล์ UF จริง ให้เดา AF_Report/Report_Gen (ถ้ามีอยู่ในรอบนี้)
                         if default_choice == "(Auto)":
                             kn2 = _norm_filekey(kn)
                             if "uf" in kn2 or "uf_system" in kn2 or "ufsystem" in kn2:
-                                for fname in uploaded_exports.keys():
+                                for fname in uploaded_exports_proc.keys():
                                     fn2 = _norm_filekey(fname)
                                     if fn2.startswith("af_report") or "report_gen" in fn2:
                                         default_choice = fname
@@ -2253,17 +2361,72 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
                             f"ไฟล์ที่ใช้สำหรับ '{kn}'",
                             options=options,
                             index=options.index(default_choice) if default_choice in options else 0,
-                            key=f"filemap_{kn}"
+                            key=f"filemap_{kn}",
                         )
                         if sel != "(Auto)":
                             file_key_map[kn] = sel
 
                     st.caption("ทิป: ถ้า UF/System เปลี่ยนชื่อไฟล์ ให้เลือกไฟล์ AF_Report_Gen.. มาแทนคีย์ UF_System")
 
-            results, missing = extract_scada_values_from_exports(mapping_rows, uploaded_exports, file_key_map=file_key_map, target_date=report_date)
+            # --- ดึงค่าเฉพาะไฟล์ที่เลือก ---
+            allow_single = True if process_mode.startswith("📚") else False
+            results_new, missing_new = extract_scada_values_from_exports(
+                mapping_rows,
+                uploaded_exports_proc,
+                file_key_map=file_key_map,
+                target_date=report_date,
+                allow_single_file_fallback=allow_single,
+            )
+
+            # --- รวมผล: ถ้าอ่านเฉพาะไฟล์ใหม่/ไฟล์ที่เลือก ให้ 'เติมเพิ่ม' โดยไม่ลบของเดิม ---
+            prev = st.session_state.get("excel_results")
+            merged = []
+            updated_pids = set()
+
+            if prev and (not process_mode.startswith("📚")):
+                prev_by_pid = {str(r.get("point_id")): r for r in prev}
+                for r in results_new:
+                    pid = str(r.get("point_id"))
+                    ok_new = (r.get("status") == "OK") and (r.get("value") is not None)
+                    if ok_new:
+                        rr = dict(r)
+                        rr["_updated"] = True
+                        merged.append(rr)
+                        updated_pids.add(pid)
+                    else:
+                        old = prev_by_pid.get(pid)
+                        ok_old = old and (old.get("status") == "OK") and (old.get("value") is not None)
+                        if ok_old:
+                            oo = dict(old)
+                            oo["_updated"] = False
+                            merged.append(oo)
+                        else:
+                            rr = dict(r)
+                            rr["_updated"] = False
+                            merged.append(rr)
+            else:
+                for r in results_new:
+                    ok_new = (r.get("status") == "OK") and (r.get("value") is not None)
+                    rr = dict(r)
+                    rr["_updated"] = bool(ok_new)
+                    merged.append(rr)
+                    if ok_new:
+                        updated_pids.add(str(r.get("point_id")))
+
+            # ทำ missing จาก merged (เอาไว้ให้กรอกเอง)
+            missing_point_ids = [r.get("point_id") for r in merged if not (r.get("status") == "OK" and r.get("value") is not None)]
+            missing_merged = [{"point_id": pid} for pid in missing_point_ids if pid]
+
+            # mark processed ให้ไฟล์ที่อ่านแล้ว (ไฟล์ใหม่จะกลายเป็น 'มีแล้ว')
+            for fn in proc_files:
+                if fn in files_dict:
+                    files_dict[fn]["processed_sha1"] = files_dict[fn].get("sha1")
+            st.session_state["scada_files"] = files_dict
+
         # เก็บไว้ใน session
-        st.session_state["excel_results"] = results
-        st.session_state["excel_missing"] = missing
+        st.session_state["excel_results"] = merged
+        st.session_state["excel_missing"] = missing_merged
+        st.session_state["excel_updated_pids_last_run"] = sorted(list(updated_pids))
 
     # ถ้ามีผลแล้ว แสดงส่วนแก้/บันทึก
     if "excel_results" in st.session_state:
@@ -2274,10 +2437,15 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
         ok_count = sum(1 for r in results if r.get("status") == "OK" and r.get("value") is not None)
         st.success(f"อ่านได้แล้ว {ok_count}/{len(results)} จุด")
 
+        # ถ้าอ่านแบบเพิ่มไฟล์ใหม่ -> จะมีคอลัมน์ _updated เพื่อดูว่ารอบล่าสุดอัปเดตอะไรบ้าง
+        show_only_updated = st.checkbox("🆕 แสดงเฉพาะจุดที่อัปเดตจากการดึงค่ารอบล่าสุด", value=False)
+
         show_only_missing = st.checkbox("🚫 แสดงเฉพาะจุดที่ไม่มีใน Excel", value=False)
         df_show = pd.DataFrame(results)
         if show_only_missing and (not df_show.empty) and ("status" in df_show.columns):
             df_show = df_show[df_show["status"] != "OK"]
+        if show_only_updated and (not df_show.empty) and ("_updated" in df_show.columns):
+            df_show = df_show[df_show["_updated"] == True]
         st.dataframe(df_show, use_container_width=True)
 
 
@@ -2306,6 +2474,22 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
         st.caption("จะบันทึกเฉพาะจุดที่มีค่า (ไม่ว่าง) ลง WaterReport ตาม report_col ใน PointsMaster")
 
         
+        # เลือกวิธีบันทึก (กันเขียนทับ / บันทึกเฉพาะรอบล่าสุด)
+        save_scope = st.radio(
+            "จะบันทึกข้อมูลชุดไหน?",
+            ["บันทึกทุกจุดที่มีค่า", "บันทึกเฉพาะจุดที่อัปเดตจากรอบล่าสุด"],
+            index=0,
+            horizontal=True,
+            key="scada_save_scope",
+        )
+        write_mode_ui = st.radio(
+            "เวลาบันทึกให้ทำแบบไหน?",
+            ["เขียนทับทั้งหมด", "เขียนเฉพาะช่องว่าง (ไม่ทับของเดิม)"],
+            index=0,
+            horizontal=True,
+            key="scada_write_mode",
+        )
+
         if st.button("✅ บันทึกลง WaterReport (อัตโนมัติ)"):
             inspector_name = "Admin"
 
@@ -2314,8 +2498,21 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
             db_rows = []        # log ลง DailyReadings
             fail_list = []      # [(pid, reason), ...]
 
+            # ถ้าเลือก 'บันทึกเฉพาะจุดที่อัปเดตจากรอบล่าสุด' จะกรองจุดที่ไม่เกี่ยวออก
+            last_updated = set(st.session_state.get("excel_updated_pids_last_run", []) or [])
+            manual_updated = {pid for pid, vv in manual_inputs.items() if str(vv).strip() != ""}
+            allowed_pids = None
+            if save_scope.startswith("บันทึกเฉพาะ"):
+                allowed_pids = last_updated.union(manual_updated)
+                if not allowed_pids:
+                    st.warning("ยังไม่มีจุดที่อัปเดตจากรอบล่าสุดให้บันทึก")
+                    st.stop()
+
             for pid, val in final_values.items():
                 pid_u = str(pid).strip().upper()
+                if allowed_pids is not None and pid_u not in allowed_pids:
+                    continue
+
                 if val is None or str(val).strip() == "":
                     continue
 
@@ -2378,16 +2575,24 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
 
             # 3) export ลง WaterReport แบบ batch (ลด Read requests)
             with st.spinner("กำลังบันทึกลง WaterReport..."):
-                ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True)
+                wm = "overwrite" if write_mode_ui.startswith("เขียนทับ") else "empty_only"
+                ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True, write_mode=wm)
 
             report_ok = len(ok_pids)
             report_fail = fail_list + list(fail_report)
 
+            # แยก 'ข้ามเพราะช่องมีข้อมูลแล้ว' ออกจาก error จริง
+            skipped = [(pid, reason) for pid, reason in report_fail if str(reason) == 'SKIP_NON_EMPTY']
+            report_fail_real = [(pid, reason) for pid, reason in report_fail if str(reason) != 'SKIP_NON_EMPTY']
+
             st.success(f"✅ บันทึกลง WaterReport สำเร็จ: {report_ok} จุด")
             st.info(f"🗃️ Log ลง DailyReadings สำเร็จ: {db_ok_count} จุด")
 
-            if report_fail:
-                st.error(f"❌ บันทึกไม่สำเร็จ: {len(report_fail)} จุด")
-                st.write([[pid, reason] for pid, reason in report_fail])
+            if skipped:
+                st.info(f"⏭️ ข้าม {len(skipped)} จุด เพราะช่องมีข้อมูลอยู่แล้ว (เลือกโหมด 'เขียนทับทั้งหมด' ถ้าต้องการทับ)")
+
+            if report_fail_real:
+                st.error(f"❌ บันทึกไม่สำเร็จ: {len(report_fail_real)} จุด")
+                st.write([[pid, reason] for pid, reason in report_fail_real])
         st.divider()
         st.info("หมายเหตุ: ถ้าลูกค้าบอกว่า 'มีมิเตอร์ไฟ 1 จุดที่ไม่มี export มาใน Excel' -> ใช้ช่องกรอกเองด้านบนได้เลย (เหมือนมิเตอร์น้ำ)")
