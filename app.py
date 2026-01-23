@@ -1392,7 +1392,7 @@ def ocr_process(image_bytes, config, debug=False):
                                 if ln == expected_digits + 1:
                                     score -= 80  # หักหนักกรณี +1
                             candidates.append({"val": float(val), "score": score})
-                        except Exception:
+                    except Exception:
                             pass
 
         # ---- 2) กวาดเลขทั้งหมดในข้อความ ----
