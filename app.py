@@ -1301,78 +1301,162 @@ def ocr_process(image_bytes, config, debug=False):
         ("FULL_raw",  False, "raw"),
     ]
 
-    raw_full_text = ""
-    for tag, use_roi, variant in attempts:
-        processed = preprocess_image_cv(image_bytes, config, use_roi=use_roi, variant=variant)
-        txt, err = _vision_read_text(processed)
-        if txt and txt.strip():
-            if any(c.isdigit() for c in txt):
-                raw_full_text = (txt or "").replace("\n", " ")
-                raw_full_text = re.sub(r"\.{2,}", ".", raw_full_text)
-                break
-    
-    if not raw_full_text: return 0.0
+    def _has_digits(s: str) -> bool:
+        return bool(s) and any(c.isdigit() for c in s)
 
-    full_text = preprocess_text(raw_full_text)
-    full_text = re.sub(r"\.{2,}", ".", full_text)
-
-    def check_digits(val: float) -> bool:
-        if expected_digits <= 0: return True
+    def check_digits_len(val: float) -> int:
+        """คืนค่า 'จำนวนหลัก' ของเลขหน้า (ไม่รวมทศนิยม)"""
         try:
-            ln = len(str(int(abs(float(val)))))
-            return 1 <= ln <= expected_digits + 1
-        except: return False
+            return len(str(int(abs(float(val)))))
+        except Exception:
+            return 0
+
+    def check_digits_ok(val: float) -> bool:
+        """อนุญาตให้ผ่านแบบ 'ยืดหยุ่น' แต่จะไปจัดการด้วยคะแนนอีกที"""
+        if val is None:
+            return False
+        # ❌ มิเตอร์ไม่ควรติดลบ
+        if float(val) < 0:
+            return False
+        if expected_digits <= 0:
+            return True
+        ln = check_digits_len(val)
+        # ยังยอมให้ +1 ได้ (กันเคสเลขโตขึ้นจริง) แต่จะโดนหักคะแนนหนัก
+        return 1 <= ln <= expected_digits + 1
 
     def looks_like_spec_context(text: str, start: int, end: int) -> bool:
-        ctx = text[max(0, start - 10):min(len(text), end + 10)].lower()
-        if "kwh" in ctx or "kw h" in ctx: return False
+        """ดูรอบ ๆ ตัวเลขว่าเป็นเลขสเปคเครื่อง (Hz/V/A/IP/Rev) ไหม"""
+        ctx = text[max(0, start - 12):min(len(text), end + 12)].lower()
+        # ถ้าใกล้ ๆ มี kWh ให้ถือว่าไม่ใช่สเปค (เป็นเลขมิเตอร์ได้)
+        if "kwh" in ctx or "kw h" in ctx:
+            return False
         bad = ["hz", "volt", " v", "v ", "amp", " a", "a ", "class", "ip", "rev", "rpm", "phase", "3x", "indoor"]
         return any(b in ctx for b in bad)
 
     common_noise = {10, 30, 50, 60, 100, 220, 230, 240, 380, 400, 415, 1000, 10000}
-    candidates = []
 
-    if keyword:
-        kw = re.escape(keyword)
-        patterns = [kw + r"[^\d]*((?:\d|O|o|l|I|\|)+[\.,]?\d*)", r"((?:\d|O|o|l|I|\|)+[\.,]?\d*)[^\d]*" + kw]
-        for pat in patterns:
-            match = re.search(pat, raw_full_text, re.IGNORECASE)
-            if match:
-                val_str = match.group(1).replace("O", "0").replace("o", "0").replace("l", "1").replace("I", "1").replace("|", "1")
-                val_str = normalize_number_str(val_str, decimal_places)
-                try:
-                    val = float(val_str)
-                    if decimal_places > 0 and "." not in val_str: val = val / (10 ** decimal_places)
-                    if check_digits(val): candidates.append({"val": float(val), "score": 600})
-                except: pass
+    best_val = None
+    best_score = -10**9
 
-    clean_std = re.sub(r"\b202[0-9]\b|\b256[0-9]\b", "", full_text)
-    clean_std = re.sub(r"\.{2,}", ".", clean_std)
-    for m in re.finditer(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?", clean_std):
-        n_str = m.group(0)
-        if looks_like_spec_context(raw_full_text, m.start(), m.end()): continue
-        n_str2 = normalize_number_str(n_str, decimal_places)
-        if not n_str2: continue
-        try:
-            val = float(n_str2) if "." in n_str2 else float(int(n_str2))
-            if decimal_places > 0 and "." not in n_str2: val = val / (10 ** decimal_places)
+    for tag, use_roi, variant in attempts:
+        processed = preprocess_image_cv(image_bytes, config, use_roi=use_roi, variant=variant)
+        txt, err = _vision_read_text(processed)
+        if not txt or not _has_digits(txt):
+            continue
+        raw_text = (txt or "").replace("\n", " ")
+        raw_text = re.sub(r"\.{2,}", ".", raw_text)
+
+        # preprocess แล้วใช้ "ข้อความเดียวกัน" ในการหาเลข + เช็คบริบท (แก้บั๊กตำแหน่ง)
+        full_text = preprocess_text(raw_text)
+        full_text = re.sub(r"\.{2,}", ".", full_text)
+
+        # ตัดปีออกแบบไม่ทำให้ตำแหน่งพัง (จะใช้ full_text ที่ตัดแล้วทั้งคู่)
+        scan_text = re.sub(r"\b202[0-9]\b|\b256[0-9]\b", "", full_text)
+        scan_text = re.sub(r"\.{2,}", ".", scan_text)
+
+        candidates = []
+
+        # ---- โบนัสตาม attempt (กัน FULL ภาพกว้างชนะ ROI ง่ายเกิน) ----
+        attempt_bonus = 0
+        if use_roi:
+            attempt_bonus += 80
+        if variant in ("soft", "auto"):
+            attempt_bonus += 10
+        
+        # ---- 1) ลองจับจาก keyword ก่อน (แม่นสุด) ----
+        if keyword:
+            kw = re.escape(keyword)
+            patterns = [
+                kw + r"[^\d]*((?:\d|O|o|l|I|\|)+[\.,]?\d*)",
+                r"((?:\d|O|o|l|I|\|)+[\.,]?\d*)[^\d]*" + kw
+            ]
+            for pat in patterns:
+                match = re.search(pat, raw_text, re.IGNORECASE)
+                if match:
+                    val_str = match.group(1)
+                    val_str = val_str.replace("O", "0").replace("o", "0").replace("l", "1").replace("I", "1").replace("|", "1")
+                    val_str = normalize_number_str(val_str, decimal_places)
+                    try:
+                        val = float(val_str)
+                        if decimal_places > 0 and "." not in val_str:
+                            val = val / (10 ** decimal_places)
+                        if check_digits_ok(val):
+                            score = 900 + attempt_bonus  # ให้สูงมาก เพราะเจอ keyword
+                            ln = check_digits_len(val)
+
+                            # ให้คะแนน "ใกล้ expected_digits" ชนะ (ไม่ใช่เลขยาวชนะ)
+                            if expected_digits > 0:
+                                score += max(0, 160 - abs(ln - expected_digits) * 60)
+                                if ln == expected_digits:
+                                    score += 80
+                                if ln == expected_digits + 1:
+                                    score -= 80  # หักหนักกรณี +1
+                            candidates.append({"val": float(val), "score": score})
+                        except Exception:
+                            pass
+
+        # ---- 2) กวาดเลขทั้งหมดในข้อความ ----
+        for m in re.finditer(r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?", scan_text):
+            n_str = m.group(0)
+
+            # เช็คว่าเลขนี้เป็นสเปคเครื่องไหม (ใช้ scan_text ตัวเดียวกัน)
+            if looks_like_spec_context(scan_text, m.start(), m.end()):
+                continue
+
+            n_str2 = normalize_number_str(n_str, decimal_places)
+            if not n_str2:
+                continue
             
-            if int(abs(val)) in common_noise and not keyword: continue
-            if not check_digits(val): continue
+            try:
+                val = float(n_str2) if "." in n_str2 else float(int(n_str2))
+                if decimal_places > 0 and "." not in n_str2:
+                    val = val / (10 ** decimal_places)
 
-            score = 120
-            int_part = str(int(abs(val)))
-            score += min(len(int_part), 10) * 10
-            if decimal_places > 0 and "." in n_str2: score += 25
-            candidates.append({"val": float(val), "score": score})
-        except: continue
+                # ❌ ไม่เอาติดลบ
+                if float(val) < 0:
+                    continue
 
-    if candidates: return float(max(candidates, key=lambda x: x["score"])["val"])
-    return 0.0
+                # กันเลข noise ยอดฮิต ถ้าไม่มี keyword ช่วย
+                if int(abs(val)) in common_noise and not keyword:
+                    continue
 
-def calc_tolerance(decimals: int) -> float:
-    if decimals <= 0: return 0.5
-    return 0.5 * (10 ** (-decimals))
+                if not check_digits_ok(val):
+                    continue
+
+                ln = check_digits_len(val)
+                score = 200 + attempt_bonus
+
+                # ให้คะแนน "ใกล้ expected_digits" ชนะ
+                if expected_digits > 0:
+                    score += max(0, 140 - abs(ln - expected_digits) * 50)
+                    if ln == expected_digits:
+                        score += 60
+                    if ln == expected_digits + 1:
+                        score -= 70
+                else:
+                    # ถ้าไม่กำหนด expected_digits ให้พอใช้ logic เดิม (เบา ๆ)
+                    score += min(ln, 10) * 6
+
+                # ถ้ามีทศนิยมและต้องการทศนิยม ให้บวกนิดหน่อย
+                if decimal_places > 0 and "." in n_str2:
+                    score += 20
+
+                candidates.append({"val": float(val), "score": score})
+            except Exception:
+                continue
+            
+        if candidates:
+            pick = max(candidates, key=lambda x: x["score"])
+            if pick["score"] > best_score:
+                best_score = pick["score"]
+                best_val = pick["val"]
+
+            # ถ้าเจอคะแนนสูงมากแล้ว ก็พอ (กันเรียก Vision หลายรอบ)
+            if best_score >= 980:
+                break
+
+    return float(best_val) if best_val is not None else 0.0
+         
 # =========================================================
 # --- 🔳 QR + REF IMAGE HELPERS (Mobile) ---
 # =========================================================
