@@ -1287,7 +1287,7 @@ def _vision_read_text(processed_bytes):
     except Exception as e:
         return "", str(e)
 
-def ocr_process(image_bytes, config, debug=False):
+def ocr_process(image_bytes, config, debug=False, return_candidates=False):
     decimal_places = int(config.get('decimals', 0) or 0)
     keyword = str(config.get('keyword', '') or '').strip()
     expected_digits = int(config.get('expected_digits', 0) or 0)
@@ -1338,11 +1338,16 @@ def ocr_process(image_bytes, config, debug=False):
     best_val = None
     best_score = -10**9
 
+    # ✅ เก็บ candidate ข้าม attempts (ไว้ใช้ History Guard)
+    all_candidates = []
+    TOPK = 60  # กัน list โตเกิน
+    
     for tag, use_roi, variant in attempts:
         processed = preprocess_image_cv(image_bytes, config, use_roi=use_roi, variant=variant)
         txt, err = _vision_read_text(processed)
         if not txt or not _has_digits(txt):
             continue
+            
         raw_text = (txt or "").replace("\n", " ")
         raw_text = re.sub(r"\.{2,}", ".", raw_text)
 
@@ -1441,7 +1446,7 @@ def ocr_process(image_bytes, config, debug=False):
                 if decimal_places > 0 and "." in n_str2:
                     score += 20
 
-                candidates.append({"val": float(val), "score": score})
+                candidates.append({"val": float(val), "score": score, "tag": tag})
             except Exception:
                 continue
             
@@ -1450,12 +1455,34 @@ def ocr_process(image_bytes, config, debug=False):
             if pick["score"] > best_score:
                 best_score = pick["score"]
                 best_val = pick["val"]
-
+            # ✅ รวม candidates ข้าม attempts (เก็บเฉพาะ topK)
+            all_candidates.extend(candidates)
+            all_candidates.sort(key=lambda x: float(x.get("score", 0)), reverse=True)
+            if len(all_candidates) > TOPK:
+                all_candidates = all_candidates[:TOPK]
+                
             # ถ้าเจอคะแนนสูงมากแล้ว ก็พอ (กันเรียก Vision หลายรอบ)
             if best_score >= 980:
                 break
 
-    return float(best_val) if best_val is not None else 0.0
+    final_val = float(best_val) if best_val is not None else 0.0
+    
+    # ✅ dedupe candidates ตามค่า val (เก็บคะแนนดีที่สุด)
+    if return_candidates:
+        by_val = {}
+        for c in all_candidates:
+            try:
+                v = float(c.get("val"))
+            except Exception:
+                continue
+            key = round(v, max(0, decimal_places) + 2)
+            if key not in by_val or float(c.get("score", 0)) > float(by_val[key].get("score", 0)):
+                by_val[key] = {"val": v, "score": float(c.get("score", 0)), "tag": c.get("tag", "")}
+        
+        cand_out = sorted(by_val.values(), key=lambda x: x["score"], reverse=True)[:25]
+        return final_val, cand_out
+        
+    return final_val
          
 # =========================================================
 # --- 🔳 QR + REF IMAGE HELPERS (Mobile) ---
@@ -1737,8 +1764,209 @@ def extract_dashboard_flow_values(image_bytes: bytes, debug: bool = False):
     return (out_rows, dbg) if debug else out_rows
 
 # =========================================================
+# --- ✅ HISTORY GUARD (for cumulative meters) ---
+# =========================================================
+
+@st.cache_data(ttl=300)
+def load_dailyreadings_tail(limit=4000):
+    """โหลด DailyReadings เฉพาะท้าย ๆ เพื่อลดเวลา/โควต้า"""
+    sh = gc.open(DB_SHEET_NAME)
+    ws = sh.worksheet("DailyReadings")
+    vals = ws.get_all_values()
+    if not vals:
+        return pd.DataFrame()
+
+    header = vals[0]
+    rows = vals[1:]
+    if limit and len(rows) > limit:
+        rows = rows[-limit:]
+    df = pd.DataFrame(rows, columns=header)
+    return df
+
+def _norm_pid(pid: str) -> str:
+    return str(pid or "").strip().upper()
+
+def is_cumulative_meter(config: dict) -> bool:
+    """
+    Heuristic: มิเตอร์สะสม (Totalizer / เลขมิเตอร์ / kWh / total / m3 ฯลฯ)
+    ปลอดภัย: ใช้กับค่าที่มักเป็น "สะสม" และ decimals == 0 เป็นหลัก
+    """
+    name = str(config.get("name", "") or "")
+    typ  = str(config.get("type", "") or "")
+    kw   = str(config.get("keyword", "") or "")
+    blob = f"{name} {typ} {kw}".lower()
+
+    # เน้นมิเตอร์สะสมมากกว่า flowrate/pressure
+    hit = any(k in blob for k in [
+        "เลขมิเตอร์", "meter", "total", "totalizer", "tot", "kwh", "m3", "m³"
+    ])
+    dec = int(config.get("decimals", 0) or 0)
+
+    # ถ้าเป็นดิจิทัลทศนิยม (pressure/flowrate) มักไม่ใช่สะสม
+    if dec > 0:
+        return False
+
+    return hit
+
+def get_last_good_value(point_id: str, upto_date):
+    """
+    คืนค่า Manual_Value ล่าสุด (ไม่ใช่ FLAGGED) ที่ timestamp <= upto_date 23:59:59
+    """
+    df = load_dailyreadings_tail(limit=4000)
+    if df.empty:
+        return None
+
+    pid = _norm_pid(point_id)
+
+    # normalize columns
+    if "point_id" not in df.columns or "timestamp" not in df.columns:
+        return None
+
+    df["point_id"] = df["point_id"].astype(str).map(_norm_pid)
+    df["Status"] = df.get("Status", "").astype(str).str.strip().str.upper()
+
+    # filter pid
+    df = df[df["point_id"] == pid]
+    if df.empty:
+        return None
+
+    # drop flagged
+    df = df[~df["Status"].str.contains("FLAGGED", na=False)]
+    if df.empty:
+        return None
+
+    # parse timestamp
+    df["timestamp_dt"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp_dt"])
+    if df.empty:
+        return None
+
+    cutoff = pd.to_datetime(str(upto_date) + " 23:59:59")
+    df = df[df["timestamp_dt"] <= cutoff]
+    if df.empty:
+        return None
+
+    df = df.sort_values("timestamp_dt")
+    last = pd.to_numeric(df.iloc[-1].get("Manual_Value", None), errors="coerce")
+    if pd.isna(last):
+        return None
+    return float(last)
+
+def estimate_max_delta(point_id: str, upto_date, fallback=20000, max_cap=500000):
+    """
+    ประเมินเพดานการเพิ่มต่อวันจากประวัติ (ปลอดภัย: ถ้าไม่พอข้อมูล ใช้ fallback)
+    """
+    df = load_dailyreadings_tail(limit=8000)
+    if df.empty:
+        return fallback
+
+    pid = _norm_pid(point_id)
+    if "point_id" not in df.columns or "timestamp" not in df.columns:
+        return fallback
+
+    df["point_id"] = df["point_id"].astype(str).map(_norm_pid)
+    df["Status"] = df.get("Status", "").astype(str).str.strip().str.upper()
+    df = df[df["point_id"] == pid]
+    df = df[~df["Status"].str.contains("FLAGGED", na=False)]
+    if df.empty:
+        return fallback
+
+    df["timestamp_dt"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp_dt"])
+    cutoff = pd.to_datetime(str(upto_date) + " 23:59:59")
+    df = df[df["timestamp_dt"] <= cutoff]
+    if df.empty:
+        return fallback
+
+    df = df.sort_values("timestamp_dt").tail(30)  # เอาล่าสุดพอ
+    vals = pd.to_numeric(df.get("Manual_Value", None), errors="coerce").dropna().astype(float).tolist()
+    if len(vals) < 4:
+        return fallback
+
+    diffs = []
+    for a, b in zip(vals[:-1], vals[1:]):
+        d = b - a
+        if d >= 0:
+            diffs.append(d)
+
+    if len(diffs) < 3:
+        return fallback
+
+    diffs = np.array(diffs, dtype=float)
+    q95 = float(np.quantile(diffs, 0.95))
+    med = float(np.median(diffs))
+    # เพดานแบบปลอดภัย: เอาค่ามากสุดระหว่าง q95*3 กับ med*6 แล้วอย่างน้อย 100
+    est = max(100.0, q95 * 3.0, med * 6.0)
+
+    # กันเพดานเวอร์เกินไป
+    est = min(est, float(max_cap))
+    # กันเพดานต่ำไป
+    est = max(est, float(fallback * 0.25))
+    return int(est)
+
+def pick_by_history(best_val: float, candidates: list, prev_val: float, max_delta: int):
+    """
+    เลือก candidate ที่:
+      - >= prev_val
+      - <= prev_val + max_delta
+    แล้วเลือกที่ "ใกล้ prev_val" ที่สุด (สะสมมักเพิ่มน้อยกว่าตัวเลขสเปค)
+    """
+    if prev_val is None or not candidates:
+        return best_val, "", False
+
+    lo = float(prev_val)
+    hi = float(prev_val) + float(max_delta)
+
+    in_range = []
+    for c in candidates:
+        try:
+            v = float(c.get("val"))
+        except Exception:
+            continue
+        if lo <= v <= hi:
+            in_range.append({**c, "val": v})
+
+    if in_range:
+        # ใกล้ prev ก่อน แล้วค่อยดู score
+        in_range.sort(key=lambda x: (abs(x["val"] - lo), -float(x.get("score", 0))))
+        picked = float(in_range[0]["val"])
+        changed = (best_val is not None) and (abs(picked - float(best_val)) > 1e-9)
+        msg = f"✅ History Guard: เลือกเลขที่สอดคล้องกับเมื่อวาน (prev={lo:.0f}, maxΔ={max_delta})"
+        return picked, msg, changed
+
+    # ถ้า best_val ต่ำกว่าเมื่อวาน -> เตือนแรง
+    if best_val is not None and float(best_val) < lo:
+        msg = f"⚠️ History Guard: AI อ่านได้น้อยกว่าเมื่อวาน (prev={lo:.0f}) แนะนำให้แก้เอง"
+        return best_val, msg, False
+
+    return best_val, "", False
+
+def apply_history_guard(point_id: str, best_val: float, candidates: list, config: dict, selected_date):
+    """
+    ใช้เมื่ออยู่โหมดพนักงานจดมิเตอร์เท่านั้น
+    """
+    if not is_cumulative_meter(config):
+        return best_val, ""
+
+    prev = get_last_good_value(point_id, selected_date - timedelta(days=1))
+    if prev is None:
+        return best_val, ""
+
+    max_delta = estimate_max_delta(point_id, selected_date - timedelta(days=1), fallback=20000)
+    picked, msg, _changed = pick_by_history(best_val, candidates, prev_val=prev, max_delta=max_delta)
+    return picked, msg
+
+# =========================================================
 # --- UI LOGIC ---
 # =========================================================
+def reset_emp_meter_state():
+    st.session_state.emp_ai_value = None
+    st.session_state.emp_img_hash = ""
+    st.session_state.emp_ai_msg = ""
+    
+    # ✅ สำคัญ: เพิ่ม nonce เพื่อบังคับ Streamlit สร้าง widget ใหม่
+    st.session_state.emp_nonce = int(st.session_state.get("emp_nonce", 0)) + 1
+
 mode = st.sidebar.radio(
     "🔧 เลือกโหมดการทำงาน",
     ["📝 พนักงานจดมิเตอร์", "📥 อัปโหลด Excel (SCADA Export)", "🖥️ Dashboard Screenshot (OCR)", "👮‍♂️ Admin Approval"]
@@ -1755,6 +1983,10 @@ if mode == "📝 พนักงานจดมิเตอร์":
 
     if "emp_step" not in st.session_state: st.session_state.emp_step = "SCAN_QR"
     if "emp_point_id" not in st.session_state: st.session_state.emp_point_id = ""
+
+    # ✅ Step A: เพิ่ม nonce state (วางตรงนี้)
+    if "emp_nonce" not in st.session_state:
+        st.session_state.emp_nonce = 0
 
     all_meters = load_points_master()
     if not all_meters:
@@ -1786,12 +2018,12 @@ if mode == "📝 พนักงานจดมิเตอร์":
 
         tabs = st.tabs(["📷 ถ่ายด้วยกล้อง", "🖼️ อัปโหลดรูป QR (สำหรับทำบนคอม)"])
         with tabs[0]:
-            qr_pic = st.camera_input("ถ่าย QR ให้ชัด", key="emp_qr_cam")
+            qr_pic = st.camera_input("ถ่าย QR ให้ชัด", key=f"emp_qr_cam_{st.session_state.emp_nonce}")
         with tabs[1]:
             qr_upload = st.file_uploader(
                 "อัปโหลดรูป QR (jpg/png)",
                 type=["jpg", "jpeg", "png"],
-                key="emp_qr_upload",
+                key=f"emp_qr_upload_{st.session_state.emp_nonce}",
                 help="เหมาะสำหรับกรณีทำงานบนคอม/ไม่มี camera_input"
             )
 
@@ -1804,6 +2036,7 @@ if mode == "📝 พนักงานจดมิเตอร์":
         if qr_bytes:
             pid = decode_qr(qr_bytes)
             if pid:
+                reset_emp_meter_state()
                 st.session_state.emp_point_id = pid
                 st.session_state.emp_step = "INPUT"
                 st.rerun()
@@ -1815,6 +2048,7 @@ if mode == "📝 พนักงานจดมิเตอร์":
             manual_pid = st.text_input("พิมพ์ point_id", key="emp_manual_pid")
             if st.button("ยืนยันรหัส", use_container_width=True, key="emp_manual_ok"):
                 if manual_pid.strip():
+                    reset_emp_meter_state()
                     st.session_state.emp_point_id = manual_pid.strip().upper()
                     st.session_state.emp_step = "INPUT"
                     st.rerun()
@@ -1888,6 +2122,7 @@ if mode == "📝 พนักงานจดมิเตอร์":
             st.caption(config.get("name"))
         st.markdown(f"💾 บันทึกลงคอลัมน์: <span class='report-badge'>{report_col}</span>", unsafe_allow_html=True)
         if st.button("🔁 เปลี่ยนจุด (สแกนใหม่)", use_container_width=True, key="emp_change_point"):
+            reset_emp_meter_state()
             st.session_state.emp_step = "SCAN_QR"
             st.session_state.emp_point_id = ""
             st.session_state.confirm_mode = False
@@ -1910,10 +2145,14 @@ if mode == "📝 พนักงานจดมิเตอร์":
     tab_cam, tab_up = st.tabs(["📷 ถ่ายรูป", "📂 อัปโหลด"])
 
     with tab_cam:
-        img_cam = st.camera_input("ถ่ายภาพมิเตอร์", key="emp_meter_cam")
+        img_cam = st.camera_input("ถ่ายภาพมิเตอร์", key=f"emp_meter_cam_{st.session_state.emp_nonce}")
 
     with tab_up:
-        img_up = st.file_uploader("เลือกรูปภาพ", type=['jpg', 'png', 'jpeg'], key="emp_meter_upload")
+        img_up = st.file_uploader(
+            "เลือกรูปภาพ",
+            type=['jpg', 'png', 'jpeg'],
+            key=f"emp_meter_upload_{st.session_state.emp_nonce}"
+        )
         if img_up is not None:
             st.image(img_up, caption=f"รูปที่เลือก: {getattr(img_up, 'name', 'upload')}", use_container_width=True)
 
@@ -1927,6 +2166,8 @@ if mode == "📝 พนักงานจดมิเตอร์":
         st.session_state.emp_ai_value = None
     if "emp_img_hash" not in st.session_state:
         st.session_state.emp_img_hash = ""
+    if "emp_ai_msg" not in st.session_state:
+         st.session_state.emp_ai_msg = ""
 
     if img_file is None:
         st.info("📷 ถ่ายรูป (หรืออัปโหลดรูป) แล้ว AI จะอ่านค่าให้เองอัตโนมัติ")
@@ -1939,7 +2180,17 @@ if mode == "📝 พนักงานจดมิเตอร์":
     if img_hash != st.session_state.emp_img_hash:
         st.session_state.emp_img_hash = img_hash
         with st.spinner("🤖 AI กำลังอ่านค่า..."):
-            st.session_state.emp_ai_value = float(ocr_process(img_bytes, config, debug=False))
+            best, cand = ocr_process(img_bytes, config, debug=False, return_candidates=True)
+            
+            # ✅ ใช้ History Guard เฉพาะมิเตอร์สะสม (ไม่กระทบจุดอื่น)
+            best2, msg = best, ""
+            try:
+                best2, msg = apply_history_guard(point_id, best, cand, config, selected_date)
+            except Exception:
+                best2, msg = best, ""
+                
+            st.session_state.emp_ai_value = float(best2)
+            st.session_state.emp_ai_msg = msg
 
     # --- FIX: กันค่า AI ติดลบไม่ให้ st.number_input ล้ม ---
     ai_val = float(st.session_state.emp_ai_value or 0.0)
@@ -1950,6 +2201,8 @@ if mode == "📝 พนักงานจดมิเตอร์":
         st.warning("⚠️ AI อ่านค่าได้ติดลบ (น่าจะอ่านผิด) — ระบบจะให้แก้เองก่อนบันทึก")
 
     st.write(f"🤖 **AI เสนอค่า:** {fmt % ai_val}")
+    if st.session_state.get("emp_ai_msg"):
+        st.info(st.session_state.emp_ai_msg)
 
     choice = st.radio(
         "จะบันทึกค่าไหน?",
@@ -1992,8 +2245,7 @@ if mode == "📝 พนักงานจดมิเตอร์":
                 st.success("✅ บันทึกสำเร็จ")
 
                 # ไปจุดถัดไป
-                st.session_state.emp_ai_value = None
-                st.session_state.emp_img_hash = ""
+                reset_emp_meter_state()
                 st.session_state.emp_step = "SCAN_QR"
                 st.session_state.emp_point_id = ""
                 st.rerun()
@@ -2003,8 +2255,7 @@ if mode == "📝 พนักงานจดมิเตอร์":
             st.error(f"❌ บันทึกไม่สำเร็จ: {e}")
 
     if col_retry.button("🔁 ถ่าย/เลือกใหม่", use_container_width=True):
-        st.session_state.emp_ai_value = None
-        st.session_state.emp_img_hash = ""
+        reset_emp_meter_state()
         st.rerun()
 
 elif mode == "🖥️ Dashboard Screenshot (OCR)":
