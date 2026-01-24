@@ -466,6 +466,110 @@ def append_rows_dailyreadings_batch(rows: list):
         return True, f"APPENDED {len(rows)}"
     except Exception as e:
         return False, str(e)
+        
+# =========================================================
+# --- ✅ WATERREPORT PROGRESS (92 จุด) ---
+# =========================================================
+@st.cache_data(ttl=60)
+def get_waterreport_progress_snapshot(target_date):
+    """
+    เช็คความคืบหน้าการลงค่าใน REAL_REPORT_SHEET ของ 'วันนั้น'
+    - นับจาก PointsMaster เฉพาะ point ที่มี report_col จริง (ไม่ใช่ -)
+    - อ่าน row ของวันนั้นครั้งเดียว แล้วไล่เช็คคอลัมน์
+    คืน dict:
+      ok, total, filled, missing(list[dict]), done_set(set),
+      value_map(dict pid->cell_value), sheet_title, row, asof, error
+    """
+    # 1) เตรียมรายการจุดที่ต้องลง (จาก PointsMaster)
+    pm = load_points_master() or []
+    expected = []
+    for it in pm:
+        pid = str(it.get("point_id", "")).strip().upper()
+        report_col = str(it.get("report_col", "")).strip()
+        if not pid:
+            continue
+        if (not report_col) or (report_col in ("-", "—", "–")):
+            continue
+        expected.append({
+            "point_id": pid,
+            "report_col": report_col,
+            "name": str(it.get("name", "") or "").strip()
+         })
+    total = len(expected)
+
+    # 2) เปิด WaterReport + หาแท็บเดือน
+    try:
+        sh = _with_retry(gc.open, REAL_REPORT_SHEET)
+    except Exception as e:
+        return {
+            "ok": False, "total": total, "filled": 0, "missing": expected,
+            "done_set": set(), "value_map": {},
+            "sheet_title": None, "row": None,
+            "asof": get_thai_time().strftime("%Y-%m-%d %H:%M:%S"),
+            "error": f"open REAL_REPORT_SHEET failed: {e}"
+         }
+        
+    sheet_name = None
+    try:
+        sheet_name = get_thai_sheet_name(sh, target_date)
+    except Exception:
+        sheet_name = None
+
+    try:
+         ws = _with_retry(sh.worksheet, sheet_name) if sheet_name else _with_retry(sh.get_worksheet, 0)
+    except Exception as e:
+        return {
+            "ok": False, "total": total, "filled": 0, "missing": expected,
+            "done_set": set(), "value_map": {},
+            "sheet_title": sheet_name, "row": None,
+            "asof": get_thai_time().strftime("%Y-%m-%d %H:%M:%S"),
+            "error": f"open worksheet failed: {e}"
+        }
+    # 3) อ่านแถวของวันนั้นครั้งเดียว
+    try:
+        target_row = 6 + int(target_date.day)
+    except Exception:
+        target_row = 7
+
+    try:
+        row_vals = _with_retry(ws.row_values, target_row)  # list[str]
+    except Exception as e:
+        return {
+            "ok": False, "total": total, "filled": 0, "missing": expected,
+            "done_set": set(), "value_map": {},
+            "sheet_title": ws.title, "row": target_row,
+            "asof": get_thai_time().strftime("%Y-%m-%d %H:%M:%S"),
+            "error": f"read row_values failed: {e}"
+        }
+
+    done_set = set()
+    value_map = {}
+    missing = []
+
+    for it in expected:
+        pid = it["point_id"]
+        col_idx = col_to_index(it["report_col"])
+        existing = row_vals[col_idx - 1] if (col_idx - 1) < len(row_vals) else ""
+        if str(existing).strip() != "":
+            done_set.add(pid)
+            value_map[pid] = existing
+        else:
+            missing.append(it)
+
+    filled = len(done_set)
+
+    return {
+        "ok": True,
+        "total": total,
+        "filled": filled,
+        "missing": missing,
+        "done_set": done_set,
+        "value_map": value_map,
+        "sheet_title": ws.title,
+        "row": target_row,
+        "asof": get_thai_time().strftime("%Y-%m-%d %H:%M:%S"),
+        "error": ""
+    }
 
 def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, target_date, image_url="-"):
     try:
@@ -2004,6 +2108,49 @@ if mode == "📝 พนักงานจดมิเตอร์":
             key="emp_date"
         )
 
+    # =========================================================
+    # ✅ (2) Progress + Missing Alert (Sidebar)
+    # =========================================================
+    prog = get_waterreport_progress_snapshot(selected_date)
+    done_set = set(prog.get("done_set") or [])
+    done_val_map = dict(prog.get("value_map") or {})
+    total = int(prog.get("total", 0) or 0)
+    filled = int(prog.get("filled", 0) or 0)
+    ratio = (filled / total) if total else 0.0
+
+    st.sidebar.markdown("## ✅ ความคืบหน้าการลงค่า (วันนี้)")
+    st.sidebar.progress(ratio)
+    st.sidebar.write(f"ลงแล้ว **{filled}/{total} จุด** ({ratio*100:.1f}%)")
+
+    if prog.get("ok"):
+        st.sidebar.caption(f"Sheet: {prog.get('sheet_title')} | Row: {prog.get('row')} | อัปเดต: {prog.get('asof')}")
+    else:
+        st.sidebar.error("อ่านความคืบหน้าไม่สำเร็จ")
+        st.sidebar.caption(str(prog.get("error", ""))[:300])
+
+    missing_list = prog.get("missing") or []
+    if missing_list:
+        with st.sidebar.expander(f"🚨 ยังไม่ลง ({len(missing_list)}) จุด", expanded=False):
+            show_n = 40
+            for m in missing_list[:show_n]:
+                nm = m.get("name") or ""
+                st.write(f"- {m['point_id']}" + (f" — {nm}" if nm else ""))
+            if len(missing_list) > show_n:
+                st.caption(f"...อีก {len(missing_list)-show_n} จุด")
+
+        # Quick jump ไปจุดที่ยังไม่ลง (ช่วยให้ทีมทำงานเร็วขึ้น)
+        miss_ids = [m["point_id"] for m in missing_list if m.get("point_id")]
+        jump_pid = st.sidebar.selectbox("ไปยังจุดที่ยังไม่ลง", options=["(เลือก)"] + miss_ids, key="emp_jump_missing")
+        if st.sidebar.button("➡️ ไปจุดนี้", use_container_width=True, key="emp_jump_btn"):
+            if jump_pid != "(เลือก)":
+                reset_emp_meter_state()
+                st.session_state.emp_point_id = str(jump_pid).strip().upper()
+                st.session_state.emp_step = "INPUT"
+                st.session_state.confirm_mode = False
+                st.rerun()
+    else:
+        st.sidebar.success("ครบแล้ว 🎉")
+ 
     # ถ้าอยู่โหมด mismatch confirm ให้ล็อกอยู่จุดเดิม
     if st.session_state.get("confirm_mode", False):
         st.session_state.emp_point_id = st.session_state.get("last_point_id", st.session_state.emp_point_id)
@@ -2113,6 +2260,18 @@ if mode == "📝 พนักงานจดมิเตอร์":
     report_col = str(config.get('report_col', '-') or '-').strip()
     meter_type = infer_meter_type(config)
 
+    # =========================================================
+    # ✅ (3) Duplicate Guard: เตือนถ้าวันนี้ลงค่าใน WaterReport แล้ว
+    # =========================================================
+    pid_u = str(point_id).strip().upper()
+    if pid_u in done_set:
+        existing_val = done_val_map.get(pid_u, "")
+        st.warning(
+            f"⚠️ จุดนี้มีค่าถูกลงใน WaterReport ของวันที่ {selected_date.strftime('%Y-%m-%d')} แล้ว"
+            + (f" (ค่าในช่องตอนนี้: {existing_val})" if str(existing_val).strip() else "")
+            + "\n\nถ้าจะลงซ้ำ กรุณาตรวจสอบก่อน (หรือไปทำจุดที่ยังไม่ลงจาก sidebar)"
+        )
+        
     st.write("---")
     c1, c2 = st.columns([2, 1])
 
