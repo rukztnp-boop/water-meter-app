@@ -480,22 +480,35 @@ def get_waterreport_progress_snapshot(target_date):
       ok, total, filled, missing(list[dict]), done_set(set),
       value_map(dict pid->cell_value), sheet_title, row, asof, error
     """
-    # 1) เตรียมรายการจุดที่ต้องลง (จาก PointsMaster)
+    # 1) เตรียมรายการจุดทั้งหมด (จาก PointsMaster) -> total = ทุก point_id (เช่น 92)
     pm = load_points_master() or []
-    expected = []
+    expected_all = []       # ✅ เอาไว้เป็นตัวหาร (นับทุก point_id)
+    expected_report = []    # ✅ เฉพาะจุดที่มี report_col จริง (เช็ค WaterReport ได้)
+    missing_config = []     # ✅ จุดที่ยังไม่ตั้ง report_col
+    
+    seen = set()
     for it in pm:
         pid = str(it.get("point_id", "")).strip().upper()
-        report_col = str(it.get("report_col", "")).strip()
         if not pid:
             continue
-        if (not report_col) or (report_col in ("-", "—", "–")):
+        if pid in seen:
             continue
-        expected.append({
-            "point_id": pid,
-            "report_col": report_col,
-            "name": str(it.get("name", "") or "").strip()
-         })
-    total = len(expected)
+        seen.add(pid)
+        
+        report_col = str(it.get("report_col", "")).strip()
+        name = str(it.get("name", "") or "").strip()
+        
+        rec = {"point_id": pid, "report_col": report_col, "name": name}
+        expected_all.append(rec)
+        
+        if report_col and report_col not in ("-", "—", "–"):
+            expected_report.append(rec)
+        else:
+            missing_config.append({**rec, "reason": "NO_REPORT_COL"})
+        
+    total_all = len(expected_all)          # ✅ เช่น 92
+    otal_report = len(expected_report)    # ✅ เช่น 87
+
 
     # 2) เปิด WaterReport + หาแท็บเดือน
     try:
@@ -546,7 +559,8 @@ def get_waterreport_progress_snapshot(target_date):
     value_map = {}
     missing = []
 
-    for it in expected:
+    # ✅ เปลี่ยนจาก expected -> expected_report
+    for it in expected_report:
         pid = it["point_id"]
         col_idx = col_to_index(it["report_col"])
         existing = row_vals[col_idx - 1] if (col_idx - 1) < len(row_vals) else ""
@@ -554,13 +568,15 @@ def get_waterreport_progress_snapshot(target_date):
             done_set.add(pid)
             value_map[pid] = existing
         else:
-            missing.append(it)
+            missing_report.append(it)
 
     filled = len(done_set)
 
     return {
         "ok": True,
-        "total": total,
+        "total": total_all, 
+        "total_report": total_report,
+        "config_missing": len(missing_config),
         "filled": filled,
         "missing": missing,
         "done_set": done_set,
@@ -2117,6 +2133,10 @@ if mode == "📝 พนักงานจดมิเตอร์":
     total = int(prog.get("total", 0) or 0)
     filled = int(prog.get("filled", 0) or 0)
     ratio = (filled / total) if total else 0.0
+    st.sidebar.caption(
+        f"ตั้ง report_col แล้ว: {int(prog.get('total_report',0) or 0)} | "
+        f"ยังไม่ตั้ง: {int(prog.get('config_missing',0) or 0)}"
+    )
 
     st.sidebar.markdown("## ✅ ความคืบหน้าการลงค่า (วันนี้)")
     st.sidebar.progress(ratio)
