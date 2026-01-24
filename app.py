@@ -568,7 +568,7 @@ def get_waterreport_progress_snapshot(target_date):
             done_set.add(pid)
             value_map[pid] = existing
         else:
-            missing_report.append(it)
+            missing.append(it)
 
     filled = len(done_set)
 
