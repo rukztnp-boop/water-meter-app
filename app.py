@@ -575,7 +575,7 @@ def get_waterreport_progress_snapshot(target_date):
     return {
         "ok": True,
         "total": total_all, 
-        "total_report": total_report,
+         "total": total,
         "config_missing": len(missing_config),
         "filled": filled,
         "missing": missing,
