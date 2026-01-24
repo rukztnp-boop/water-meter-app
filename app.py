@@ -474,54 +474,62 @@ def append_rows_dailyreadings_batch(rows: list):
 def get_waterreport_progress_snapshot(target_date):
     """
     เช็คความคืบหน้าการลงค่าใน REAL_REPORT_SHEET ของ 'วันนั้น'
-    - นับจาก PointsMaster เฉพาะ point ที่มี report_col จริง (ไม่ใช่ -)
-    - อ่าน row ของวันนั้นครั้งเดียว แล้วไล่เช็คคอลัมน์
-    คืน dict:
-      ok, total, filled, missing(list[dict]), done_set(set),
-      value_map(dict pid->cell_value), sheet_title, row, asof, error
+    - total = จำนวนจุดที่ "ตั้ง report_col แล้ว" (เช็คได้จริงใน WaterReport)
+    - total_all = จำนวน point_id ทั้งหมดใน PointsMaster
     """
-    # 1) เตรียมรายการจุดทั้งหมด (จาก PointsMaster) -> total = ทุก point_id (เช่น 92)
     pm = load_points_master() or []
-    expected_all = []       # ✅ เอาไว้เป็นตัวหาร (นับทุก point_id)
-    expected_report = []    # ✅ เฉพาะจุดที่มี report_col จริง (เช็ค WaterReport ได้)
-    missing_config = []     # ✅ จุดที่ยังไม่ตั้ง report_col
-    
+
+    expected_all = []
+    expected_report = []
+    missing_config = []
     seen = set()
+
     for it in pm:
         pid = str(it.get("point_id", "")).strip().upper()
-        if not pid:
-            continue
-        if pid in seen:
+        if not pid or pid in seen:
             continue
         seen.add(pid)
-        
+
         report_col = str(it.get("report_col", "")).strip()
         name = str(it.get("name", "") or "").strip()
-        
         rec = {"point_id": pid, "report_col": report_col, "name": name}
+
         expected_all.append(rec)
-        
+
         if report_col and report_col not in ("-", "—", "–"):
-            expected_report.append(rec)
+            # กัน report_col แปลเป็นคอลัมน์ไม่ได้
+            if col_to_index(report_col) > 0:
+                expected_report.append(rec)
+            else:
+                missing_config.append({**rec, "reason": "BAD_REPORT_COL"})
         else:
             missing_config.append({**rec, "reason": "NO_REPORT_COL"})
-        
-    total_all = len(expected_all)          # ✅ เช่น 92
-    otal_report = len(expected_report)    # ✅ เช่น 87
 
+    total_all = len(expected_all)
+    total_report = len(expected_report)
+    asof = get_thai_time().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 2) เปิด WaterReport + หาแท็บเดือน
+    # --- open spreadsheet ---
     try:
         sh = _with_retry(gc.open, REAL_REPORT_SHEET)
     except Exception as e:
         return {
-            "ok": False, "total": total, "filled": 0, "missing": expected,
-            "done_set": set(), "value_map": {},
-            "sheet_title": None, "row": None,
-            "asof": get_thai_time().strftime("%Y-%m-%d %H:%M:%S"),
-            "error": f"open REAL_REPORT_SHEET failed: {e}"
-         }
-        
+            "ok": False,
+            "total": total_report,
+            "total_report": total_report,
+            "total_all": total_all,
+            "config_missing": len(missing_config),
+            "filled": 0,
+            "missing": expected_report,
+            "done_set": set(),
+            "value_map": {},
+            "sheet_title": None,
+            "row": None,
+            "asof": asof,
+            "error": f"open REAL_REPORT_SHEET failed: {e}",
+        }
+
+    # --- find month sheet ---
     sheet_name = None
     try:
         sheet_name = get_thai_sheet_name(sh, target_date)
@@ -529,40 +537,60 @@ def get_waterreport_progress_snapshot(target_date):
         sheet_name = None
 
     try:
-         ws = _with_retry(sh.worksheet, sheet_name) if sheet_name else _with_retry(sh.get_worksheet, 0)
+        ws = _with_retry(sh.worksheet, sheet_name) if sheet_name else _with_retry(sh.get_worksheet, 0)
     except Exception as e:
         return {
-            "ok": False, "total": total, "filled": 0, "missing": expected,
-            "done_set": set(), "value_map": {},
-            "sheet_title": sheet_name, "row": None,
-            "asof": get_thai_time().strftime("%Y-%m-%d %H:%M:%S"),
-            "error": f"open worksheet failed: {e}"
+            "ok": False,
+            "total": total_report,
+            "total_report": total_report,
+            "total_all": total_all,
+            "config_missing": len(missing_config),
+            "filled": 0,
+            "missing": expected_report,
+            "done_set": set(),
+            "value_map": {},
+            "sheet_title": sheet_name,
+            "row": None,
+            "asof": asof,
+            "error": f"open worksheet failed: {e}",
         }
-    # 3) อ่านแถวของวันนั้นครั้งเดียว
+
+    # --- read row of day ---
     try:
         target_row = 6 + int(target_date.day)
     except Exception:
         target_row = 7
 
     try:
-        row_vals = _with_retry(ws.row_values, target_row)  # list[str]
+        row_vals = _with_retry(ws.row_values, target_row)
     except Exception as e:
         return {
-            "ok": False, "total": total, "filled": 0, "missing": expected,
-            "done_set": set(), "value_map": {},
-            "sheet_title": ws.title, "row": target_row,
-            "asof": get_thai_time().strftime("%Y-%m-%d %H:%M:%S"),
-            "error": f"read row_values failed: {e}"
+            "ok": False,
+            "total": total_report,
+            "total_report": total_report,
+            "total_all": total_all,
+            "config_missing": len(missing_config),
+            "filled": 0,
+            "missing": expected_report,
+            "done_set": set(),
+            "value_map": {},
+            "sheet_title": ws.title,
+            "row": target_row,
+            "asof": asof,
+            "error": f"read row_values failed: {e}",
         }
 
     done_set = set()
     value_map = {}
     missing = []
 
-    # ✅ เปลี่ยนจาก expected -> expected_report
     for it in expected_report:
         pid = it["point_id"]
         col_idx = col_to_index(it["report_col"])
+        if col_idx <= 0:
+            missing.append({**it, "reason": "BAD_REPORT_COL"})
+            continue
+
         existing = row_vals[col_idx - 1] if (col_idx - 1) < len(row_vals) else ""
         if str(existing).strip() != "":
             done_set.add(pid)
@@ -574,8 +602,9 @@ def get_waterreport_progress_snapshot(target_date):
 
     return {
         "ok": True,
-        "total": total_all, 
-         "total": total,
+        "total": total_report,
+        "total_report": total_report,
+        "total_all": total_all,
         "config_missing": len(missing_config),
         "filled": filled,
         "missing": missing,
@@ -583,8 +612,8 @@ def get_waterreport_progress_snapshot(target_date):
         "value_map": value_map,
         "sheet_title": ws.title,
         "row": target_row,
-        "asof": get_thai_time().strftime("%Y-%m-%d %H:%M:%S"),
-        "error": ""
+        "asof": asof,
+        "error": "",
     }
 
 def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, target_date, image_url="-"):
