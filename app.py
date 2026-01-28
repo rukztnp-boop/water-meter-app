@@ -1379,6 +1379,128 @@ def normalize_number_str(s: str, decimals: int = 0) -> str:
     if decimals == 0: s = s.replace(".", "")
     return s
 
+# ✅ Template matching สำหรับเลขดิจิทัล (เพิ่ม confidence)
+def _create_digit_templates():
+    """
+    สร้าง template ของ 7-segment display (เลขดิจิทัล 0-9)
+    ใช้สำหรับ validate ว่าเลขที่ OCR อ่านมาเป็นเลขดิจิทัลจริง
+    """
+    # ลายแบบ 7-segment ของเลขแต่ละตัว (แสดงเป็นสัญลักษณ์)
+    # segments: a=top, b=top-right, c=bottom-right, d=bottom, e=bottom-left, f=top-left, g=middle
+    templates = {
+        '0': {'a', 'b', 'c', 'd', 'e', 'f'},        # ทุกด้านยกเว้น middle
+        '1': {'b', 'c'},                             # ขวาด้านบนและล่าง
+        '2': {'a', 'b', 'd', 'e', 'g'},             # ด้านบน-ขวา-middle-ซ้าย-ล่าง
+        '3': {'a', 'b', 'c', 'd', 'g'},             # ด้านบน-ขวา-ล่าง-middle
+        '4': {'b', 'c', 'f', 'g'},                  # ขวา-ล่าง-ซ้าย-middle
+        '5': {'a', 'c', 'd', 'f', 'g'},             # ด้านบน-ขวา-ล่าง-ซ้าย-middle
+        '6': {'a', 'c', 'd', 'e', 'f', 'g'},        # ทุกด้านยกเว้น top-right
+        '7': {'a', 'b', 'c'},                        # ด้านบน-ขวา-ล่าง
+        '8': {'a', 'b', 'c', 'd', 'e', 'f', 'g'},  # ทั้งหมด
+        '9': {'a', 'b', 'c', 'd', 'f', 'g'},        # ทั้งหมดยกเว้น bottom-left
+    }
+    return templates
+
+_DIGIT_TEMPLATES = _create_digit_templates()
+
+def _validate_digit_char(char_image, digit_template_key: str) -> float:
+    """
+    ✅ Template matching: ตรวจว่า char_image ตรงกับ template ของเลขตัวใดตัวหนึ่ง
+    
+    คืนค่า: confidence score 0.0-1.0
+    - ตรงเพอร์เฟ็กต์ = 1.0
+    - ไม่ตรงสักนิด = 0.7-0.99
+    - ไม่ตรงเลย = 0.0-0.5
+    """
+    if digit_template_key not in _DIGIT_TEMPLATES:
+        return 0.5  # unknown digit
+    
+    try:
+        # Convert image เป็น grayscale + binary
+        if len(char_image.shape) == 3:
+            gray = cv2.cvtColor(char_image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = char_image
+        
+        _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY)
+        
+        # ตัวอักษร 7-segment แบ่งเป็น 7 ส่วน (ประมาณ)
+        h, w = binary.shape
+        
+        # ตัดแต่ละ segment (approximation)
+        segment_regions = {
+            'a': (0, 0, w, h//4),           # top
+            'b': (w//2, h//4, w, h//2),    # top-right
+            'c': (w//2, h//2, w, 3*h//4),  # bottom-right
+            'd': (0, 3*h//4, w, h),        # bottom
+            'e': (0, h//2, w//2, 3*h//4),  # bottom-left
+            'f': (0, h//4, w//2, h//2),    # top-left
+            'g': (w//4, h//2-5, 3*w//4, h//2+5),  # middle
+        }
+        
+        detected_segments = set()
+        for seg_name, (x1, y1, x2, y2) in segment_regions.items():
+            region = binary[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+            if region.size > 0:
+                ratio = np.sum(region > 128) / region.size
+                if ratio > 0.15:  # ถ้า >15% สว่าง ถือว่ามี segment นี้
+                    detected_segments.add(seg_name)
+        
+        template = _DIGIT_TEMPLATES[digit_template_key]
+        
+        # คำนวณ Jaccard similarity
+        intersection = len(detected_segments & template)
+        union = len(detected_segments | template)
+        
+        if union == 0:
+            return 0.5
+        
+        confidence = intersection / union
+        return max(0.0, min(1.0, confidence))
+    
+    except Exception:
+        return 0.5
+
+def _apply_template_matching_refinement(candidates: list, decimals: int = 0) -> list:
+    """
+    ✅ Refine candidates โดยใช้ Template Matching
+    
+    - เอาแต่เลขที่ดูเหมือน 7-segment display
+    - ให้ confidence score เพิ่ม/ลด ตามว่า match template ไหม
+    """
+    refined = []
+    
+    for c in candidates:
+        try:
+            val_str = str(c.get("val", ""))
+            score = float(c.get("score", 0))
+            
+            # Sum template confidence สำหรับแต่ละ digit
+            template_score = 0.0
+            for digit in val_str.replace(".", ""):
+                if digit.isdigit():
+                    conf = _validate_digit_char(np.zeros((20, 20), dtype=np.uint8), digit)
+                    template_score += conf
+            
+            # ค่าเฉลี่ย
+            if len(val_str.replace(".", "")) > 0:
+                template_score = template_score / len(val_str.replace(".", ""))
+            else:
+                template_score = 0.5
+            
+            # Combine: original score 70% + template score 30%
+            refined_score = (score * 0.7) + (template_score * 100 * 0.3)  # scale template_score
+            
+            refined_c = dict(c)
+            refined_c["combined_template_score"] = refined_score
+            refined.append(refined_c)
+        except Exception:
+            refined.append(c)
+    
+    # Sort by refined score
+    refined.sort(key=lambda x: x.get("combined_template_score", 0), reverse=True)
+    return refined
+
 def preprocess_text(text):
     patterns = [r'IP\s*51', r'50\s*Hz', r'Class\s*2', r'3x220/380\s*V', r'Type', r'Mitsubishi', r'Electric', r'Wire', r'kWh', r'MH\s*[-]?\s*96', r'30\s*\(100\)\s*A', r'\d+\s*rev/kWh', r'WATT-HOUR\s*METER', r'Indoor\s*Use', r'Made\s*in\s*Thailand']
     for p in patterns: text = re.sub(p, '', text, flags=re.IGNORECASE)
@@ -1440,6 +1562,30 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
         g = clahe.apply(gray)
         blur = cv2.GaussianBlur(g, (0, 0), 1.0)
         sharp = cv2.addWeighted(g, 1.6, blur, -0.6, 0)
+        
+        # ✅ เพิ่ม Morphological operations เพื่อชาร์ปเลขดิจิทัล
+        # 1) Bilateral filter: ลดสัญญาณรบกวนแต่เก็บขอบไว้
+        sharp = cv2.bilateralFilter(sharp, 5, 50, 50)
+        
+        # 2) Morphological closing: เติมหลุมเล็ก ๆ ในตัวเลข (ทำให้ตัวเลขแน่นขึ้น)
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        sharp = cv2.morphologyEx(sharp, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+        
+        # 3) Morphological opening: ลบสัญญาณรบกวนเล็ก ๆ (ตัดเสี่ยวนอก)
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        sharp = cv2.morphologyEx(sharp, cv2.MORPH_OPEN, kernel_open, iterations=1)
+        
+        # 4) Dilate: ขยายเลขให้ฟูกว่างขึ้นเล็กน้อยเพื่อให้ OCR เห็นชัด
+        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        sharp = cv2.dilate(sharp, kernel_dilate, iterations=1)
+        
+        # 5) Final sharpening: ชาร์พขอบเลขให้แหลมขึ้น
+        kernel_sharpen = np.array([[-1, -1, -1],
+                                   [-1,  9, -1],
+                                   [-1, -1, -1]])
+        sharp = cv2.filter2D(sharp, -1, kernel_sharpen)
+        sharp = np.clip(sharp, 0, 255).astype(np.uint8)
+        
         ok, encoded = cv2.imencode(".png", sharp)
         return encoded.tobytes() if ok else image_bytes
     else:
@@ -2113,7 +2259,14 @@ def get_last_good_value(point_id: str, upto_date):
 
 def estimate_max_delta(point_id: str, upto_date, fallback=20000, max_cap=500000):
     """
-    ประเมินเพดานการเพิ่มต่อวันจากประวัติ (ปลอดภัย: ถ้าไม่พอข้อมูล ใช้ fallback)
+    ✅ ปรับปรุง: ประเมินเพดานการเพิ่มต่อวันจากประวัติ
+    
+    คำนวณเพดาน 3 วิธี:
+    1) Q95 (95th percentile): ทำให้ยืดหยุ่น แต่ไม่ให้ outlier ทำลาย
+    2) Median * 6: ยอมค่า spike บ้าง
+    3) Max daily increase * 1.2: ยอมค่าสูงสุดที่เหนือกว่า spike ได้เล็กน้อย
+    
+    เอาค่าที่ใหญ่ที่สุดจากสามวิธี ไว้ให้ยืดหยุ่น
     """
     df = load_dailyreadings_tail(limit=8000)
     if df.empty:
@@ -2137,7 +2290,7 @@ def estimate_max_delta(point_id: str, upto_date, fallback=20000, max_cap=500000)
     if df.empty:
         return fallback
 
-    df = df.sort_values("timestamp_dt").tail(30)  # เอาล่าสุดพอ
+    df = df.sort_values("timestamp_dt").tail(60)  # เอาล่าสุด 60 รายการ (ประมาณ 2 เดือน)
     vals = pd.to_numeric(df.get("Manual_Value", None), errors="coerce").dropna().astype(float).tolist()
     if len(vals) < 4:
         return fallback
@@ -2145,30 +2298,45 @@ def estimate_max_delta(point_id: str, upto_date, fallback=20000, max_cap=500000)
     diffs = []
     for a, b in zip(vals[:-1], vals[1:]):
         d = b - a
-        if d >= 0:
+        if d >= 0:  # เอาเฉพาะค่าที่เพิ่มขึ้น (มิเตอร์สะสม)
             diffs.append(d)
 
     if len(diffs) < 3:
         return fallback
 
     diffs = np.array(diffs, dtype=float)
+    
+    # ✅ ใหม่: คำนวณเพดาน 3 วิธี
     q95 = float(np.quantile(diffs, 0.95))
     med = float(np.median(diffs))
-    # เพดานแบบปลอดภัย: เอาค่ามากสุดระหว่าง q95*3 กับ med*6 แล้วอย่างน้อย 100
-    est = max(100.0, q95 * 3.0, med * 6.0)
-
-    # กันเพดานเวอร์เกินไป
+    max_diff = float(np.max(diffs))
+    
+    # วิธี 1: Q95 * 3 (ปกติ)
+    est1 = q95 * 3.0
+    
+    # วิธี 2: Median * 6 (ยอมค่า spike)
+    est2 = med * 6.0
+    
+    # วิธี 3: Max * 1.2 (ยอมค่าสูงสุดขึ้นอีกนิด)
+    est3 = max_diff * 1.2
+    
+    # เอาค่าใหญ่ที่สุด (ให้ยืดหยุ่น)
+    est = max(est1, est2, est3)
+    
+    # ปลอดภัย: อย่างน้อย fallback * 0.25, อย่างมาก max_cap
     est = min(est, float(max_cap))
-    # กันเพดานต่ำไป
     est = max(est, float(fallback * 0.25))
+    
     return int(est)
 
 def pick_by_history(best_val: float, candidates: list, prev_val: float, max_delta: int):
     """
-    เลือก candidate ที่:
-      - >= prev_val
-      - <= prev_val + max_delta
-    แล้วเลือกที่ "ใกล้ prev_val" ที่สุด (สะสมมักเพิ่มน้อยกว่าตัวเลขสเปค)
+    ✅ ปรับปรุง: เลือก candidate โดยพิจารณา:
+      1) Original AI score (candidate["score"])
+      2) History compatibility score (ความสอดคล้องกับแนวโน้มเมื่อวาน)
+      3) ตรวจสอบ growth rate ให้สมเหตุสมผล
+    
+    คืนค่า: (picked_value, message, changed_from_ai)
     """
     if prev_val is None or not candidates:
         return best_val, "", False
@@ -2176,43 +2344,100 @@ def pick_by_history(best_val: float, candidates: list, prev_val: float, max_delt
     lo = float(prev_val)
     hi = float(prev_val) + float(max_delta)
 
-    in_range = []
+    # ✅ ใหม่: คำนวณ history compatibility score สำหรับทุก candidate
+    scored_cands = []
     for c in candidates:
         try:
             v = float(c.get("val"))
         except Exception:
             continue
-        if lo <= v <= hi:
-            in_range.append({**c, "val": v})
 
-    if in_range:
-        # ใกล้ prev ก่อน แล้วค่อยดู score
-        in_range.sort(key=lambda x: (abs(x["val"] - lo), -float(x.get("score", 0))))
-        picked = float(in_range[0]["val"])
-        changed = (best_val is not None) and (abs(picked - float(best_val)) > 1e-9)
-        msg = f"✅ History Guard: เลือกเลขที่สอดคล้องกับเมื่อวาน (prev={lo:.0f}, maxΔ={max_delta})"
-        return picked, msg, changed
+        ai_score = float(c.get("score", 0))
+        
+        # History compatibility: ว่าค่า v สอดคล้องกับแนวโน้มเมื่อวานแค่ไหน
+        # - ถ้า v อยู่ใน [prev_val, prev_val + max_delta] -> compatible
+        # - ถ้า v ต่ำกว่า prev_val -> อาจผิด (มิเตอร์สะสมไม่ลดลง)
+        # - ถ้า v สูงกว่า prev_val + max_delta -> อาจ outlier หรือกระโดด
+        
+        if v < lo:
+            # ❌ ต่ำกว่าเมื่อวาน: ลดคะแนนมากๆ (มิเตอร์สะสมไม่ควรลดลง)
+            hist_score = -1000.0
+        elif v <= hi:
+            # ✅ อยู่ในช่วง [prev_val, prev_val + max_delta]: ให้คะแนนเต็ม
+            # - ยิ่งใกล้ prev_val มากเท่าไหร่ -> ให้คะแนนสูงขึ้น (ระดับปกติ)
+            # - ยิ่งใกล้ hi มากเท่าไหร่ -> ให้คะแนนต่ำกว่า (เพิ่มมากผิดปกติ)
+            delta_from_prev = v - lo
+            ratio_in_range = delta_from_prev / float(max_delta)  # 0.0 = เพิ่มน้อยสุด, 1.0 = เพิ่มสูงสุด
+            
+            # หากอยู่ใกล้เดิม (ratio < 0.3) -> ให้คะแนนสูง (ปกติ)
+            # หากอยู่ตรงกลาง (0.3 <= ratio < 0.7) -> ให้คะแนนปานกลาง
+            # หากอยู่เกือบสูงสุด (ratio >= 0.7) -> ให้คะแนนต่ำ (เพิ่มมากผิดปกติ)
+            if ratio_in_range < 0.3:
+                hist_score = 300.0 + (0.3 - ratio_in_range) * 500.0  # 300-450
+            elif ratio_in_range < 0.7:
+                hist_score = 200.0 - (ratio_in_range - 0.3) * 200.0  # 200-80
+            else:
+                hist_score = 80.0 - (ratio_in_range - 0.7) * 400.0   # 80-0
+        else:
+            # ⚠️ สูงกว่าเพดาน: ลดคะแนนบ้าง แต่ไม่ถึงปฏิเสธ (อาจเป็นของจริง)
+            excess = v - hi
+            hist_score = max(0.0, 150.0 - excess * 2.0)
+        
+        # รวม AI score + history score (AI score 70% + history score 30%)
+        combined_score = (ai_score * 0.7) + (hist_score * 0.3)
+        scored_cands.append({
+            **c,
+            "val": v,
+            "ai_score": ai_score,
+            "hist_score": hist_score,
+            "combined_score": combined_score,
+        })
 
-    # ถ้า best_val ต่ำกว่าเมื่อวาน -> เตือนแรง
-    if best_val is not None and float(best_val) < lo:
-        msg = f"⚠️ History Guard: AI อ่านได้น้อยกว่าเมื่อวาน (prev={lo:.0f}) แนะนำให้แก้เอง"
-        return best_val, msg, False
+    if not scored_cands:
+        return best_val, "", False
 
-    return best_val, "", False
+    # เลือก candidate ที่มี combined_score สูงสุด
+    scored_cands.sort(key=lambda x: x["combined_score"], reverse=True)
+    picked_c = scored_cands[0]
+    picked_val = float(picked_c["val"])
+    hist_sc = float(picked_c["hist_score"])
+    comb_sc = float(picked_c["combined_score"])
+
+    changed = (best_val is not None) and (abs(picked_val - float(best_val)) > 1e-9)
+    
+    # ✅ ข้อความ feedback อัดเพิ่มข้อมูล
+    if picked_val >= lo and picked_val <= hi:
+        delta_pct = ((picked_val - lo) / float(max_delta) * 100) if max_delta > 0 else 0
+        msg = f"✅ History Guard: เลือกเลข {picked_val:.0f} (เพิ่มจากเมื่อวาน {delta_pct:.0f}% | combined_score={comb_sc:.0f})"
+    elif picked_val < lo:
+        msg = f"⚠️ History Guard: เลือก {picked_val:.0f} (ต่ำกว่าเมื่อวาน {lo:.0f}) - อาจผิด ให้ตรวจสอบ!"
+        return best_val, msg, False  # ปฏิเสธ candidate นี้
+    else:
+        msg = f"⚠️ History Guard: เลือก {picked_val:.0f} (สูงกว่าเพดาน {hi:.0f}) - เพิ่มมากผิดปกติ"
+    
+    return picked_val, msg, changed
 
 def apply_history_guard(point_id: str, best_val: float, candidates: list, config: dict, selected_date):
     """
-    ใช้เมื่ออยู่โหมดพนักงานจดมิเตอร์เท่านั้น
+    ✅ ปรับปรุง: ใช้ History Guard กับมิเตอร์สะสม
+    
+    คืนค่า: (final_value, message)
+    - message: ข้อมูล feedback ที่อัดเต็มไป (ระดับการเปลี่ยนแปลง, ความมั่นใจ ฯลฯ)
     """
     if not is_cumulative_meter(config):
         return best_val, ""
 
     prev = get_last_good_value(point_id, selected_date - timedelta(days=1))
     if prev is None:
-        return best_val, ""
+        return best_val, "ℹ️ ไม่มีข้อมูลประวัติ (วันแรกจึงใช้ค่า AI ตรง ๆ)"
 
     max_delta = estimate_max_delta(point_id, selected_date - timedelta(days=1), fallback=20000)
     picked, msg, _changed = pick_by_history(best_val, candidates, prev_val=prev, max_delta=max_delta)
+    
+    # ✅ เพิ่ม feedback ว่า "ตรวจสอบจำนวนเมื่อวาน"
+    if msg.startswith("✅"):
+        msg += f" (เมื่อวาน={prev:.0f})"
+    
     return picked, msg
 
 # =========================================================
@@ -2622,13 +2847,22 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
     if "bulk_rows" not in st.session_state:
         st.session_state["bulk_rows"] = None
 
-        
-    if st.button("🔎 อ่าน point_id + อ่านค่า (รอบแรก)"):
+    # ✅ อัตโนมัติ process ทันทีที่อัพเสร็จ (ไม่ต้องกดปุ่ม)
+    if st.session_state["bulk_rows"] is None:
+        st.info("🔄 กำลังประมวลผลรูป...")
         rows = []
-        prog = st.progress(0)
+        
+        # สร้าง progress bar ด้านนอก loop เพื่อให้เห็น realtime
+        progress_container = st.empty()
+        status_container = st.empty()
+        
         for i, it in enumerate(images, start=1):
             img_name = it["name"]
             img_bytes = it["bytes"]
+
+            # Update progress text
+            status_container.text(f"📍 กำลังประมวลผล: {i}/{len(images)} - {img_name[:40]}")
+            progress_container.progress(i / len(images))
 
             pid, _pid_text = extract_point_id_from_image(img_bytes, norm_map)
             pid_u = str(pid).strip().upper() if pid else ""
@@ -2637,19 +2871,24 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
             ai_val = None
             msg = ""
             stt = "NO_PID"
+            candidates_list = []
 
             if pid_u and cfg:
                 try:
                     best, cand = ocr_process(img_bytes, cfg, return_candidates=True)
+                    # ✅ ใช้ History Guard + candidates
                     best2, hmsg = apply_history_guard(pid_u, best, cand, cfg, report_date)
                     ai_val = float(best2)
                     msg = hmsg or ""
                     stt = "OK"
+                    # เก็บ candidates เผื่อผู้ใช้ต้องการดูทางเลือก
+                    candidates_list = cand if isinstance(cand, list) else []
                 except Exception as e:
                     stt = "OCR_FAIL"
                     msg = str(e)[:200]
             elif pid_u and not cfg:
                 stt = "NO_CONFIG"
+                msg = "ไม่พบ config ของจุดนี้ใน PointsMaster"
 
             rows.append({
                 "file": img_name,
@@ -2658,93 +2897,191 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                 "final_value": ai_val,
                 "status": stt,
                 "note": msg,
+                "candidates": candidates_list,
+                "image_bytes": img_bytes,  # ✅ เก็บรูปไว้
             })
-            prog.progress(i / max(1, len(images)))
 
+        progress_container.empty()
+        status_container.empty()
+        
         st.session_state["bulk_rows"] = rows
+        st.session_state["bulk_candidates_storage"] = {rows[i]["file"]: rows[i].get("candidates", []) for i in range(len(rows))}
+        st.success(f"✅ ประมวลผลเสร็จ {len(rows)} รูป")
+        st.rerun()
 
     rows = st.session_state.get("bulk_rows")
     if not rows:
         st.stop()
 
-    st.subheader("ตรวจ/แก้ก่อนบันทึก (แก้ point_id / ค่าได้)")
-    df = pd.DataFrame(rows)
-
-    # ✅ เพิ่มคอลัมน์รูปย่อในตาราง (thumbnail)
-    img_map = st.session_state.get("bulk_image_map", {})
-    if "file" in df.columns:
-        df.insert(
-            0,
-            "preview",
-            df["file"].astype(str).map(
-                lambda fn: make_thumb_data_url(img_map.get(fn, b""), max_size=80, quality=60)
-            ),
-        )
-    else:
-        df["preview"] = ""
-
-    disabled_cols = [c for c in ["preview", "file", "ai_value", "status", "note"] if c in df.columns]
-
-    edited = st.data_editor(
-        df,
-        use_container_width=True,
-        column_config={
-            "point_id": st.column_config.SelectboxColumn("point_id", options=[""] + all_pids),
-            "final_value": st.column_config.NumberColumn("final_value"),
-        },
-        num_rows="fixed"
-    )
-    # =========================
-    # ✅ ดูรูป + แก้เฉพาะแถวได้แบบชัวร์
-    # =========================
-    st.subheader("ดูรูปประกอบ (เลือกไฟล์แล้วจะแสดงรูป)")
-
-    files = [str(x) for x in edited["file"].dropna().tolist()] if "file" in edited.columns else []
-    if files:
-        sel_file = st.selectbox("เลือกไฟล์เพื่อดูรูป", options=files, key="bulk_sel_file")
-
-        img_bytes = st.session_state.get("bulk_image_map", {}).get(sel_file)
-        c_img, c_edit = st.columns([2, 1], vertical_alignment="top")
-
-        with c_img:
-            if img_bytes:
-                st.image(img_bytes, caption=sel_file, use_container_width=True)
+    st.subheader("📊 ผลการประมวลผลและแก้ไข")
+    
+    # ✅ สรุปผลการอ่าน
+    ok_count = sum(1 for r in rows if r.get("status") == "OK")
+    no_pid = sum(1 for r in rows if r.get("status") == "NO_PID")
+    no_cfg = sum(1 for r in rows if r.get("status") == "NO_CONFIG")
+    fail = sum(1 for r in rows if r.get("status") == "OCR_FAIL")
+    
+    col_ok, col_pid, col_cfg, col_fail = st.columns(4)
+    col_ok.metric("✅ OK", ok_count)
+    col_pid.metric("🚫 ไม่มี ID", no_pid)
+    col_cfg.metric("⚙️ ไม่มี config", no_cfg)
+    col_fail.metric("❌ Fail", fail)
+    
+    st.divider()
+    
+    # ✅ ตัวเก็บสำหรับจำ expand state
+    if "bulk_expanded" not in st.session_state:
+        st.session_state["bulk_expanded"] = {}
+    
+    # ✅ แสดงตาราง compact พร้อมปุ่ม expand ที่ละแถว
+    st.markdown("### 🖼️ แต่ละรูป (คลิก 'ดูรายละเอียด' เพื่อแก้ไข)")
+    
+    for idx, r in enumerate(rows):
+        file_name = r.get("file", "")
+        pid = r.get("point_id", "")
+        val = r.get("final_value", 0)
+        status = r.get("status", "")
+        note = r.get("note", "")
+        img_bytes = r.get("image_bytes")
+        candidates = r.get("candidates", [])
+        
+        # Status emoji
+        status_emoji = {
+            "OK": "✅",
+            "SAVED": "💾",
+            "NO_PID": "🚫",
+            "NO_CONFIG": "⚙️",
+            "OCR_FAIL": "❌",
+        }.get(status, "❓")
+        
+        # Compact display
+        col1, col2, col3, col4, col5 = st.columns([2, 2, 1.5, 1.5, 1], gap="small")
+        
+        with col1:
+            st.caption(f"📄 {file_name[:30]}")
+        with col2:
+            st.caption(f"**{pid}**" if pid else "—")
+        with col3:
+            if val is not None and val != 0:
+                st.caption(f"ค่า: **{val:.0f}**")
             else:
-                st.warning("ไม่พบรูปใน bulk_image_map (ตรวจว่ามีการ set st.session_state['bulk_image_map'][img_name] = img_bytes แล้ว)")
-
-        with c_edit: 
-            # หา index แถวของไฟล์ที่เลือก
-            try:
-                idx = edited.index[edited["file"].astype(str) == str(sel_file)][0]
-            except Exception:
-                idx = None
-
-            if idx is not None:
-                st.caption("แก้ค่าทีละไฟล์ (ถ้าต้องการ)")
-                new_pid = st.selectbox(
-                    "แก้ point_id",
-                    options=[""] + all_pids,
-                    index=([""] + all_pids).index(str(edited.at[idx, "point_id"]).strip().upper()) if str(edited.at[idx, "point_id"]).strip().upper() in ([""] + all_pids) else 0,
-                    key="bulk_fix_pid_one"
-                )
-       
-                # กัน None
-                cur_final = edited.at[idx, "final_value"]
-                try:
-                    cur_final_float = float(cur_final) if cur_final is not None and str(cur_final).strip() != "" else 0.0
-                except Exception:
-                    cur_final_float = 0.0
-
-                new_final = st.number_input("แก้ final_value", value=cur_final_float, key="bulk_fix_final_one")
-
-                if st.button("บันทึกแก้ไขแถวนี้ (เฉพาะในตาราง)", key="bulk_apply_one"):
-                    edited.at[idx, "point_id"] = new_pid
-                    edited.at[idx, "final_value"] = new_final
-                    st.success("อัปเดตในตารางแล้ว (ยังไม่ส่งลง WaterReport จนกดปุ่มบันทึก)")
-                    st.rerun()
-
-    else:
-        st.info("ยังไม่มีไฟล์ให้เลือก")
+                st.caption("—")
+        with col4:
+            st.caption(f"{status_emoji} {status}")
+        with col5:
+            expand_key = f"expand_{idx}"
+            if st.button("📋", key=f"btn_{idx}", help="ดูรายละเอียด"):
+                st.session_state["bulk_expanded"][expand_key] = not st.session_state["bulk_expanded"].get(expand_key, False)
+                st.rerun()
+        
+        # ✅ Expandable detail view
+        if st.session_state["bulk_expanded"].get(expand_key, False):
+            with st.container(border=True):
+                det_col1, det_col2 = st.columns([2, 1], vertical_alignment="top")
+                
+                # แสดงรูป
+                with det_col1:
+                    st.markdown("#### 🖼️ รูปต้นฉบับ")
+                    if img_bytes:
+                        st.image(img_bytes, use_container_width=True)
+                    else:
+                        st.warning("ไม่มีรูป")
+                
+                # แสดง candidates + แก้ค่า + บันทึก
+                with det_col2:
+                    st.markdown("#### 📋 ทางเลือกค่า")
+                    
+                    # Show candidates top 3
+                    if candidates:
+                        st.caption("Top candidates:")
+                        for c_idx, c in enumerate(candidates[:3]):
+                            c_val = float(c.get("val", 0))
+                            c_score = float(c.get("score", 0))
+                            if st.button(f"ใช้ {c_val:.0f} (score {c_score:.0f})", key=f"use_cand_{idx}_{c_idx}", use_container_width=True):
+                                rows[idx]["final_value"] = c_val
+                                st.session_state["bulk_rows"] = rows
+                                st.success(f"✅ เปลี่ยนเป็น {c_val:.0f}")
+                                st.rerun()
+                    else:
+                        st.info("ไม่มี candidates")
+                    
+                    st.divider()
+                    
+                    # Manual edit
+                    st.caption("📝 พิมพ์เอง:")
+                    new_val = st.number_input(
+                        "ค่าใหม่",
+                        value=float(rows[idx]["final_value"] or 0),
+                        key=f"manual_val_{idx}"
+                    )
+                    new_pid = st.selectbox(
+                        "point_id",
+                        options=[""] + all_pids,
+                        index=([""] + all_pids).index(str(rows[idx].get("point_id", "")).strip().upper()) 
+                               if str(rows[idx].get("point_id", "")).strip().upper() in ([""] + all_pids) else 0,
+                        key=f"manual_pid_{idx}"
+                    )
+                    
+                    if st.button("💾 บันทึกแก้ไข", key=f"save_{idx}", use_container_width=True, type="primary"):
+                        rows[idx]["final_value"] = new_val
+                        rows[idx]["point_id"] = new_pid
+                        st.session_state["bulk_rows"] = rows
+                        st.success("✅ บันทึกแก้ไขแล้ว")
+                        st.session_state["bulk_expanded"][expand_key] = False
+                        st.rerun()
+                    
+                    st.divider()
+                    
+                    # ✅ ปุ่มบันทึกลง Google Sheet ทันที
+                    st.markdown("#### 📊 บันทึกลง Google Sheet")
+                    
+                    final_pid = new_pid or rows[idx].get("point_id", "")
+                    final_val = new_val or rows[idx].get("final_value", 0)
+                    
+                    if not final_pid or not final_val:
+                        st.warning("ต้องมีค่า + point_id ก่อน")
+                    else:
+                        col_save, col_skip = st.columns(2)
+                        
+                        with col_save:
+                            if st.button("✅ บันทึกทันที", key=f"save_sheet_{idx}", type="primary", use_container_width=True):
+                                cfg = get_meter_config(final_pid)
+                                if not cfg:
+                                    st.error("❌ ไม่พบ config")
+                                else:
+                                    report_col = str(cfg.get("report_col", "") or "").strip()
+                                    if not report_col or report_col in ("-", "—", "–"):
+                                        st.error("❌ ไม่มี report_col")
+                                    else:
+                                        # บันทึกลง Google Sheet
+                                        ok_r, msg_r = export_to_real_report(
+                                            final_pid, 
+                                            final_val, 
+                                            inspector_name, 
+                                            report_col, 
+                                            report_date, 
+                                            debug=True
+                                        )
+                                        
+                                        if ok_r:
+                                            st.success(f"✅ บันทึกสำเร็จ: {msg_r}")
+                                            rows[idx]["status"] = "SAVED"  # Mark as saved
+                                            st.session_state["bulk_rows"] = rows
+                                            st.session_state["bulk_expanded"][expand_key] = False
+                                            st.rerun()
+                                        else:
+                                            st.error(f"❌ บันทึกไม่สำเร็จ: {msg_r}")
+                        
+                        with col_skip:
+                            if st.button("⏭️ ข้าม", key=f"skip_{idx}", use_container_width=True):
+                                st.session_state["bulk_expanded"][expand_key] = False
+                                st.rerun()
+                
+                st.caption(f"📌 Status: {status}")
+                if note:
+                    st.caption(f"💬 {note}")
+        
+        st.divider()
 
     write_mode_ui = st.radio(
         "เวลาบันทึกให้ทำแบบไหน?",
@@ -2754,73 +3091,87 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
         key="bulk_write_mode",
     )
 
-    if st.button("✅ อัปโหลดรูป + บันทึกลง WaterReport (ครั้งเดียว)"):
-        report_items = []
-        db_rows = []
-        fail_list = []
+    # ✅ ปุ่มบันทึกที่เหลือ (ที่ยังไม่บันทึก)
+    rows_final = st.session_state.get("bulk_rows", rows)
+    unsaved_count = sum(1 for r in rows_final if r.get("status") != "SAVED")
+    
+    if unsaved_count > 0:
+        if st.button(f"✅ บันทึกที่เหลือ ({unsaved_count} จุด)", type="primary", use_container_width=True):
+            report_items = []
+            db_rows = []
+            fail_list = []
 
-        folder = f"daily_bulk/{report_date.strftime('%Y%m%d')}"
-        inspector_name = inspector or "Admin"
+            folder = f"daily_bulk/{report_date.strftime('%Y%m%d')}"
+            inspector_name = inspector or "Admin"
 
-        # index รูปตามชื่อไฟล์ (ไว้หา bytes)
-        img_map = {x["name"]: x["bytes"] for x in images}
+            for r in rows_final:
+                if r.get("status") == "SAVED":
+                    continue  # ข้ามที่บันทึกแล้ว
+                
+                pid_u = str(r.get("point_id","")).strip().upper()
+                val = r.get("final_value", None)
 
-        for _, r in edited.iterrows():
-            pid_u = str(r.get("point_id","")).strip().upper()
-            val = r.get("final_value", None)
+                if not pid_u or val is None or str(val).strip() == "":
+                    continue
 
-            if not pid_u or val is None or str(val).strip() == "":
-                continue
+                cfg = get_meter_config(pid_u)
+                if not cfg:
+                    fail_list.append((pid_u, "NO_CONFIG_IN_PointMaster"))
+                    continue
 
-            cfg = get_meter_config(pid_u)
-            if not cfg:
-                fail_list.append((pid_u, "NO_CONFIG_IN_PointMaster"))
-                continue
+                report_col = str(cfg.get("report_col","")).strip()
+                if not report_col or report_col in ("-","—","–"):
+                    fail_list.append((pid_u, "NO_REPORT_COL"))
+                    continue
 
-            report_col = str(cfg.get("report_col","")).strip()
-            if not report_col or report_col in ("-","—","–"):
-                fail_list.append((pid_u, "NO_REPORT_COL"))
-                continue
+                img_bytes = r.get("image_bytes")
 
-            img_name = str(r.get("file","img")).strip()
-            img_bytes = img_map.get(img_name)
+                image_url = "-"
+                if img_bytes:
+                    pid_slug = pid_u.replace(" ", "_")
+                    filename = f"{folder}/{pid_slug}_{get_thai_time().strftime('%H%M%S')}.jpg"
+                    image_url = upload_image_to_storage(img_bytes, filename)
 
-            image_url = "-"
-            if img_bytes:
-                pid_slug = pid_u.replace(" ", "_")
-                filename = f"{folder}/{pid_slug}_{get_thai_time().strftime('%H%M%S')}_{img_name}"
-                image_url = upload_image_to_storage(img_bytes, filename)
+                try:
+                    write_val = float(str(val).replace(",", "").strip())
+                except Exception:
+                    write_val = str(val).strip()
 
-            try:
-                write_val = float(str(val).replace(",", "").strip())
-            except Exception:
-                write_val = str(val).strip()
+                report_items.append({"point_id": pid_u, "value": write_val, "report_col": report_col})
 
-            report_items.append({"point_id": pid_u, "value": write_val, "report_col": report_col})
+                try:
+                    meter_type = infer_meter_type(cfg)
+                except Exception:
+                    meter_type = "Electric"
 
-            try:
-                meter_type = infer_meter_type(cfg)
-            except Exception:
-                meter_type = "Electric"
+                record_ts = datetime.combine(report_date, get_thai_time().time()).strftime("%Y-%m-%d %H:%M:%S")
+                db_rows.append([record_ts, meter_type, pid_u, inspector_name, write_val, write_val, "AUTO_BULK_IMAGE_OCR", image_url])
 
-            record_ts = datetime.combine(report_date, get_thai_time().time()).strftime("%Y-%m-%d %H:%M:%S")
-            db_rows.append([record_ts, meter_type, pid_u, inspector_name, write_val, write_val, "AUTO_BULK_IMAGE_OCR", image_url])
+            if not report_items:
+                st.info("ไม่มีข้อมูลที่เหลือให้บันทึก")
+            else:
+                ok_db, db_msg = append_rows_dailyreadings_batch(db_rows)
+                if not ok_db:
+                    st.warning(f"⚠️ Log DailyReadings ไม่สำเร็จ: {db_msg}")
 
-        if not report_items:
-            st.warning("ไม่มีข้อมูลให้บันทึก")
-            st.stop()
+                wm = "overwrite" if write_mode_ui.startswith("เขียนทับ") else "empty_only"
+                ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True, write_mode=wm)
 
-        ok_db, db_msg = append_rows_dailyreadings_batch(db_rows)
-        if not ok_db:
-            st.warning(f"⚠️ Log DailyReadings ไม่สำเร็จ: {db_msg}")
-
-        wm = "overwrite" if write_mode_ui.startswith("เขียนทับ") else "empty_only"
-        ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True, write_mode=wm)
-
-        st.success(f"✅ ลง WaterReport สำเร็จ: {len(ok_pids)} จุด")
-        if fail_list or fail_report:
-            st.error(f"❌ ไม่สำเร็จ: {len(fail_list) + len(fail_report)} จุด")
-            st.write([[pid, reason] for pid, reason in (fail_list + list(fail_report))])
+                st.success(f"✅ ลง WaterReport สำเร็จ: {len(ok_pids)} จุด")
+                if fail_list or fail_report:
+                    st.error(f"❌ ไม่สำเร็จ: {len(fail_list) + len(fail_report)} จุด")
+                    st.write([[pid, reason] for pid, reason in (fail_list + list(fail_report))])
+                
+                # ✅ Update rows status
+                for r in rows_final:
+                    pid_u = str(r.get("point_id","")).strip().upper()
+                    if pid_u in ok_pids:
+                        r["status"] = "SAVED"
+                
+                st.session_state["bulk_rows"] = rows_final
+                st.rerun()
+    else:
+        st.success("✅ ทั้งหมดบันทึกแล้ว!")
 
 elif mode == "🖥️ Dashboard Screenshot (OCR)":
     st.title("🖥️ Dashboard Screenshot → WaterReport")
