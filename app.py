@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import random
+import base64
 import time as pytime
 import math
 from google.oauth2 import service_account
@@ -21,7 +22,30 @@ from google.cloud import storage
 from datetime import datetime, timedelta, timezone, time # ✅ เพิ่ม time
 import string
 
+# =========================
+# Helpers / Utils (ต้องอยู่ก่อน UI)
+# =========================
+def make_thumb_data_url(image_bytes: bytes, max_size: int = 160, quality: int = 70) -> str:
+    try:
+        arr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return ""
 
+        h, w = img.shape[:2]
+        scale = min(max_size / max(h, w), 1.0)
+        if scale < 1.0:
+            img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+        if not ok:
+            return ""
+
+        b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+        return f"data:image/jpeg;base64,{b64}"
+    except Exception:
+        return ""
+        
 # =========================================================
 # --- 📦 CONFIGURATION ---
 # =========================================================
