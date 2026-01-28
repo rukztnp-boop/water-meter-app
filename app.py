@@ -2617,12 +2617,11 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
             images.append({"name": name, "bytes": b})
 
     st.write(f"พบรูปทั้งหมด: **{len(images)}** ไฟล์")
+    st.session_state["bulk_image_map"] = {it["name"]: it["bytes"] for it in images}
 
     if "bulk_rows" not in st.session_state:
         st.session_state["bulk_rows"] = None
 
-    if "bulk_image_map" not in st.session_state:
-        st.session_state["bulk_image_map"] = {}
         
     if st.button("🔎 อ่าน point_id + อ่านค่า (รอบแรก)"):
         rows = []
