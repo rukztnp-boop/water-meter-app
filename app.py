@@ -3,6 +3,8 @@ import streamlit as st
 import io
 import os
 import re
+import zipfile
+from difflib import SequenceMatcher
 import gspread
 import openpyxl
 from openpyxl.utils.cell import column_index_from_string
@@ -18,6 +20,7 @@ from google.cloud import vision
 from google.cloud import storage
 from datetime import datetime, timedelta, timezone, time # ✅ เพิ่ม time
 import string
+
 
 # =========================================================
 # --- 📦 CONFIGURATION ---
@@ -1913,6 +1916,89 @@ def extract_dashboard_flow_values(image_bytes: bytes, debug: bool = False):
     return (out_rows, dbg) if debug else out_rows
 
 # =========================================================
+# --- 📸 BULK IMAGE OCR: FIND point_id FROM PHOTO ---
+# =========================================================
+
+def _norm_pid_key(s: str) -> str:
+    s = str(s or "").upper().strip()
+    s = s.replace("-", "_")
+    s = re.sub(r"\s+", "_", s)          # space -> _
+    s = re.sub(r"[^A-Z0-9_]", "", s)    # ตัดสัญลักษณ์แปลกๆ
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+@st.cache_data(ttl=3600)
+def build_pid_norm_map():
+    """สร้าง map สำหรับ match point_id แบบทน OCR เพี้ยน"""
+    pm = load_points_master() or []
+    norm_map = {}
+    for r in pm:
+        pid = str(r.get("point_id", "")).strip().upper()
+        if not pid:
+            continue
+        norm_map[_norm_pid_key(pid)] = pid
+    return norm_map
+
+def _crop_bottom_bytes(image_bytes: bytes, frac: float = 0.40) -> bytes:
+    """ครอปช่วงล่างของรูป (ตรงเทปเหลือง) เพื่อ OCR point_id ให้แม่น/เร็ว"""
+    img = _cv2_decode_bytes(image_bytes)
+    if img is None:
+        return image_bytes
+    h, w = img.shape[:2]
+    y1 = int(h * (1.0 - frac))
+    crop = img[y1:h, 0:w].copy()
+    crop = _upscale_for_ocr(crop, max_side=2200)
+    out = _cv2_encode_jpg(crop, quality=92)
+    return out or image_bytes
+
+def find_point_id_from_text(ocr_text: str, norm_map: dict):
+    t = _norm_pid_key(ocr_text)
+    if not t:
+        return None
+
+    # 1) exact substring match (เร็ว+แม่น)
+    best = None
+    best_len = -1
+    for nkey, orig in norm_map.items():
+        if nkey and nkey in t:
+            if len(nkey) > best_len:
+                best = orig
+                best_len = len(nkey)
+    if best:
+        return best
+
+    # 2) fuzzy จาก pattern ที่เหมือน point_id
+    cand = re.findall(r"[A-Z]{1,3}_[A-Z0-9]{1,10}(?:_[A-Z0-9]{1,10}){1,5}", t)
+    if not cand:
+        return None
+
+    best_score = 0.0
+    best_pid = None
+    for c in cand[:12]:
+        for nkey, orig in norm_map.items():
+            sc = SequenceMatcher(None, c, nkey).ratio()
+            if sc > best_score:
+                best_score = sc
+                best_pid = orig
+
+    return best_pid if best_score >= 0.78 else None
+
+def extract_point_id_from_image(image_bytes: bytes, norm_map: dict):
+    """คืนค่า (point_id หรือ None, ocr_text ที่ใช้)"""
+    # pass1: OCR เฉพาะช่วงล่างก่อน
+    btm = _crop_bottom_bytes(image_bytes, frac=0.40)
+    txt, _err = _vision_read_text(btm)
+    pid = find_point_id_from_text(txt, norm_map)
+    if pid:
+        return pid, txt
+
+    # pass2: fallback OCR ทั้งภาพ
+    txt2, _err2 = _vision_read_text(image_bytes)
+    pid2 = find_point_id_from_text(txt2, norm_map)
+    return pid2, txt2
+
+    
+# =========================================================
 # --- ✅ HISTORY GUARD (for cumulative meters) ---
 # =========================================================
 
@@ -2118,7 +2204,11 @@ def reset_emp_meter_state():
 
 mode = st.sidebar.radio(
     "🔧 เลือกโหมดการทำงาน",
-    ["📝 พนักงานจดมิเตอร์", "📥 อัปโหลด Excel (SCADA Export)", "🖥️ Dashboard Screenshot (OCR)", "👮‍♂️ Admin Approval"]
+    ["📝 พนักงานจดมิเตอร์",
+     "📸 อัปโหลดรูปทั้งวัน (มี point_id ในรูป)",
+     "📥 อัปโหลด Excel (SCADA Export)",
+     "🖥️ Dashboard Screenshot (OCR)",
+     "👮‍♂️ Admin Approval"]
 )
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
@@ -2465,6 +2555,180 @@ if mode == "📝 พนักงานจดมิเตอร์":
     if col_retry.button("🔁 ถ่าย/เลือกใหม่", use_container_width=True):
         reset_emp_meter_state()
         st.rerun()
+
+elif mode == "📸 อัปโหลดรูปทั้งวัน (มี point_id ในรูป)":
+    st.title("📸 อัปโหลดรูปทั้งวัน → อ่าน point_id → ลง WaterReport")
+    st.caption("อัปโหลดรูปหลายไฟล์/zip ที่มี point_id อยู่ในรูป แล้วระบบจะอ่านค่าให้และบันทึกลง WaterReport แบบครั้งเดียว")
+
+    c_insp, c_date = st.columns(2)
+    with c_insp:
+        inspector = st.text_input("ชื่อผู้บันทึก", "Admin", key="bulk_inspector")
+    with c_date:
+        report_date = st.date_input("📅 วันที่ของรายงาน", value=get_thai_time().date(), key="bulk_date")
+
+    norm_map = build_pid_norm_map()
+    pm = load_points_master() or []
+    all_pids = sorted({str(r.get("point_id","")).strip().upper() for r in pm if r.get("point_id")})
+
+    up_files = st.file_uploader(
+        "อัปโหลดรูป (หลายไฟล์) หรือ zip",
+        type=["jpg","jpeg","png","zip"],
+        accept_multiple_files=True,
+        key="bulk_upload"
+    )
+    if not up_files:
+        st.stop()
+
+    # แตกไฟล์: รองรับ zip + รูปตรง ๆ
+    images = []  # [{name, bytes}]
+    for f in up_files:
+        name = getattr(f, "name", "upload")
+        b = f.getvalue()
+        if name.lower().endswith(".zip"):
+            z = zipfile.ZipFile(io.BytesIO(b))
+            for zi in z.infolist():
+                if zi.filename.lower().endswith((".jpg",".jpeg",".png")):
+                    images.append({"name": os.path.basename(zi.filename), "bytes": z.read(zi)})
+        else:
+            images.append({"name": name, "bytes": b})
+
+    st.write(f"พบรูปทั้งหมด: **{len(images)}** ไฟล์")
+
+    if "bulk_rows" not in st.session_state:
+        st.session_state["bulk_rows"] = None
+
+    if st.button("🔎 อ่าน point_id + อ่านค่า (รอบแรก)"):
+        rows = []
+        prog = st.progress(0)
+        for i, it in enumerate(images, start=1):
+            img_name = it["name"]
+            img_bytes = it["bytes"]
+
+            pid, _pid_text = extract_point_id_from_image(img_bytes, norm_map)
+            pid_u = str(pid).strip().upper() if pid else ""
+
+            cfg = get_meter_config(pid_u) if pid_u else None
+            ai_val = None
+            msg = ""
+            stt = "NO_PID"
+
+            if pid_u and cfg:
+                try:
+                    best, cand = ocr_process(img_bytes, cfg, return_candidates=True, fast=True)
+                    best2, hmsg = apply_history_guard(pid_u, best, cand, cfg, report_date)
+                    ai_val = float(best2)
+                    msg = hmsg or ""
+                    stt = "OK"
+                except Exception as e:
+                    stt = "OCR_FAIL"
+                    msg = str(e)[:200]
+            elif pid_u and not cfg:
+                stt = "NO_CONFIG"
+
+            rows.append({
+                "file": img_name,
+                "point_id": pid_u or "",
+                "ai_value": ai_val,
+                "final_value": ai_val,
+                "status": stt,
+                "note": msg,
+            })
+            prog.progress(i / max(1, len(images)))
+
+        st.session_state["bulk_rows"] = rows
+
+    rows = st.session_state.get("bulk_rows")
+    if not rows:
+        st.stop()
+
+    st.subheader("ตรวจ/แก้ก่อนบันทึก (แก้ point_id / ค่าได้)")
+    df = pd.DataFrame(rows)
+
+    edited = st.data_editor(
+        df,
+        use_container_width=True,
+        column_config={
+            "point_id": st.column_config.SelectboxColumn("point_id", options=[""] + all_pids),
+            "final_value": st.column_config.NumberColumn("final_value"),
+        },
+        num_rows="fixed"
+    )
+
+    write_mode_ui = st.radio(
+        "เวลาบันทึกให้ทำแบบไหน?",
+        ["เขียนทับทั้งหมด", "เขียนเฉพาะช่องว่าง (ไม่ทับของเดิม)"],
+        index=0,
+        horizontal=True,
+        key="bulk_write_mode",
+    )
+
+    if st.button("✅ อัปโหลดรูป + บันทึกลง WaterReport (ครั้งเดียว)"):
+        report_items = []
+        db_rows = []
+        fail_list = []
+
+        folder = f"daily_bulk/{report_date.strftime('%Y%m%d')}"
+        inspector_name = inspector or "Admin"
+
+        # index รูปตามชื่อไฟล์ (ไว้หา bytes)
+        img_map = {x["name"]: x["bytes"] for x in images}
+
+        for _, r in edited.iterrows():
+            pid_u = str(r.get("point_id","")).strip().upper()
+            val = r.get("final_value", None)
+
+            if not pid_u or val is None or str(val).strip() == "":
+                continue
+
+            cfg = get_meter_config(pid_u)
+            if not cfg:
+                fail_list.append((pid_u, "NO_CONFIG_IN_PointMaster"))
+                continue
+
+            report_col = str(cfg.get("report_col","")).strip()
+            if not report_col or report_col in ("-","—","–"):
+                fail_list.append((pid_u, "NO_REPORT_COL"))
+                continue
+
+            img_name = str(r.get("file","img")).strip()
+            img_bytes = img_map.get(img_name)
+
+            image_url = "-"
+            if img_bytes:
+                pid_slug = pid_u.replace(" ", "_")
+                filename = f"{folder}/{pid_slug}_{get_thai_time().strftime('%H%M%S')}_{img_name}"
+                image_url = upload_image_to_storage(img_bytes, filename)
+
+            try:
+                write_val = float(str(val).replace(",", "").strip())
+            except Exception:
+                write_val = str(val).strip()
+
+            report_items.append({"point_id": pid_u, "value": write_val, "report_col": report_col})
+
+            try:
+                meter_type = infer_meter_type(cfg)
+            except Exception:
+                meter_type = "Electric"
+
+            record_ts = datetime.combine(report_date, get_thai_time().time()).strftime("%Y-%m-%d %H:%M:%S")
+            db_rows.append([record_ts, meter_type, pid_u, inspector_name, write_val, write_val, "AUTO_BULK_IMAGE_OCR", image_url])
+
+        if not report_items:
+            st.warning("ไม่มีข้อมูลให้บันทึก")
+            st.stop()
+
+        ok_db, db_msg = append_rows_dailyreadings_batch(db_rows)
+        if not ok_db:
+            st.warning(f"⚠️ Log DailyReadings ไม่สำเร็จ: {db_msg}")
+
+        wm = "overwrite" if write_mode_ui.startswith("เขียนทับ") else "empty_only"
+        ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True, write_mode=wm)
+
+        st.success(f"✅ ลง WaterReport สำเร็จ: {len(ok_pids)} จุด")
+        if fail_list or fail_report:
+            st.error(f"❌ ไม่สำเร็จ: {len(fail_list) + len(fail_report)} จุด")
+            st.write([[pid, reason] for pid, reason in (fail_list + list(fail_report))])
 
 elif mode == "🖥️ Dashboard Screenshot (OCR)":
     st.title("🖥️ Dashboard Screenshot → WaterReport")
