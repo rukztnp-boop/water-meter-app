@@ -2597,6 +2597,9 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
     if "bulk_rows" not in st.session_state:
         st.session_state["bulk_rows"] = None
 
+    if "bulk_image_map" not in st.session_state:
+        st.session_state["bulk_image_map"] = {}
+        
     if st.button("🔎 อ่าน point_id + อ่านค่า (รอบแรก)"):
         rows = []
         prog = st.progress(0)
@@ -2653,6 +2656,57 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
         },
         num_rows="fixed"
     )
+    # =========================
+    # ✅ ดูรูป + แก้เฉพาะแถวได้แบบชัวร์
+    # =========================
+    st.subheader("ดูรูปประกอบ (เลือกไฟล์แล้วจะแสดงรูป)")
+
+    files = [str(x) for x in edited["file"].dropna().tolist()] if "file" in edited.columns else []
+    if files:
+        sel_file = st.selectbox("เลือกไฟล์เพื่อดูรูป", options=files, key="bulk_sel_file")
+
+        img_bytes = st.session_state.get("bulk_image_map", {}).get(sel_file)
+        c_img, c_edit = st.columns([2, 1], vertical_alignment="top")
+
+        with c_img:
+            if img_bytes:
+                st.image(img_bytes, caption=sel_file, use_container_width=True)
+            else:
+                st.warning("ไม่พบรูปใน bulk_image_map (ตรวจว่ามีการ set st.session_state['bulk_image_map'][img_name] = img_bytes แล้ว)")
+
+        with c_edit: 
+            # หา index แถวของไฟล์ที่เลือก
+            try:
+                idx = edited.index[edited["file"].astype(str) == str(sel_file)][0]
+            except Exception:
+                idx = None
+
+            if idx is not None:
+                st.caption("แก้ค่าทีละไฟล์ (ถ้าต้องการ)")
+                new_pid = st.selectbox(
+                    "แก้ point_id",
+                    options=[""] + all_pids,
+                    index=([""] + all_pids).index(str(edited.at[idx, "point_id"]).strip().upper()) if str(edited.at[idx, "point_id"]).strip().upper() in ([""] + all_pids) else 0,
+                    key="bulk_fix_pid_one"
+                )
+       
+                # กัน None
+                cur_final = edited.at[idx, "final_value"]
+                try:
+                    cur_final_float = float(cur_final) if cur_final is not None and str(cur_final).strip() != "" else 0.0
+                except Exception:
+                    cur_final_float = 0.0
+
+                new_final = st.number_input("แก้ final_value", value=cur_final_float, key="bulk_fix_final_one")
+
+                if st.button("บันทึกแก้ไขแถวนี้ (เฉพาะในตาราง)", key="bulk_apply_one"):
+                    edited.at[idx, "point_id"] = new_pid
+                    edited.at[idx, "final_value"] = new_final
+                    st.success("อัปเดตในตารางแล้ว (ยังไม่ส่งลง WaterReport จนกดปุ่มบันทึก)")
+                    st.rerun()
+
+    else:
+        st.info("ยังไม่มีไฟล์ให้เลือก")
 
     write_mode_ui = st.radio(
         "เวลาบันทึกให้ทำแบบไหน?",
