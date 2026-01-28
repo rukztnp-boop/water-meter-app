@@ -2614,7 +2614,7 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
 
             if pid_u and cfg:
                 try:
-                    best, cand = ocr_process(img_bytes, cfg, return_candidates=True, fast=True)
+                    best, cand = ocr_process(img_bytes, cfg, return_candidates=True)
                     best2, hmsg = apply_history_guard(pid_u, best, cand, cfg, report_date)
                     ai_val = float(best2)
                     msg = hmsg or ""
