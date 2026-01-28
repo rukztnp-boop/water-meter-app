@@ -1541,9 +1541,21 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
 
     if config.get('ignore_red', False):
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        lower_red1 = np.array([0, 70, 50]);  upper_red1 = np.array([10, 255, 255])
-        lower_red2 = np.array([170, 70, 50]); upper_red2 = np.array([180, 255, 255])
+        # ✅ ปรับให้เข้มงวดขึ้น: ตัดเลขแดงให้สะอาด
+        # Red range 1: 0-10 (hue) + saturation >= 80 + value >= 60
+        # Red range 2: 170-180 (hue) + saturation >= 80 + value >= 60
+        lower_red1 = np.array([0, 80, 60])
+        upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([170, 80, 60])
+        upper_red2 = np.array([180, 255, 255])
+        
         mask = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
+        
+        # ✅ Morphological close: ทำให้ mask ติดกันขึ้น (ลด noise)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        
+        # ✅ เปลี่ยนเลขแดงเป็นสีขาว (255,255,255)
         img[mask > 0] = [255, 255, 255]
 
     if variant == "raw":
@@ -2989,6 +3001,44 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                 
                 # แสดง candidates + แก้ค่า + บันทึก
                 with det_col2:
+                    # ✅ ถ้าเป็น NO_PID ให้พิมพ์ point_id เอง
+                    if status == "NO_PID":
+                        st.markdown("#### 📍 พิมพ์ point_id")
+                        manual_pid_input = st.selectbox(
+                            "เลือก point_id จากรายชื่อ",
+                            options=["(พิมพ์เอง)"] + all_pids,
+                            key=f"no_pid_select_{idx}"
+                        )
+                        
+                        if manual_pid_input == "(พิมพ์เอง)":
+                            manual_pid_text = st.text_input(
+                                "พิมพ์ point_id",
+                                value="",
+                                placeholder="เช่น GU_BP_3_2",
+                                key=f"no_pid_input_{idx}"
+                            )
+                            selected_manual_pid = manual_pid_text.strip().upper() if manual_pid_text else ""
+                        else:
+                            selected_manual_pid = manual_pid_input
+                        
+                        if st.button("✅ ยืนยัน point_id", key=f"confirm_pid_{idx}", use_container_width=True, type="primary"):
+                            if selected_manual_pid:
+                                # เช็ค config
+                                cfg = get_meter_config(selected_manual_pid)
+                                if cfg:
+                                    rows[idx]["point_id"] = selected_manual_pid
+                                    rows[idx]["status"] = "OK"
+                                    rows[idx]["note"] = f"✅ Manual input: {selected_manual_pid}"
+                                    st.session_state["bulk_rows"] = rows
+                                    st.success(f"✅ เปลี่ยนเป็น {selected_manual_pid}")
+                                    st.rerun()
+                                else:
+                                    st.error(f"❌ ไม่พบ config สำหรับ {selected_manual_pid}")
+                            else:
+                                st.warning("กรุณาพิมพ์ point_id")
+                        
+                        st.divider()
+                    
                     st.markdown("#### 📋 ทางเลือกค่า")
                     
                     # Show candidates top 3
@@ -3036,9 +3086,10 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                     st.markdown("#### 📊 บันทึกลง Google Sheet")
                     
                     final_pid = new_pid or rows[idx].get("point_id", "")
-                    final_val = new_val or rows[idx].get("final_value", 0)
+                    final_val = new_val if new_val is not None else rows[idx].get("final_value", None)
                     
-                    if not final_pid or not final_val:
+                    # ✅ แก้ validation: เช็ค None/empty string แทน 0
+                    if not final_pid or final_val is None or str(final_val).strip() == "":
                         st.warning("ต้องมีค่า + point_id ก่อน")
                     else:
                         col_save, col_skip = st.columns(2)
