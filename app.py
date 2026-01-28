@@ -2974,9 +2974,12 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
         with col2:
             st.caption(f"**{pid}**" if pid else "—")
         with col3:
-            # ✅ แสดงค่า 0 ได้ (เช่นค่าเริ่มต้น)
+            # ✅ แสดงค่า 0 ได้ (เช่นค่าเริ่มต้น) + format ตามจำนวนทศนิยม
             if val is not None and str(val).strip() != "":
-                st.caption(f"ค่า: **{val:.0f}**")
+                cfg = get_meter_config(pid)
+                decimals = int(cfg.get('decimals', 0) or 0) if cfg else 0
+                fmt = f"{{:.{decimals}f}}"
+                st.caption(f"ค่า: **{fmt.format(val)}**")
             else:
                 st.caption("—")
         with col4:
@@ -3048,10 +3051,15 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                         for c_idx, c in enumerate(candidates[:3]):
                             c_val = float(c.get("val", 0))
                             c_score = float(c.get("score", 0))
-                            if st.button(f"ใช้ {c_val:.0f} (score {c_score:.0f})", key=f"use_cand_{idx}_{c_idx}", use_container_width=True):
+                            # ✅ Format ตามจำนวนทศนิยม
+                            cfg = get_meter_config(rows[idx].get("point_id", ""))
+                            decimals = int(cfg.get('decimals', 0) or 0) if cfg else 0
+                            fmt = f"{{:.{decimals}f}}"
+                            val_str = fmt.format(c_val)
+                            if st.button(f"ใช้ {val_str} (score {c_score:.0f})", key=f"use_cand_{idx}_{c_idx}", use_container_width=True):
                                 rows[idx]["final_value"] = c_val
                                 st.session_state["bulk_rows"] = rows
-                                st.success(f"✅ เปลี่ยนเป็น {c_val:.0f}")
+                                st.success(f"✅ เปลี่ยนเป็น {val_str}")
                                 st.rerun()
                     else:
                         st.info("ไม่มี candidates")
