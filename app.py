@@ -2670,6 +2670,21 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
     st.subheader("ตรวจ/แก้ก่อนบันทึก (แก้ point_id / ค่าได้)")
     df = pd.DataFrame(rows)
 
+    # ✅ เพิ่มคอลัมน์รูปย่อในตาราง (thumbnail)
+    img_map = st.session_state.get("bulk_image_map", {})
+    if "file" in df.columns:
+        df.insert(
+            0,
+            "preview",
+            df["file"].astype(str).map(
+                lambda fn: make_thumb_data_url(img_map.get(fn, b""), max_size=80, quality=60)
+            ),
+        )
+    else:
+        df["preview"] = ""
+
+    disabled_cols = [c for c in ["preview", "file", "ai_value", "status", "note"] if c in df.columns]
+
     edited = st.data_editor(
         df,
         use_container_width=True,
