@@ -1541,22 +1541,22 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
 
     if config.get('ignore_red', False):
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        # ✅ ปรับให้เข้มงวดขึ้น: ตัดเลขแดงให้สะอาด
-        # Red range 1: 0-10 (hue) + saturation >= 80 + value >= 60
-        # Red range 2: 170-180 (hue) + saturation >= 80 + value >= 60
-        lower_red1 = np.array([0, 80, 60])
+        # ✅ เข้มงวดมาก: ตัดเฉพาะเลขแดงเจาะจง
+        # Red range ที่เข้มงวด: H=[0,10] หรือ [170,180] + S>=85 + V>=70
+        lower_red1 = np.array([0, 85, 70])
         upper_red1 = np.array([10, 255, 255])
-        lower_red2 = np.array([170, 80, 60])
+        lower_red2 = np.array([170, 85, 70])
         upper_red2 = np.array([180, 255, 255])
         
-        mask = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
+        mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
         
-        # ✅ Morphological close: ทำให้ mask ติดกันขึ้น (ลด noise)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        # ✅ Morphological operations: ทำให้ mask ติดกัน
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel, iterations=1)
         
         # ✅ เปลี่ยนเลขแดงเป็นสีขาว (255,255,255)
-        img[mask > 0] = [255, 255, 255]
+        img[mask_red > 0] = [255, 255, 255]
 
     if variant == "raw":
         ok, encoded = cv2.imencode(".jpg", img)
@@ -1566,8 +1566,10 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
     if variant == "invert": gray = 255 - gray
 
     use_digital_logic = (variant == "soft") or (variant == "auto" and is_digital_meter(config))
+    # ✅ Analog meter with ignore_red should also use enhanced preprocessing
+    use_enhanced_analog = (variant == "auto" and not is_digital_meter(config) and config.get('ignore_red', False))
 
-    if use_digital_logic:
+    if use_digital_logic or use_enhanced_analog:
         if min(H, W) < 300:
             gray = cv2.resize(gray, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
