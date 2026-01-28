@@ -2974,7 +2974,8 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
         with col2:
             st.caption(f"**{pid}**" if pid else "—")
         with col3:
-            if val is not None and val != 0:
+            # ✅ แสดงค่า 0 ได้ (เช่นค่าเริ่มต้น)
+            if val is not None and str(val).strip() != "":
                 st.caption(f"ค่า: **{val:.0f}**")
             else:
                 st.caption("—")
