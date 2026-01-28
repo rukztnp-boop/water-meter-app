@@ -3100,30 +3100,41 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                     final_val = new_val if new_val is not None else rows[idx].get("final_value", None)
                     
                     # ✅ แก้ validation: เช็ค None/empty string แทน 0
-                    if not final_pid or final_val is None or str(final_val).strip() == "":
-                        st.warning("ต้องมีค่า + point_id ก่อน")
+                    if not final_pid:
+                        st.warning("ต้องมีค่า point_id ก่อน")
+                    elif final_val is None or str(final_val).strip() == "":
+                        st.warning("ต้องมีค่าตัวเลขก่อน")
                     else:
                         col_save, col_skip = st.columns(2)
                         
                         with col_save:
                             if st.button("✅ บันทึกทันที", key=f"save_sheet_{idx}", type="primary", use_container_width=True):
-                                cfg = get_meter_config(final_pid)
-                                if not cfg:
-                                    st.error("❌ ไม่พบ config")
+                                if not final_pid or final_val is None or str(final_val).strip() == "":
+                                    st.error("❌ ต้องมีค่า + point_id ก่อน")
                                 else:
-                                    report_col = str(cfg.get("report_col", "") or "").strip()
-                                    if not report_col or report_col in ("-", "—", "–"):
-                                        st.error("❌ ไม่มี report_col")
+                                    cfg = get_meter_config(final_pid)
+                                    if not cfg:
+                                        st.error("❌ ไม่พบ config")
                                     else:
-                                        # บันทึกลง Google Sheet
-                                        ok_r, msg_r = export_to_real_report(
-                                            final_pid, 
-                                            final_val, 
-                                            inspector_name, 
-                                            report_col, 
-                                            report_date, 
-                                            debug=True
-                                        )
+                                        report_col = str(cfg.get("report_col", "") or "").strip()
+                                        if not report_col or report_col in ("-", "—", "–"):
+                                            st.error("❌ ไม่มี report_col")
+                                        else:
+                                            # ✅ Parse value to float
+                                            try:
+                                                write_val = float(str(final_val).replace(",", "").strip())
+                                            except Exception:
+                                                write_val = str(final_val).strip()
+                                            
+                                            # บันทึกลง Google Sheet
+                                            ok_r, msg_r = export_to_real_report(
+                                                final_pid, 
+                                                write_val, 
+                                                inspector_name, 
+                                                report_col, 
+                                                report_date, 
+                                                debug=True
+                                            )
                                         
                                         if ok_r:
                                             st.success(f"✅ บันทึกสำเร็จ: {msg_r}")
@@ -3219,16 +3230,23 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                 wm = "overwrite" if write_mode_ui.startswith("เขียนทับ") else "empty_only"
                 ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True, write_mode=wm)
 
-                st.success(f"✅ ลง WaterReport สำเร็จ: {len(ok_pids)} จุด")
+                # ✅ Show results
+                if ok_pids:
+                    st.success(f"✅ ลง WaterReport สำเร็จ: {len(ok_pids)} จุด")
+                
                 if fail_list or fail_report:
                     st.error(f"❌ ไม่สำเร็จ: {len(fail_list) + len(fail_report)} จุด")
-                    st.write([[pid, reason] for pid, reason in (fail_list + list(fail_report))])
+                    with st.expander("📋 ดูรายละเอียด:"):
+                        for pid, reason in (fail_list + list(fail_report)):
+                            st.caption(f"  • {pid}: {reason}")
                 
-                # ✅ Update rows status
+                # ✅ Update rows status carefully
                 for r in rows_final:
                     pid_u = str(r.get("point_id","")).strip().upper()
                     if pid_u in ok_pids:
                         r["status"] = "SAVED"
+                    elif any(pid_u == str(f[0]).strip().upper() for f in fail_report):
+                        r["status"] = "ERROR"
                 
                 st.session_state["bulk_rows"] = rows_final
                 st.rerun()
