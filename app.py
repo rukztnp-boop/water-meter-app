@@ -2691,8 +2691,9 @@ if mode == "📝 พนักงานจดมิเตอร์":
 
     with c2:
         decimals = int(config.get("decimals", 0) or 0)
-        step = 1.0 if decimals == 0 else (0.1 if decimals == 1 else 0.01)
-        fmt = "%.0f" if decimals == 0 else ("%.1f" if decimals == 1 else "%.2f")
+        step = 1.0 if decimals == 0 else (10 ** (-decimals))
+        # ✅ Dynamic format: รองรับ decimals ทุกจำนวน (0, 1, 2, 3, ...)
+        fmt = f"{{:.{decimals}f}}"
         st.caption("ถ่ายรูปแล้ว AI จะเสนอค่าด้านล่าง")
 
     # --- (Optional) แสดงรูปตัวอย่างของจุดนี้ เพื่อช่วยเช็คว่าถ่ายถูกมิเตอร์ ---
@@ -3082,9 +3083,17 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                     
                     # Manual edit
                     st.caption("📝 พิมพ์เอง:")
+                    # ✅ Get decimals to format correctly
+                    cfg_manual = get_meter_config(new_pid or rows[idx].get("point_id", ""))
+                    decimals_manual = int(cfg_manual.get('decimals', 0) or 0) if cfg_manual else 0
+                    step_manual = 1.0 if decimals_manual == 0 else (10 ** (-decimals_manual))
+                    fmt_manual = f"{{:.{decimals_manual}f}}"
+                    
                     new_val = st.number_input(
                         "ค่าใหม่",
                         value=float(rows[idx]["final_value"] or 0),
+                        step=step_manual,
+                        format=fmt_manual,
                         key=f"manual_val_{idx}"
                     )
                     new_pid = st.selectbox(
