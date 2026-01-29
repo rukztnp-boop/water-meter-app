@@ -3138,6 +3138,9 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                                             except Exception:
                                                 write_val = str(final_val).strip()
                                             
+                                            # ✅ Use inspector from parent scope
+                                            inspector_name = str(inspector).strip() or "Admin"
+                                            
                                             # บันทึกลง Google Sheet
                                             ok_r, msg_r = export_to_real_report(
                                                 final_pid, 
