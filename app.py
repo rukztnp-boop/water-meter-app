@@ -3083,7 +3083,17 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                     
                     # Manual edit
                     st.caption("📝 พิมพ์เอง:")
-                    # ✅ Get decimals to format correctly
+                    
+                    # ✅ Get point_id first (selectbox comes first)
+                    new_pid = st.selectbox(
+                        "point_id",
+                        options=[""] + all_pids,
+                        index=([""] + all_pids).index(str(rows[idx].get("point_id", "")).strip().upper()) 
+                               if str(rows[idx].get("point_id", "")).strip().upper() in ([""] + all_pids) else 0,
+                        key=f"manual_pid_{idx}"
+                    )
+                    
+                    # ✅ Get decimals to format correctly (now new_pid is defined)
                     cfg_manual = get_meter_config(new_pid or rows[idx].get("point_id", ""))
                     decimals_manual = int(cfg_manual.get('decimals', 0) or 0) if cfg_manual else 0
                     step_manual = 1.0 if decimals_manual == 0 else (10 ** (-decimals_manual))
@@ -3095,13 +3105,6 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                         step=step_manual,
                         format=fmt_manual,
                         key=f"manual_val_{idx}"
-                    )
-                    new_pid = st.selectbox(
-                        "point_id",
-                        options=[""] + all_pids,
-                        index=([""] + all_pids).index(str(rows[idx].get("point_id", "")).strip().upper()) 
-                               if str(rows[idx].get("point_id", "")).strip().upper() in ([""] + all_pids) else 0,
-                        key=f"manual_pid_{idx}"
                     )
                     
                     if st.button("💾 บันทึกแก้ไข", key=f"save_{idx}", use_container_width=True, type="primary"):
