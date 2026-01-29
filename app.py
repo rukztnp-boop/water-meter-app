@@ -2827,7 +2827,8 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
     with c_insp:
         inspector = st.text_input("ชื่อผู้บันทึก", "Admin", key="bulk_inspector")
     with c_date:
-        report_date = st.date_input("📅 วันที่ของรายงาน", value=get_thai_time().date(), key="bulk_date")
+        # ✅ ไม่ใช้ key ให้ date picker อ่านค่า default ทุกครั้ง (ไม่ cache)
+        report_date = st.date_input("📅 วันที่ของรายงาน", value=get_thai_time().date())
 
     norm_map = build_pid_norm_map()
     pm = load_points_master() or []
@@ -2841,6 +2842,17 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
     )
     if not up_files:
         st.stop()
+
+    # ✅ ตรวจสอบว่ากลุ่มไฟล์เปลี่ยนหรือเปล่า → ถ้าเปลี่ยน reset bulk_rows
+    current_file_ids = tuple(sorted([f.name for f in up_files]))
+    if "bulk_last_files" not in st.session_state:
+        st.session_state["bulk_last_files"] = None
+    
+    if st.session_state["bulk_last_files"] != current_file_ids:
+        # ✅ ไฟล์เปลี่ยนแล้ว → reset all state
+        st.session_state["bulk_rows"] = None
+        st.session_state["bulk_expanded"] = {}
+        st.session_state["bulk_last_files"] = current_file_ids
 
     # แตกไฟล์: รองรับ zip + รูปตรง ๆ
     images = []  # [{name, bytes}]
