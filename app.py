@@ -2413,7 +2413,8 @@ def extract_dashboard_flow_values(image_bytes: bytes, debug: bool = False):
         if len(num_tokens) >= 3:
             p   = _parse_number(num_tokens[0]["text"])
             fr  = _parse_number(num_tokens[1]["text"])
-            tot = _parse_number(num_tokens[2]["text"])
+            # ใช้ num_tokens[3] (TOT1) ถ้ามี 4 ตัวเลขขึ้นไป ไม่เช่นนั้นใช้ num_tokens[2]
+            tot = _parse_number(num_tokens[3]["text"]) if len(num_tokens) >= 4 else _parse_number(num_tokens[2]["text"])
             row.update({
                 "pressure_bar": p,
                 "flowrate_m3h": fr,
