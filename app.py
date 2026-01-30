@@ -1586,15 +1586,8 @@ def extract_scada_values_from_exports(
 
         value = rowvals[col_idx - 1]
 
-        # ทำให้เป็นเลข (ถ้าเป็น string)
-        try:
-            if isinstance(value, str):
-                vv = value.strip().replace(",", "")
-                value = float(vv) if vv != "" else None
-            elif isinstance(value, (int, float)):
-                value = float(value)
-        except Exception:
-            pass
+        # ทำให้เป็นเลข (ถ้าเป็น string) - ใช้ helper function
+        value = parse_scada_numeric_value(value)
 
         stt = "OK" if value is not None else "EMPTY"
         if stt != "OK":
@@ -1612,6 +1605,101 @@ def extract_scada_values_from_exports(
         })
 
     return results, missing
+
+
+def parse_scada_numeric_value(value):
+    """
+    Parse numeric value from SCADA export ที่อาจมีรูปแบบแตกต่างกัน
+    รองรับ: English format (123.45), Thai format (123,45), European format (1.234,56), etc.
+    
+    Returns:
+        float: parsed value, or None if cannot parse
+    """
+    if value is None:
+        return None
+    
+    # ถ้าเป็น number อยู่แล้ว
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except Exception:
+            return None
+    
+    # ถ้าเป็น string
+    if isinstance(value, str):
+        vv = value.strip()
+        
+        # Handle empty/invalid strings
+        if not vv or vv.lower() in ("", "none", "null", "-", "n/a", "na"):
+            return None
+        
+        # นับจำนวน dots และ commas
+        dot_count = vv.count(".")
+        comma_count = vv.count(",")
+        
+        try:
+            # Case 1: ไม่มี separator (เช่น "123" หรือ "12345")
+            if dot_count == 0 and comma_count == 0:
+                return float(vv)
+            
+            # Case 2: มี dot เดียว (English format เช่น "123.45")
+            elif dot_count == 1 and comma_count == 0:
+                return float(vv)
+            
+            # Case 3: มี comma เดียว - ต้องตรวจสอบว่าเป็น decimal หรือ thousands separator
+            elif dot_count == 0 and comma_count == 1:
+                # ถ้า comma หลังตัวที่ 3 จากท้าย -> น่าจะเป็น thousands separator
+                parts = vv.split(",")
+                if len(parts[-1]) > 3:
+                    # ตัวหลังสุดมากกว่า 3 หลัก -> เป็น decimal แน่ๆ
+                    return float(vv.replace(",", "."))
+                else:
+                    # ตัวหลังสุด <= 3 หลัก -> น่าจะเป็น thousands (เช่น 1,234) แต่อาจเป็น decimal (เช่น 1,5)
+                    # ให้ลอง parse แบบ decimal ก่อน ถ้าได้ค่า < 1 ให้ใช้ decimal มิฉะนั้น... ลองนึกใหม่
+                    # สำหรับ SCADA โดยทั่วไป: ถ้ามี comma เดียวแล้ว น่าจะเป็น decimal more often
+                    return float(vv.replace(",", "."))
+            
+            # Case 4: มี dot และ comma (thousand separator + decimal)
+            elif dot_count == 1 and comma_count == 1:
+                last_dot = vv.rfind(".")
+                last_comma = vv.rfind(",")
+                
+                if last_dot > last_comma:
+                    # English format with comma thousands: 1,234.56
+                    return float(vv.replace(",", ""))
+                else:
+                    # European format: 1.234,56
+                    return float(vv.replace(".", "").replace(",", "."))
+            
+            # Case 5: หลาย dots, ไม่มี comma (European thousands เช่น "1.234.567")
+            elif dot_count > 1 and comma_count == 0:
+                return float(vv.replace(".", ""))
+            
+            # Case 6: หลาย commas, ไม่มี dot
+            elif comma_count > 1 and dot_count == 0:
+                parts = vv.split(",")
+                # เชค: ถ้าตัวหลังสุดมี <= 3 หลักและอย่างน้อย 1 หลัก อาจเป็น decimal
+                last_part = parts[-1]
+                if 1 <= len(last_part) <= 3:
+                    # น่าจะเป็น decimal format (เช่น 1,234,567 with European decimal คือ 1234567.0)
+                    # แต่แบบนี้หายากมากสำหรับ SCADA ปกติ
+                    # ส่วนใหญ่ commas หลายตัว แปลว่า thousands separator
+                    return float(vv.replace(",", ""))
+                else:
+                    return float(vv.replace(",", ""))
+            
+            # Case 7: complex (หลาย dots และ commas)
+            else:
+                # ลองแบบ: remove dots แล้ว replace comma เป็น dot
+                temp = vv.replace(".", "").replace(",", ".")
+                return float(temp)
+        
+        except (ValueError, AttributeError):
+            return None
+    
+    return None
+
+
 def normalize_number_str(s: str, decimals: int = 0) -> str:
     if not s: return ""
     s = str(s).strip().replace(",", "").replace(" ", "")
