@@ -22,6 +22,22 @@ from google.cloud import storage
 from datetime import datetime, timedelta, timezone, time # ✅ เพิ่ม time
 import string
 
+# =========================================================
+# --- SQL SERVER IMPORTS (สำหรับ CUTEST SCADA Integration) ---
+# =========================================================
+try:
+    import pyodbc
+    HAS_PYODBC = True
+except ImportError:
+    HAS_PYODBC = False
+    
+try:
+    import sqlalchemy
+    from sqlalchemy import create_engine, text
+    HAS_SQLALCHEMY = True
+except ImportError:
+    HAS_SQLALCHEMY = False
+
 # =========================
 # Helpers / Utils (ต้องอยู่ก่อน UI)
 # =========================
@@ -642,6 +658,129 @@ def get_waterreport_progress_snapshot(target_date):
         "asof": asof,
         "error": "",
     }
+
+# =========================================================
+# --- SQL SERVER INTEGRATION (CUTEST SCADA 2018) ---
+# =========================================================
+def test_sql_connection(server: str, database: str, username: str, password: str) -> tuple[bool, str]:
+    """
+    ทดสอบเชื่อมต่อ SQL Server
+    คืนค่า: (success: bool, message: str)
+    """
+    if not HAS_PYODBC:
+        return False, "❌ pyodbc ไม่ได้ติดตั้ง: pip install pyodbc"
+    
+    try:
+        conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};DATABASE={database};UID={username};PWD={password};Connection Timeout=5"
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+        cursor.execute("SELECT @@version")
+        result = cursor.fetchone()
+        conn.close()
+        return True, f"✅ เชื่อมต่อสำเร็จ\n{result[0][:100]}"
+    except Exception as e:
+        return False, f"❌ เชื่อมต่อไม่สำเร็จ:\n{str(e)[:200]}"
+
+def query_scada_values(
+    server: str, 
+    database: str, 
+    username: str, 
+    password: str,
+    point_id: str,
+    target_date: datetime.date,
+    target_time: str = None
+) -> dict:
+    """
+    ดึงค่าจาก CUTEST SCADA SQL Server
+    
+    CUTEST Scada 2018 มักเก็บข้อมูลในตาราง:
+    - [History_Data] หรือ [Readings]
+    - คอลัมน์: TagName, Value, Timestamp
+    
+    คืนค่า: {
+        "success": bool,
+        "value": float or None,
+        "timestamp": str,
+        "message": str,
+        "all_records": list (ถ้า success)
+    }
+    """
+    if not HAS_PYODBC:
+        return {"success": False, "message": "pyodbc ไม่ได้ติดตั้ง"}
+    
+    try:
+        conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};DATABASE={database};UID={username};PWD={password}"
+        conn = pyodbc.connect(conn_str, timeout=10)
+        cursor = conn.cursor()
+        
+        # พยายามหา table ที่มีข้อมูล
+        table_candidates = ["History_Data", "Readings", "dbo.History_Data", "dbo.Readings", "TagHistory"]
+        query_result = None
+        table_found = None
+        
+        date_str = target_date.strftime("%Y-%m-%d")
+        
+        for table in table_candidates:
+            try:
+                # คำสั่ง SQL ที่ยืดหยุ่น (ต้องปรับตามโครงสร้าง CUTEST จริง)
+                query = f"""
+                SELECT TOP 100 TagName, Value, Timestamp 
+                FROM {table}
+                WHERE TagName LIKE '%{point_id}%'
+                  AND CAST(Timestamp AS DATE) = '{date_str}'
+                ORDER BY Timestamp DESC
+                """
+                cursor.execute(query)
+                query_result = cursor.fetchall()
+                table_found = table
+                if query_result:
+                    break
+            except:
+                continue
+        
+        conn.close()
+        
+        if not query_result:
+            return {
+                "success": False,
+                "message": f"ไม่พบข้อมูล point_id='{point_id}' ในวันที่ {date_str}",
+                "all_records": []
+            }
+        
+        # แปลงผล
+        records = []
+        latest_value = None
+        latest_time = None
+        
+        for row in query_result:
+            tag_name = row[0]
+            value = row[1]
+            timestamp = row[2]
+            records.append({
+                "tag": tag_name,
+                "value": value,
+                "timestamp": str(timestamp)
+            })
+            if latest_value is None:
+                latest_value = value
+                latest_time = str(timestamp)
+        
+        return {
+            "success": True,
+            "value": latest_value,
+            "timestamp": latest_time,
+            "table": table_found,
+            "record_count": len(records),
+            "all_records": records,
+            "message": f"✅ พบข้อมูล {len(records)} แถว จากตาราง {table_found}"
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"❌ เกิดข้อผิดพลาด:\n{str(e)[:300]}",
+            "all_records": []
+        }
 
 def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, target_date, image_url="-"):
     try:
@@ -2478,7 +2617,8 @@ mode = st.sidebar.radio(
      "📸 อัปโหลดรูปทั้งวัน (มี point_id ในรูป)",
      "📥 อัปโหลด Excel (SCADA Export)",
      "🖥️ Dashboard Screenshot (OCR)",
-     "👮‍♂️ Admin Approval"]
+     "�️ SQL Server (CUTEST SCADA - Test)",
+     "�👮‍♂️ Admin Approval"]
 )
 if mode == "📝 พนักงานจดมิเตอร์":
     st.title("Smart Meter System")
@@ -3450,7 +3590,124 @@ elif mode == "🖥️ Dashboard Screenshot (OCR)":
             st.error(f"❌ ไม่สำเร็จ: {len(fail_list) + len(fail_report)} จุด")
             st.write([[pid, reason] for pid, reason in (fail_list + list(fail_report))])
 
-elif mode == "👮‍♂️ Admin Approval":
+elif mode == "�️ SQL Server (CUTEST SCADA - Test)":
+    st.title("🗄️ SQL Server Integration (Test Mode)")
+    st.markdown("### ดึงข้อมูลจาก CUTEST SCADA 2018 SQL Server โดยตรง")
+    
+    st.warning("⚠️ นี่คือโหมดทดสอบ (Test Mode) - ยังไม่เก็บข้อมูลลง Google Sheet")
+    
+    if not HAS_PYODBC:
+        st.error("❌ ต้องติดตั้ง pyodbc ก่อน\n```\npip install pyodbc\n```")
+        st.stop()
+    
+    st.markdown("---")
+    st.subheader("1️⃣ ตั้งค่าเชื่อมต่อ SQL Server")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        sql_server = st.text_input("Server Address", placeholder="192.168.1.100 หรือ localhost", value=st.session_state.get("sql_server", ""))
+        sql_username = st.text_input("Username", placeholder="sa", value=st.session_state.get("sql_username", ""))
+    
+    with col2:
+        sql_database = st.text_input("Database Name", placeholder="CUTEST_DB", value=st.session_state.get("sql_database", ""))
+        sql_password = st.text_input("Password", type="password", placeholder="password", value=st.session_state.get("sql_password", ""))
+    
+    if st.button("💾 บันทึกการตั้งค่า"):
+        st.session_state["sql_server"] = sql_server
+        st.session_state["sql_database"] = sql_database
+        st.session_state["sql_username"] = sql_username
+        st.success("✅ บันทึกการตั้งค่าแล้ว")
+    
+    if st.button("🔌 ทดสอบเชื่อมต่อ", type="primary"):
+        if not sql_server or not sql_database or not sql_username:
+            st.error("❌ กรุณากรอกข้อมูลให้ครบ")
+        else:
+            with st.spinner("กำลังทดสอบเชื่อมต่อ..."):
+                success, message = test_sql_connection(sql_server, sql_database, sql_username, sql_password)
+                if success:
+                    st.success(message)
+                else:
+                    st.error(message)
+    
+    st.markdown("---")
+    st.subheader("2️⃣ ดึงค่าจาก SCADA")
+    
+    all_meters = load_points_master()
+    meter_choices = {m['point_id']: f"{m['point_id']} - {m.get('device_name', '')}" for m in all_meters if m.get('point_id')}
+    
+    if not meter_choices:
+        st.warning("❌ ไม่พบ Point ID ใน PointsMaster")
+    else:
+        selected_pid = st.selectbox(
+            "เลือก Point ID",
+            options=list(meter_choices.keys()),
+            format_func=lambda x: meter_choices[x]
+        )
+        
+        col_date, col_time = st.columns(2)
+        with col_date:
+            query_date = st.date_input("เลือกวันที่", value=get_thai_time().date())
+        with col_time:
+            query_time = st.text_input("เวลา (HH:MM) - ไม่บังคับ", placeholder="14:30")
+        
+        if st.button("🔍 ดึงข้อมูล", type="primary"):
+            if not sql_server or not sql_database or not sql_username:
+                st.error("❌ กรุณากรอกข้อมูล SQL Server ให้ครบ")
+            else:
+                with st.spinner("กำลังดึงข้อมูล..."):
+                    result = query_scada_values(
+                        sql_server,
+                        sql_database,
+                        sql_username,
+                        sql_password,
+                        selected_pid,
+                        query_date,
+                        query_time
+                    )
+                
+                if result["success"]:
+                    st.success("✅ ดึงข้อมูลสำเร็จ!")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("ค่าล่าสุด", f"{result.get('value', 'N/A')}")
+                    with col2:
+                        st.metric("เวลา", result.get('timestamp', 'N/A')[:19])
+                    with col3:
+                        st.metric("จำนวนแถว", result.get('record_count', 0))
+                    
+                    st.info(f"📊 จากตาราง: {result.get('table', 'Unknown')}")
+                    
+                    if result.get('all_records'):
+                        st.subheader("📋 ข้อมูลทั้งหมด")
+                        df_records = pd.DataFrame(result['all_records'])
+                        st.dataframe(df_records, use_container_width=True)
+                        
+                        csv_data = df_records.to_csv(index=False, encoding='utf-8-sig')
+                        st.download_button(
+                            "📥 ดาวน์โหลด CSV",
+                            csv_data,
+                            f"scada_{selected_pid}_{query_date}.csv",
+                            "text/csv"
+                        )
+                else:
+                    st.error(result.get('message', "เกิดข้อผิดพลาด"))
+    
+    st.markdown("---")
+    st.subheader("📝 หมายเหตุ")
+    st.info("""
+    **CUTEST SCADA 2018 ใช้ตาราง SQL:**
+    - `History_Data` - ข้อมูลประวัติหลัก
+    - `Readings` - ข้อมูลการอ่าน
+    - `TagHistory` - ประวัติ Tag
+    
+    **คอลัมน์ที่ต้องมี:**
+    - `TagName` หรือ `PointID` - รหัสจุดวัด
+    - `Value` - ค่าที่วัด
+    - `Timestamp` - เวลา
+    """)
+
+elif mode == "�👮‍♂️ Admin Approval":
     st.title("👮‍♂️ Admin Dashboard")
     st.caption("ระบบอนุมัติผลการอ่านค่ามิเตอร์น้ำ/ไฟ")
     if st.button("🔄 รีเฟรช"): st.rerun()
