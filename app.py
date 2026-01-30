@@ -893,6 +893,7 @@ def extract_scada_values_from_exports(
     file_key_map: dict | None = None,
     target_date=None,
     allow_single_file_fallback: bool = True,
+    custom_max_scan_rows: int = 0,
 ):
     """
     mapping_rows: list[dict] จาก load_scada_excel_mapping
@@ -1085,7 +1086,7 @@ def extract_scada_values_from_exports(
 
         return None
 
-    def get_sheet_ctx(fname: str, wb, sheet: str, target_date_local):
+    def get_sheet_ctx(fname: str, wb, sheet: str, target_date_local, custom_max_scan_rows: int = 0):
         key = (fname, sheet, target_date_local)
         if key in sheet_ctx_cache:
             return sheet_ctx_cache[key]
@@ -1129,7 +1130,10 @@ def extract_scada_values_from_exports(
         if date_col and target_date_local:
             started = False
             # กันเคสไฟล์ใหญ่มาก (AF_Report_Gen) ที่ ws.max_row หลอกจนค้าง
-            max_scan_rows = 50000  # ปรับได้ตามความเหมาะสม
+            if custom_max_scan_rows > 0:
+                max_scan_rows = custom_max_scan_rows
+            else:
+                max_scan_rows = 50000  # ค่าเริ่มต้น
             max_r = min(ws.max_row or 0, hdr_row + max_scan_rows)
             min_c = min(date_col, time_col)
             max_c = max(date_col, time_col)
@@ -1173,8 +1177,11 @@ def extract_scada_values_from_exports(
                     if blank_streak >= 200 and time_rows:
                         break
         else:
-            # ไฟล์ทั่วไป (Daily/SMMT): จำกัด scan 5000 แถวกัน max_row หลอก
-            max_scan_rows = 5000
+            # ไฟล์ทั่วไป (Daily/SMMT): จำกัด scan ตามค่า custom หรือ 100000 แถว (ไม่จำกัด)
+            if custom_max_scan_rows > 0:
+                max_scan_rows = custom_max_scan_rows
+            else:
+                max_scan_rows = 100000  # ค่าเริ่มต้นสแกนเกือบทั้งไฟล์
             max_r = min(ws.max_row or 0, hdr_row + max_scan_rows)
 
             for r, (tval,) in enumerate(
@@ -1276,7 +1283,7 @@ def extract_scada_values_from_exports(
             continue
 
         sheet = _resolve_sheet_name_for_export(wb, desired_sheet, point_id)
-        ctx = get_sheet_ctx(fname, wb, sheet, target_date)
+        ctx = get_sheet_ctx(fname, wb, sheet, target_date, custom_max_scan_rows=custom_max_scan_rows)
 
         if ctx.get("status") != "OK":
             stt = ctx.get("status")
@@ -3625,6 +3632,28 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
         key="scada_process_mode",
     )
 
+    # ⚙️ ตั้งค่า max_scan_rows
+    with st.expander("⚙️ ตั้งค่าการสแกน (กรณีดึงค่าไม่ครบ):"):
+        scan_option = st.radio(
+            "จำนวนแถวที่สแกนต่อไฟล์?",
+            ["🚀 สแกนแบบเร็ว (5,000 แถว)", "⚖️ สแกนตัวกลาง (50,000 แถว)", "🔍 สแกนเต็มที่ (100,000+ แถว)", "⚡ สแกนโดยไม่จำกัด (เนื่องจากอาจช้า)"],
+            index=1,  # ค่าเริ่มต้น: ตัวกลาง
+            horizontal=False,
+        )
+        
+        max_scan_rows_custom = 0  # ค่าเริ่มต้น = ปล่อยให้ระบบเลือก
+        if "🚀" in scan_option:
+            max_scan_rows_custom = 5000
+        elif "⚖️" in scan_option:
+            max_scan_rows_custom = 50000
+        elif "🔍" in scan_option:
+            max_scan_rows_custom = 100000
+        elif "⚡" in scan_option:
+            max_scan_rows_custom = 999999999  # ไม่จำกัด
+            st.warning("⚠️ โหมด 'ไม่จำกัด' อาจทำให้ระบบช้า หากไฟล์มีแถวมากมาย (เช่น > 500,000 แถว)")
+        
+        st.caption(f"ค่าปัจจุบัน: {max_scan_rows_custom:,} แถว" if max_scan_rows_custom else "ค่าปัจจุบัน: ปล่อยให้ระบบเลือก")
+
     all_files = list(files_dict.keys())
     new_files = [fn for fn in all_files if _is_new_file(files_dict.get(fn, {}))]
 
@@ -3748,6 +3777,7 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
                 file_key_map=file_key_map,
                 target_date=report_date,
                 allow_single_file_fallback=allow_single,
+                custom_max_scan_rows=max_scan_rows_custom,
             )
 
             # --- รวมผล: ถ้าอ่านเฉพาะไฟล์ใหม่/ไฟล์ที่เลือก ให้ 'เติมเพิ่ม' โดยไม่ลบของเดิม ---
