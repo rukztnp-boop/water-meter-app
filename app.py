@@ -30,6 +30,12 @@ try:
     HAS_PYODBC = True
 except ImportError:
     HAS_PYODBC = False
+
+try:
+    import pymssql
+    HAS_PYMSSQL = True
+except ImportError:
+    HAS_PYMSSQL = False
     
 try:
     import sqlalchemy
@@ -664,22 +670,54 @@ def get_waterreport_progress_snapshot(target_date):
 # =========================================================
 def test_sql_connection(server: str, database: str, username: str, password: str) -> tuple[bool, str]:
     """
-    ทดสอบเชื่อมต่อ SQL Server
+    ทดสอบเชื่อมต่อ SQL Server (รองรับ pyodbc, pymssql, sqlalchemy)
     คืนค่า: (success: bool, message: str)
     """
-    if not HAS_PYODBC:
-        return False, "❌ pyodbc ไม่ได้ติดตั้ง: pip install pyodbc"
+    # 🔹 Attempt 1: pymssql (แนะนำสำหรับ macOS/Linux)
+    if HAS_PYMSSQL:
+        try:
+            conn = pymssql.connect(
+                host=server,
+                user=username,
+                password=password,
+                database=database,
+                timeout=5
+            )
+            cursor = conn.cursor()
+            cursor.execute("SELECT @@version")
+            result = cursor.fetchone()
+            conn.close()
+            version = result[0] if result else "Unknown"
+            return True, f"✅ เชื่อมต่อสำเร็จ (pymssql)\n{str(version)[:100]}"
+        except Exception as e:
+            pass
     
-    try:
-        conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};DATABASE={database};UID={username};PWD={password};Connection Timeout=5"
-        conn = pyodbc.connect(conn_str)
-        cursor = conn.cursor()
-        cursor.execute("SELECT @@version")
-        result = cursor.fetchone()
-        conn.close()
-        return True, f"✅ เชื่อมต่อสำเร็จ\n{result[0][:100]}"
-    except Exception as e:
-        return False, f"❌ เชื่อมต่อไม่สำเร็จ:\n{str(e)[:200]}"
+    # 🔹 Attempt 2: sqlalchemy
+    if HAS_SQLALCHEMY:
+        try:
+            conn_str = f"mssql+pyodbc://{username}:{password}@{server}/{database}?driver=ODBC+Driver+17+for+SQL+Server"
+            engine = create_engine(conn_str, pool_pre_ping=True)
+            with engine.connect() as conn:
+                result = conn.execute(text("SELECT @@version"))
+                version = result.fetchone()[0]
+                return True, f"✅ เชื่อมต่อสำเร็จ (sqlalchemy)\n{str(version)[:100]}"
+        except Exception as e:
+            pass
+    
+    # 🔹 Attempt 3: pyodbc (Windows)
+    if HAS_PYODBC:
+        try:
+            conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};DATABASE={database};UID={username};PWD={password};Connection Timeout=5"
+            conn = pyodbc.connect(conn_str)
+            cursor = conn.cursor()
+            cursor.execute("SELECT @@version")
+            result = cursor.fetchone()
+            conn.close()
+            return True, f"✅ เชื่อมต่อสำเร็จ (pyodbc)\n{result[0][:100]}"
+        except Exception as e:
+            pass
+    
+    return False, "❌ ไม่มี driver SQL ที่ติดตั้ง\nต้องติดตั้ง: pip install pymssql"
 
 def query_scada_values(
     server: str, 
@@ -692,95 +730,156 @@ def query_scada_values(
 ) -> dict:
     """
     ดึงค่าจาก CUTEST SCADA SQL Server
-    
-    CUTEST Scada 2018 มักเก็บข้อมูลในตาราง:
-    - [History_Data] หรือ [Readings]
-    - คอลัมน์: TagName, Value, Timestamp
+    รองรับ: pymssql, sqlalchemy, pyodbc
     
     คืนค่า: {
         "success": bool,
         "value": float or None,
         "timestamp": str,
         "message": str,
-        "all_records": list (ถ้า success)
+        "all_records": list
     }
     """
-    if not HAS_PYODBC:
-        return {"success": False, "message": "pyodbc ไม่ได้ติดตั้ง"}
+    date_str = target_date.strftime("%Y-%m-%d")
+    table_candidates = ["History_Data", "Readings", "dbo.History_Data", "dbo.Readings", "TagHistory"]
     
-    try:
-        conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};DATABASE={database};UID={username};PWD={password}"
-        conn = pyodbc.connect(conn_str, timeout=10)
-        cursor = conn.cursor()
-        
-        # พยายามหา table ที่มีข้อมูล
-        table_candidates = ["History_Data", "Readings", "dbo.History_Data", "dbo.Readings", "TagHistory"]
-        query_result = None
-        table_found = None
-        
-        date_str = target_date.strftime("%Y-%m-%d")
-        
-        for table in table_candidates:
-            try:
-                # คำสั่ง SQL ที่ยืดหยุ่น (ต้องปรับตามโครงสร้าง CUTEST จริง)
-                query = f"""
-                SELECT TOP 100 TagName, Value, Timestamp 
-                FROM {table}
-                WHERE TagName LIKE '%{point_id}%'
-                  AND CAST(Timestamp AS DATE) = '{date_str}'
-                ORDER BY Timestamp DESC
-                """
-                cursor.execute(query)
-                query_result = cursor.fetchall()
-                table_found = table
-                if query_result:
-                    break
-            except:
-                continue
-        
-        conn.close()
-        
-        if not query_result:
+    # 🔹 Method 1: pymssql
+    if HAS_PYMSSQL:
+        try:
+            conn = pymssql.connect(
+                host=server,
+                user=username,
+                password=password,
+                database=database,
+                timeout=10
+            )
+            cursor = conn.cursor()
+            
+            for table in table_candidates:
+                try:
+                    query = f"""
+                    SELECT TOP 100 TagName, Value, Timestamp 
+                    FROM {table}
+                    WHERE TagName LIKE '%{point_id}%'
+                      AND CAST(Timestamp AS DATE) = '{date_str}'
+                    ORDER BY Timestamp DESC
+                    """
+                    cursor.execute(query)
+                    query_result = cursor.fetchall()
+                    if query_result:
+                        conn.close()
+                        return _process_sql_results(query_result, table, date_str, point_id)
+                except:
+                    continue
+            
+            conn.close()
             return {
                 "success": False,
                 "message": f"ไม่พบข้อมูล point_id='{point_id}' ในวันที่ {date_str}",
                 "all_records": []
             }
-        
-        # แปลงผล
-        records = []
-        latest_value = None
-        latest_time = None
-        
-        for row in query_result:
-            tag_name = row[0]
-            value = row[1]
-            timestamp = row[2]
-            records.append({
-                "tag": tag_name,
-                "value": value,
-                "timestamp": str(timestamp)
-            })
-            if latest_value is None:
-                latest_value = value
-                latest_time = str(timestamp)
-        
-        return {
-            "success": True,
-            "value": latest_value,
-            "timestamp": latest_time,
-            "table": table_found,
-            "record_count": len(records),
-            "all_records": records,
-            "message": f"✅ พบข้อมูล {len(records)} แถว จากตาราง {table_found}"
-        }
-        
-    except Exception as e:
-        return {
-            "success": False,
-            "message": f"❌ เกิดข้อผิดพลาด:\n{str(e)[:300]}",
-            "all_records": []
-        }
+        except Exception as e:
+            pass
+    
+    # 🔹 Method 2: sqlalchemy
+    if HAS_SQLALCHEMY:
+        try:
+            conn_str = f"mssql+pyodbc://{username}:{password}@{server}/{database}?driver=ODBC+Driver+17+for+SQL+Server"
+            engine = create_engine(conn_str, pool_pre_ping=True)
+            
+            for table in table_candidates:
+                try:
+                    query = f"""
+                    SELECT TOP 100 TagName, Value, Timestamp 
+                    FROM {table}
+                    WHERE TagName LIKE '%{point_id}%'
+                      AND CAST(Timestamp AS DATE) = '{date_str}'
+                    ORDER BY Timestamp DESC
+                    """
+                    with engine.connect() as conn:
+                        result = conn.execute(text(query))
+                        rows = result.fetchall()
+                        if rows:
+                            query_result = [(row[0], row[1], row[2]) for row in rows]
+                            return _process_sql_results(query_result, table, date_str, point_id)
+                except:
+                    continue
+            
+            return {
+                "success": False,
+                "message": f"ไม่พบข้อมูล point_id='{point_id}' ในวันที่ {date_str}",
+                "all_records": []
+            }
+        except Exception as e:
+            pass
+    
+    # 🔹 Method 3: pyodbc
+    if HAS_PYODBC:
+        try:
+            conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};DATABASE={database};UID={username};PWD={password}"
+            conn = pyodbc.connect(conn_str, timeout=10)
+            cursor = conn.cursor()
+            
+            for table in table_candidates:
+                try:
+                    query = f"""
+                    SELECT TOP 100 TagName, Value, Timestamp 
+                    FROM {table}
+                    WHERE TagName LIKE '%{point_id}%'
+                      AND CAST(Timestamp AS DATE) = '{date_str}'
+                    ORDER BY Timestamp DESC
+                    """
+                    cursor.execute(query)
+                    query_result = cursor.fetchall()
+                    if query_result:
+                        conn.close()
+                        return _process_sql_results(query_result, table, date_str, point_id)
+                except:
+                    continue
+            
+            conn.close()
+            return {
+                "success": False,
+                "message": f"ไม่พบข้อมูล point_id='{point_id}' ในวันที่ {date_str}",
+                "all_records": []
+            }
+        except Exception as e:
+            pass
+    
+    return {
+        "success": False,
+        "message": "❌ ไม่มี SQL driver ที่ติดตั้ง\nต้องติดตั้ง: pip install pymssql",
+        "all_records": []
+    }
+
+def _process_sql_results(query_result, table_found, date_str, point_id):
+    """ตัวช่วยสำหรับประมวลผลผลลัพธ์ SQL"""
+    records = []
+    latest_value = None
+    latest_time = None
+    
+    for row in query_result:
+        tag_name = row[0]
+        value = row[1]
+        timestamp = row[2]
+        records.append({
+            "tag": tag_name,
+            "value": value,
+            "timestamp": str(timestamp)
+        })
+        if latest_value is None:
+            latest_value = value
+            latest_time = str(timestamp)
+    
+    return {
+        "success": True,
+        "value": latest_value,
+        "timestamp": latest_time,
+        "table": table_found,
+        "record_count": len(records),
+        "all_records": records,
+        "message": f"✅ พบข้อมูล {len(records)} แถว จากตาราง {table_found}"
+    }
 
 def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, target_date, image_url="-"):
     try:
@@ -3596,9 +3695,35 @@ elif mode == "�️ SQL Server (CUTEST SCADA - Test)":
     
     st.warning("⚠️ นี่คือโหมดทดสอบ (Test Mode) - ยังไม่เก็บข้อมูลลง Google Sheet")
     
-    if not HAS_PYODBC:
-        st.error("❌ ต้องติดตั้ง pyodbc ก่อน\n```\npip install pyodbc\n```")
+    # ตรวจสอบว่ามี driver ที่ติดตั้ง
+    has_driver = HAS_PYMSSQL or HAS_PYODBC or HAS_SQLALCHEMY
+    if not has_driver:
+        st.error("""
+        ❌ ต้องติดตั้ง SQL Driver อย่างน้อยตัวหนึ่ง:
+        
+        **แนะนำสำหรับ macOS/Linux:**
+        ```
+        pip install pymssql
+        ```
+        
+        **หรือ (ทั่วไป):**
+        ```
+        pip install sqlalchemy
+        ```
+        
+        **หรือ (Windows):**
+        ```
+        pip install pyodbc
+        ```
+        """)
         st.stop()
+    
+    # แสดง driver ที่ใช้อยู่
+    driver_list = []
+    if HAS_PYMSSQL: driver_list.append("✅ pymssql")
+    if HAS_SQLALCHEMY: driver_list.append("✅ sqlalchemy")
+    if HAS_PYODBC: driver_list.append("✅ pyodbc")
+    st.info(f"🔌 Driver ที่พบ: {', '.join(driver_list)}")
     
     st.markdown("---")
     st.subheader("1️⃣ ตั้งค่าเชื่อมต่อ SQL Server")
