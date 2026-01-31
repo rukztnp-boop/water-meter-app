@@ -22,6 +22,22 @@ from google.cloud import storage
 from datetime import datetime, timedelta, timezone, time # ✅ เพิ่ม time
 import string
 
+# ✅ 1.3: Daily Report Logging System
+try:
+    from daily_report_logger import (
+        update_log_success,
+        update_log_failed,
+        print_daily_report,
+        get_daily_summary,
+    )
+    HAS_LOGGER = True
+except ImportError:
+    HAS_LOGGER = False
+    def update_log_success(*args, **kwargs): pass
+    def update_log_failed(*args, **kwargs): pass
+    def print_daily_report(*args, **kwargs): return "Logger not available"
+    def get_daily_summary(*args, **kwargs): return {}
+
 # =========================================================
 # --- SQL SERVER IMPORTS (สำหรับ CUTEST SCADA Integration) ---
 # =========================================================
@@ -3800,14 +3816,22 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                 wm = "overwrite" if write_mode_ui.startswith("เขียนทับ") else "empty_only"
                 ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True, write_mode=wm)
 
+                # ✅ 1.3: Update logging with results
+                if HAS_LOGGER:
+                    update_log_success(ok_pids)
+                    if fail_report:
+                        update_log_failed(fail_report)
+                    # Show daily report
+                    st.info(print_daily_report())
+
                 # ✅ Show results
                 if ok_pids:
                     st.success(f"✅ ลง WaterReport สำเร็จ: {len(ok_pids)} จุด")
                 
-                if fail_list or fail_report:
-                    st.error(f"❌ ไม่สำเร็จ: {len(fail_list) + len(fail_report)} จุด")
+                if fail_report:
+                    st.error(f"❌ ไม่สำเร็จ: {len(fail_report)} จุด")
                     with st.expander("📋 ดูรายละเอียด:"):
-                        for pid, reason in (fail_list + list(fail_report)):
+                        for pid, reason in fail_report:
                             st.caption(f"  • {pid}: {reason}")
                 
                 # ✅ Update rows status carefully
@@ -3966,10 +3990,18 @@ elif mode == "🖥️ Dashboard Screenshot (OCR)":
         with st.spinner("กำลังบันทึกลง WaterReport..."):
             ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True)
 
+        # ✅ 1.3: Update logging with results
+        if HAS_LOGGER:
+            update_log_success(ok_pids)
+            if fail_report:
+                update_log_failed(fail_report)
+            # Show daily report
+            st.info(print_daily_report())
+
         st.success(f"✅ บันทึกสำเร็จ: {len(ok_pids)} จุด")
-        if fail_list or fail_report:
-            st.error(f"❌ ไม่สำเร็จ: {len(fail_list) + len(fail_report)} จุด")
-            st.write([[pid, reason] for pid, reason in (fail_list + list(fail_report))])
+        if fail_report:
+            st.error(f"❌ ไม่สำเร็จ: {len(fail_report)} จุด")
+            st.write([[pid, reason] for pid, reason in fail_report])
 
 elif mode == "�️ SQL Server (CUTEST SCADA - Test)":
     st.title("🗄️ SQL Server Integration (Test Mode)")
@@ -4644,8 +4676,16 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
                 wm = "overwrite" if write_mode_ui.startswith("เขียนทับ") else "empty_only"
                 ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True, write_mode=wm)
 
+            # ✅ 1.3: Update logging with results
+            if HAS_LOGGER:
+                update_log_success(ok_pids)
+                if fail_report:
+                    update_log_failed(fail_report)
+                # Show daily report
+                st.info(print_daily_report())
+
             report_ok = len(ok_pids)
-            report_fail = fail_list + list(fail_report)
+            report_fail = list(fail_report)
 
             # แยก 'ข้ามเพราะช่องมีข้อมูลแล้ว' ออกจาก error จริง
             skipped = [(pid, reason) for pid, reason in report_fail if str(reason) == 'SKIP_NON_EMPTY']
