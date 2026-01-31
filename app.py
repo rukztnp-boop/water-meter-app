@@ -209,19 +209,69 @@ def col_to_index(col_str):
     return num
 
 # ✅ แก้ไข: รับวันที่เข้ามาเพื่อหา Sheet เดือนที่ถูกต้อง (เผื่อลงย้อนหลังข้ามเดือน)
+# ✅ Support both Thai and English month names with comprehensive month rollover handling
 def get_thai_sheet_name(sh, target_date):
+    """Find the correct monthly sheet based on target_date.
+    
+    Supports multiple naming conventions:
+    - Thai months: ม.ค. 68, ก.พ. 68, etc.
+    - English months: Jan2026, Feb2026, January2026, etc.
+    
+    Args:
+        sh: gspread Spreadsheet object
+        target_date: datetime.date object to find the correct month
+    
+    Returns:
+        Sheet title if found, None otherwise
+    """
     thai_months = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
+    english_months_short = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    english_months_long = ["January", "February", "March", "April", "May", "June", 
+                           "July", "August", "September", "October", "November", "December"]
     
     # ใช้วันที่ที่เลือก (target_date) แทนเวลาปัจจุบัน
     m_idx = target_date.month - 1
-    # ปีพุทธศักราช
-    yy = str(target_date.year + 543)[-2:]
+    # ปีพุทธศักราช (2 หรือ 4 หลัก)
+    yy2 = str(target_date.year + 543)[-2:]
+    yy4 = str(target_date.year + 543)
+    # ปีค.ศ. (2 หรือ 4 หลัก)
+    ad_yy2 = str(target_date.year)[-2:]
+    ad_yy4 = str(target_date.year)
     
-    patterns = [f"{thai_months[m_idx]}{yy}", f"{thai_months[m_idx][:-1]}{yy}", f"{thai_months[m_idx]} {yy}", f"{thai_months[m_idx][:-1]} {yy}"]
     all_sheets = [s.title for s in sh.worksheets()]
-    for p in patterns:
+    
+    # Try Thai month patterns first (highest priority)
+    thai_patterns = [
+        f"{thai_months[m_idx]}{yy2}",      # ม.ค.68
+        f"{thai_months[m_idx][:-1]}{yy2}", # ม.ค68  (without dot)
+        f"{thai_months[m_idx]} {yy2}",     # ม.ค. 68
+        f"{thai_months[m_idx][:-1]} {yy2}",# ม.ค 68
+        f"{thai_months[m_idx]}{yy4}",      # ม.ค.2568
+        f"{thai_months[m_idx][:-1]}{yy4}", # ม.ค2568
+        f"{thai_months[m_idx]} {yy4}",     # ม.ค. 2568
+        f"{thai_months[m_idx][:-1]} {yy4}",# ม.ค 2568
+    ]
+    
+    for p in thai_patterns:
         if p in all_sheets:
             return p
+    
+    # Try English month patterns (short names)
+    eng_patterns = [
+        f"{english_months_short[m_idx]}{ad_yy4}",  # Jan2026
+        f"{english_months_short[m_idx]} {ad_yy4}", # Jan 2026
+        f"{english_months_short[m_idx]}{ad_yy2}",  # Jan26
+        f"{english_months_short[m_idx]} {ad_yy2}", # Jan 26
+        f"{english_months_long[m_idx]}{ad_yy4}",   # January2026
+        f"{english_months_long[m_idx]} {ad_yy4}",  # January 2026
+        f"{english_months_long[m_idx]}{ad_yy2}",   # January26
+        f"{english_months_long[m_idx]} {ad_yy2}",  # January 26
+    ]
+    
+    for p in eng_patterns:
+        if p in all_sheets:
+            return p
+    
     return None
 
 def find_day_row_exact(ws, day: int):
@@ -308,17 +358,29 @@ def export_to_real_report(point_id, read_value, inspector, report_col, target_da
     if not sheet_name:
         try:
             thai_months = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
+            english_months_short = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+            english_months_long = ["January", "February", "March", "April", "May", "June", 
+                                   "July", "August", "September", "October", "November", "December"]
+            
             m_idx = target_date.month - 1
-            yy2 = str(target_date.year + 543)[-2:]
-            yy4 = str(target_date.year + 543)
-            m_norm = thai_months[m_idx].replace(".", "").replace(" ", "")
+            yy2_thai = str(target_date.year + 543)[-2:]
+            yy4_thai = str(target_date.year + 543)
+            yy2_ad = str(target_date.year)[-2:]
+            yy4_ad = str(target_date.year)
+            
+            m_norm_thai = thai_months[m_idx].replace(".", "").replace(" ", "")
 
             def norm(x):
-                return str(x).replace(".", "").replace(" ", "").strip()
+                return str(x).replace(".", "").replace(" ", "").lower().strip()
 
             for t in [s.title for s in sh.worksheets()]:
                 tn = norm(t)
-                if (m_norm in tn) and (yy2 in tn or yy4 in tn):
+                # Check Thai month patterns
+                if (m_norm_thai.lower() in tn) and (yy2_thai in tn or yy4_thai in tn):
+                    sheet_name = t
+                    break
+                # Check English month patterns (case-insensitive)
+                if (english_months_short[m_idx].lower() in tn or english_months_long[m_idx].lower() in tn) and (yy2_ad in tn or yy4_ad in tn):
                     sheet_name = t
                     break
         except Exception:
