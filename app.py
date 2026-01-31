@@ -965,6 +965,9 @@ def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, targ
 def _normalize_scada_time(value):
     """
     แปลงเวลาให้เป็นรูปแบบ 'HH:MM' เพื่อเทียบกันง่าย (รองรับ time/datetime/str/float)
+    
+    ✅ 24:00 standardization:
+    - 24:00 → 23:55 (standard for end-of-day)
     """
     import datetime as _dt
     if value is None:
@@ -975,22 +978,41 @@ def _normalize_scada_time(value):
         seconds = int(round(float(value) * 24 * 60 * 60))
         h = (seconds // 3600) % 24
         m = (seconds % 3600) // 60
-        return f"{h:02d}:{m:02d}"
+        result = f"{h:02d}:{m:02d}"
+        # Apply 24:00 → 23:55 conversion
+        if h == 24 and m == 0:
+            return "23:55"
+        return result
 
     if isinstance(value, _dt.datetime):
         value = value.time()
     if isinstance(value, _dt.time):
-        return f"{value.hour:02d}:{value.minute:02d}"
+        result = f"{value.hour:02d}:{value.minute:02d}"
+        # Apply 24:00 → 23:55 conversion
+        if value.hour == 24 and value.minute == 0:
+            return "23:55"
+        return result
 
     s = str(value).strip()
-    # 23.55
+    # 23.55 or 24.00
     if re.match(r"^\d{1,2}\.\d{2}$", s):
         h, m = s.split(".")
-        return f"{int(h):02d}:{int(m):02d}"
-    # 23:55 or 23:55:00
+        h = int(h)
+        m = int(m)
+        # ✅ 24:00 → 23:55 conversion
+        if h == 24 and m == 0:
+            return "23:55"
+        return f"{h:02d}:{m:02d}"
+    
+    # 23:55 or 24:00 or 23:55:00 or 24:00:00
     if re.match(r"^\d{1,2}:\d{2}", s):
         parts = s.split(":")
-        return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+        h = int(parts[0])
+        m = int(parts[1])
+        # ✅ 24:00 → 23:55 conversion
+        if h == 24 and m == 0:
+            return "23:55"
+        return f"{h:02d}:{m:02d}"
 
     return None
 
@@ -1068,12 +1090,123 @@ def _find_cell_exact(ws, target_text: str, max_rows=60, max_cols=40):
     return None
 
 
-def _hhmm_to_minutes(hhmm: str):
+def _hhmm_to_minutes(hhmm: str, normalize_24_00=True):
+    """
+    แปลง HH:MM เป็นจำนวนนาทีตั้งแต่เที่ยงคืน
+    
+    ✅ 24:00 standardization:
+    - 24:00 ถือว่าเป็น 23:55 (สุดท้ายของวัน)
+    - กำหนดมาตรฐาน: "24:00 ของวัน D" = "23:55 ของวัน D"
+    
+    Args:
+        hhmm: string format "HH:MM" (e.g., "24:00", "23:55")
+        normalize_24_00: if True, convert 24:00 → 23:55
+    
+    Returns:
+        minutes since midnight, or None if invalid
+    """
     try:
         h, m = str(hhmm).split(":")
-        return int(h) * 60 + int(m)
+        h = int(h)
+        m = int(m)
+        
+        # ✅ Handle 24:00 normalization
+        if normalize_24_00 and h == 24 and m == 0:
+            # 24:00 ของวัน D = 23:55 ของวัน D
+            return 23 * 60 + 55
+        
+        # Validate time range
+        if h < 0 or h > 23 or m < 0 or m > 59:
+            return None
+        
+        return h * 60 + m
     except Exception:
         return None
+
+
+def _minutes_to_hhmm(minutes: int) -> str:
+    """
+    แปลงนาทีมาเป็น HH:MM format
+    """
+    try:
+        h = minutes // 60
+        m = minutes % 60
+        return f"{h:02d}:{m:02d}"
+    except Exception:
+        return None
+
+
+def _normalize_time_to_standard(hhmm: str) -> str:
+    """
+    Normalize any time format to standard HH:MM
+    
+    ✅ 24:00 standardization (สำคัญ):
+    - Input: "24:00" → Output: "23:55"
+    - This is the company standard for end-of-day
+    
+    Returns:
+        Normalized time string, or None if invalid
+    """
+    try:
+        # First normalize to HH:MM
+        normalized = _normalize_scada_time(hhmm)
+        if not normalized:
+            return None
+        
+        h, m = normalized.split(":")
+        h = int(h)
+        m = int(m)
+        
+        # ✅ Apply 24:00 → 23:55 conversion
+        if h == 24 and m == 0:
+            return "23:55"
+        
+        if h < 0 or h > 23 or m < 0 or m > 59:
+            return None
+        
+        return f"{h:02d}:{m:02d}"
+    except Exception:
+        return None
+
+
+def _find_nearest_time_row(time_rows: list, target_minutes: int, max_diff_minutes: int = 300) -> int:
+    """
+    Find the row with time closest to target_minutes (nearest time algorithm)
+    
+    ✅ Key feature: Handles missing data by finding nearest available time
+    
+    Args:
+        time_rows: list of tuples (row_number, minutes_since_midnight)
+        target_minutes: target time in minutes (e.g., 1435 for 23:55)
+        max_diff_minutes: max allowed difference (default 5 mins = 300 sec)
+    
+    Returns:
+        row_number if found, None otherwise
+    
+    Example:
+        time_rows = [(10, 1430), (11, 1435), (12, 1440)]  # 23:50, 23:55, 24:00→23:55
+        target = 1435  # 23:55
+        → returns 11 (exact match)
+        
+        If 23:55 data missing, still finds nearest (23:50 or 00:00)
+    """
+    if not time_rows:
+        return None
+    
+    if target_minutes is None:
+        # No target specified, return last available
+        return time_rows[-1][0]
+    
+    # Find closest match
+    nearest = min(time_rows, key=lambda x: abs(x[1] - target_minutes))
+    diff = abs(nearest[1] - target_minutes)
+    
+    # Only return if within acceptable range
+    if diff <= max_diff_minutes:
+        return nearest[0]
+    
+    # If no match within range, return last available (fallback)
+    return time_rows[-1][0]
 
 
 
@@ -1116,10 +1249,9 @@ def _extract_value_from_ws(ws, target_time_hhmm, value_col_letter: str, time_hea
     # เลือกแถวที่ “ใกล้เวลาเป้าหมายที่สุด”
     if target_time_hhmm:
         tmm = _hhmm_to_minutes(target_time_hhmm)
-        if tmm is None:
+        target_row = _find_nearest_time_row(time_rows, tmm, max_diff_minutes=300)
+        if target_row is None:
             target_row = time_rows[-1][0]
-        else:
-            target_row = min(time_rows, key=lambda x: abs(x[1] - tmm))[0]
     else:
         target_row = time_rows[-1][0]
 
@@ -1530,10 +1662,9 @@ def extract_scada_values_from_exports(
             return ctx["target_row_cache"][target_time_hhmm]
 
         tmm = _hhmm_to_minutes(target_time_hhmm)
-        if tmm is None:
+        row = _find_nearest_time_row(ctx["time_rows"], tmm, max_diff_minutes=300)
+        if row is None:
             row = ctx["time_rows"][-1][0]
-        else:
-            row = min(ctx["time_rows"], key=lambda x: abs(x[1] - tmm))[0]
 
         ctx["target_row_cache"][target_time_hhmm] = row
         return row
