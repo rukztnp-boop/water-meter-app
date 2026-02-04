@@ -2075,9 +2075,38 @@ def _extract_vsd_previous_day_kwh(words: list, debug: bool = False) -> tuple[flo
             except:
                 pass
     
+    # 🔥 ถ้าบรรทัดปัจจุบันไม่มีเลข หรือมีแต่เลขเมนู ให้ดูบรรทัดถัดไป
+    next_line = None
+    target_idx = lines.index(target_line)
+    if target_idx + 1 < len(lines):
+        next_line = lines[target_idx + 1]
+    
+    if not numbers or (numbers and all(re.match(r"^0[0-9]\.[0-9]{2}$", n["text"]) for n in numbers)):
+        if debug:
+            print("⚠️ VSD: บรรทัดปัจจุบันไม่มีค่า kWh ที่ชัดเจน, ลองดูบรรทัดถัดไป...")
+        
+        # ดึงตัวเลขจากบรรทัดถัดไป
+        if next_line:
+            for word in next_line["words"]:
+                text = word["text"].replace("O", "0").replace("o", "0").replace("l", "1").replace("I", "1").replace("|", "1")
+                if re.match(r"^\d+\.?\d*$", text):
+                    try:
+                        val = float(text)
+                        # Skip เลขเมนู (01.XX, 02.XX, etc.)
+                        if not re.match(r"^0[0-9]\.[0-9]{2}$", text):
+                            numbers.append({
+                                "value": val,
+                                "x": word["center_x"],
+                                "text": text
+                            })
+                    except:
+                        pass
+            if debug and numbers:
+                print(f"✅ เจอค่าในบรรทัดถัดไป: {next_line['text']}")
+    
     if not numbers:
         if debug:
-            print("⚠️ VSD: ไม่เจอตัวเลขในบรรทัดเป้าหมาย")
+            print("⚠️ VSD: ไม่เจอตัวเลขในบรรทัดเป้าหมายและบรรทัดถัดไป")
         return None, 0
     
     # เลือกเลขที่อยู่ฝั่งขวาสุด (x มากสุด)
