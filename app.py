@@ -3345,6 +3345,14 @@ def _norm_pid_key(s: str) -> str:
     s = re.sub(r"\s+", "_", s)          # space -> _
     s = re.sub(r"[^A-Z0-9_]", "", s)    # ตัดสัญลักษณ์แปลกๆ
     s = re.sub(r"_+", "_", s).strip("_")
+    
+    # 🔥 แก้ไข OCR ที่อาจอ่านผิด (common mistakes)
+    # S→3, B→8, O→0, I→1, Z→2
+    s = s.replace("S_", "3_")  # S11 → 311 ไม่ใช่, แต่ BP_S → BP_3 ใช่
+    s = s.replace("_S_", "_3_")
+    s = s.replace("_S", "_3")
+    # ไม่แปลง S ที่เป็นตัวอักษรเริ่มต้น เช่น S11A
+    
     return s
 
 @st.cache_data(ttl=3600)
@@ -3388,7 +3396,13 @@ def find_point_id_from_text(ocr_text: str, norm_map: dict):
         return best
 
     # 2) fuzzy จาก pattern ที่เหมือน point_id
-    cand = re.findall(r"[A-Z]{1,3}_[A-Z0-9]{1,10}(?:_[A-Z0-9]{1,10}){1,5}", t)
+    # ✅ แก้ไข: รองรับ underscore 1+ ตัว (ไม่บังคับ 2+)
+    # Pattern ใหม่: X_Y หรือ X_Y_Z หรือ X_Y_Z_W ฯลฯ
+    cand = re.findall(r"[A-Z]{1,4}_[A-Z0-9_]{2,}", t)
+    if not cand:
+        # Fallback: ลองหา pattern แบบเก่า (2+ underscores)
+        cand = re.findall(r"[A-Z]{1,3}_[A-Z0-9]{1,10}(?:_[A-Z0-9]{1,10}){1,5}", t)
+    
     if not cand:
         return None
 
@@ -3401,20 +3415,40 @@ def find_point_id_from_text(ocr_text: str, norm_map: dict):
                 best_score = sc
                 best_pid = orig
 
-    return best_pid if best_score >= 0.78 else None
+    # ✅ ลด threshold จาก 0.78 → 0.70 เพื่อรองรับ OCR ที่อ่านผิดเล็กน้อย
+    return best_pid if best_score >= 0.70 else None
 
 def extract_point_id_from_image(image_bytes: bytes, norm_map: dict):
     """คืนค่า (point_id หรือ None, ocr_text ที่ใช้)"""
     # pass1: OCR เฉพาะช่วงล่างก่อน
     btm = _crop_bottom_bytes(image_bytes, frac=0.40)
     txt, _err = _vision_read_text(btm)
+    
+    # 🔍 Debug: แสดง OCR result
+    if txt:
+        print(f"🔍 OCR Bottom 40%: {txt[:200]}")
+        normalized = _norm_pid_key(txt)
+        print(f"🔍 Normalized: {normalized[:200]}")
+    
     pid = find_point_id_from_text(txt, norm_map)
     if pid:
+        print(f"✅ Found point_id from bottom: {pid}")
         return pid, txt
 
     # pass2: fallback OCR ทั้งภาพ
     txt2, _err2 = _vision_read_text(image_bytes)
+    
+    if txt2:
+        print(f"🔍 OCR Full image: {txt2[:200]}")
+        normalized2 = _norm_pid_key(txt2)
+        print(f"🔍 Normalized: {normalized2[:200]}")
+    
     pid2 = find_point_id_from_text(txt2, norm_map)
+    if pid2:
+        print(f"✅ Found point_id from full: {pid2}")
+    else:
+        print(f"⚠️ No point_id found. Available patterns in norm_map: {list(norm_map.keys())[:10]}")
+    
     return pid2, txt2
 
     
