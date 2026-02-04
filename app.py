@@ -2068,6 +2068,10 @@ def is_digital_meter(config):
     blob = f"{config.get('type','')} {config.get('name','')} {config.get('keyword','')}".lower()
     return ("digital" in blob) or ("scada" in blob) or (int(config.get('decimals', 0) or 0) > 0)
 
+def is_analog_meter(config):
+    """เช็คว่าเป็นมิเตอร์อนาล็อก (ไม่ใช่ดิจิทัล)"""
+    return not is_digital_meter(config)
+
 def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -2093,21 +2097,34 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
                 img = img[y1:y2, x1:x2]
                 H, W = img.shape[:2]
 
-    if config.get('ignore_red', False):
+    # ✅ มิเตอร์อนาล็อก: บังคับตัดเลขแดง/ทศนิยม (เอาเฉพาะเลขดำ)
+    is_analog = is_analog_meter(config)
+    ignore_red = config.get('ignore_red', False) or is_analog
+    
+    if ignore_red:
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        # ✅ เข้มงวดมาก: ตัดเฉพาะเลขแดงเจาะจง
-        # Red range ที่เข้มงวด: H=[0,10] หรือ [170,180] + S>=85 + V>=70
-        lower_red1 = np.array([0, 85, 70])
-        upper_red1 = np.array([10, 255, 255])
-        lower_red2 = np.array([170, 85, 70])
-        upper_red2 = np.array([180, 255, 255])
+        
+        # ✅ มิเตอร์อนาล็อก: ใช้ threshold เข้มงวดกว่า (ตัดเลขแดงทั้งหมด)
+        if is_analog:
+            # เข้มงวดมาก: ตัดทุกสีแดง-ส้ม
+            lower_red1 = np.array([0, 60, 60])   # เข้มงวดกว่า
+            upper_red1 = np.array([15, 255, 255])
+            lower_red2 = np.array([165, 60, 60])  # เข้มงวดกว่า
+            upper_red2 = np.array([180, 255, 255])
+        else:
+            # มิเตอร์ดิจิทัล: ใช้ threshold ปกติ
+            lower_red1 = np.array([0, 85, 70])
+            upper_red1 = np.array([10, 255, 255])
+            lower_red2 = np.array([170, 85, 70])
+            upper_red2 = np.array([180, 255, 255])
         
         mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
         
         # ✅ Morphological operations: ทำให้ mask ติดกัน
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel, iterations=2)
-        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel, iterations=1)
+        kernel_size = (7, 7) if is_analog else (5, 5)  # อนาล็อกใช้ kernel ใหญ่กว่า
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, kernel_size)
+        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel, iterations=3 if is_analog else 2)
+        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel, iterations=2 if is_analog else 1)
         
         # ✅ เปลี่ยนเลขแดงเป็นสีขาว (255,255,255)
         img[mask_red > 0] = [255, 255, 255]
@@ -2248,10 +2265,72 @@ def _vision_read_text(processed_bytes):
     except Exception as e:
         return "", str(e)
 
+def detect_anomaly(new_value: float, point_id: str, expected_digits: int = 0) -> tuple[bool, str]:
+    """
+    ตรวจจับค่าผิดปกติ - ถ้าค่ากระโดดผิดธรรมชาติ
+    คืนค่า: (is_anomaly: bool, reason: str)
+    """
+    try:
+        # ดึงค่าล่าสุดจาก DailyReadings
+        sh = gc.open(DB_SHEET_NAME)
+        ws = sh.worksheet("DailyReadings")
+        
+        # อ่านแถวล่าสุด 10 แถว (ตามหลัง header)
+        rows = ws.get_all_values()
+        if len(rows) <= 1:
+            return False, ""  # ไม่มีข้อมูลเก่า
+        
+        # หาค่าล่าสุดของ point_id นี้
+        last_value = None
+        for row in reversed(rows[1:]):  # ข้าม header
+            if len(row) >= 7 and row[2] == point_id:  # col[2] = point_id
+                try:
+                    # col[4] = manual_val, col[5] = ai_val
+                    val_str = row[5] if row[5] and row[5].strip() and row[5].strip() != '-' else row[4]
+                    if val_str and val_str.strip() and val_str.strip() != '-':
+                        last_value = float(val_str)
+                        break
+                except:
+                    continue
+        
+        if last_value is None:
+            return False, ""  # ไม่มีค่าเก่า
+        
+        # ตรวจสอบการกระโดด
+        ratio = new_value / last_value if last_value > 0 else float('inf')
+        
+        # กรณีที่ 1: ค่าใหม่กระโดดขึ้นมากกว่า 100 เท่า
+        if ratio > 100:
+            return True, f"⚠️ ค่ากระโดดสูงเกินไป: {last_value:,.2f} → {new_value:,.2f} (x{ratio:.0f})"
+        
+        # กรณีที่ 2: ค่าใหม่ลดลงกว่า 50% (มิเตอร์ไม่ควรถอยหลัง)
+        if ratio < 0.5:
+            return True, f"⚠️ ค่าลดลงผิดปกติ: {last_value:,.2f} → {new_value:,.2f} (ลด {(1-ratio)*100:.0f}%)"
+        
+        # กรณีที่ 3: จำนวนหลักเพิ่มขึ้นมากกว่า 1 หลัก
+        if expected_digits > 0:
+            last_digits = len(str(int(abs(last_value))))
+            new_digits = len(str(int(abs(new_value))))
+            if new_digits > last_digits + 1:
+                return True, f"⚠️ จำนวนหลักกระโดด: {last_digits} หลัก → {new_digits} หลัก ({last_value:,.2f} → {new_value:,.2f})"
+        
+        return False, ""
+    
+    except Exception as e:
+        # Silent fail - ถ้า check ไม่ได้ก็ไม่ block
+        return False, ""
+
 def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_roboflow=True):
     decimal_places = int(config.get('decimals', 0) or 0)
     keyword = str(config.get('keyword', '') or '').strip()
     expected_digits = int(config.get('expected_digits', 0) or 0)
+    point_id = str(config.get('point_id', '')).strip()
+    
+    # ✅ มิเตอร์อนาล็อก: บังคับ decimal_places = 0 (ไม่เอาทศนิยม)
+    if is_analog_meter(config):
+        decimal_places = 0
+        if debug:
+            print("📌 มิเตอร์อนาล็อก: บังคับไม่เอาทศนิยม (decimal_places = 0)")
     
     # 🔥 ลอง Roboflow Detection ก่อน (แม่นกว่า OCR สำหรับ water meter)
     if use_roboflow and HAS_ROBOFLOW:
