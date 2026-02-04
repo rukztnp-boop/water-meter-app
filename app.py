@@ -2276,9 +2276,10 @@ def _detect_analog_digit_window(img, debug=False):
         if aspect_ratio < 2 or aspect_ratio > 12:
             continue
         
-        # Position: digit window มักอยู่ช่วงบน-กลาง (20%-60% ของความสูง)
+        # 🔥 Position: digit window มักอยู่ช่วงบน-กลาง (25%-55% ของความสูง)
+        # ปรับให้เข้มงวดกว่า เพื่อไม่ให้ไปเลือกเลขแดงที่ด้านล่าง
         center_y = y + h/2
-        if center_y < H * 0.15 or center_y > H * 0.65:
+        if center_y < H * 0.20 or center_y > H * 0.55:
             continue
         
         # Calculate score
@@ -2289,9 +2290,14 @@ def _detect_analog_digit_window(img, debug=False):
         h_center_dist = abs(center_x - W/2) / W
         score += (1 - h_center_dist) * 50
         
-        # ยิ่งอยู่ช่วงบนยิ่งดี (30-45% ของความสูง)
-        v_center_dist = abs(center_y/H - 0.35)
-        score += (1 - v_center_dist * 3) * 50
+        # 🔥 ยิ่งอยู่ช่วงบนยิ่งดี (30-40% ของความสูง) - ปรับให้สูงกว่าเดิม
+        ideal_y_ratio = 0.35  # ตำแหน่งในอุดมคติ
+        v_center_dist = abs(center_y/H - ideal_y_ratio)
+        # ลดคะแนนอย่างรุนแรงถ้าอยู่ต่ำเกิน 45%
+        if center_y/H > 0.45:
+            score -= 50
+        else:
+            score += (1 - v_center_dist * 4) * 60  # เพิ่มน้ำหนักคะแนนตำแหน่ง
         
         # Aspect ratio ประมาณ 5-8 ดีที่สุด
         ar_score = 1 - abs(aspect_ratio - 6.5) / 6.5
@@ -2305,7 +2311,8 @@ def _detect_analog_digit_window(img, debug=False):
         candidates.append({
             "bbox": (x, y, w, h),
             "score": score,
-            "aspect_ratio": aspect_ratio
+            "aspect_ratio": aspect_ratio,
+            "center_y_ratio": center_y/H
         })
     
     if not candidates:
@@ -2313,12 +2320,32 @@ def _detect_analog_digit_window(img, debug=False):
             print("⚠️ Analog: ไม่เจอ digit window")
         return None, None
     
-    # เลือก candidate ที่มีคะแนนสูงสุด
-    best = max(candidates, key=lambda c: c["score"])
+    # 🔥 เลือก candidate ที่มีคะแนนสูงสุด และอยู่สูงที่สุด (ถ้าคะแนนใกล้เคียงกัน)
+    # เรียง candidates ตามคะแนน แล้วถ้ามีหลายตัวคะแนนใกล้กัน ให้เลือกที่อยู่สูงกว่า
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    
+    # ถ้า top 2 มีคะแนนใกล้กัน (ห่างกันไม่เกิน 20%) ให้เลือกที่อยู่สูงกว่า
+    if len(candidates) >= 2:
+        top1, top2 = candidates[0], candidates[1]
+        score_diff = abs(top1["score"] - top2["score"])
+        if score_diff < abs(top1["score"] * 0.2):  # ห่างกันน้อยกว่า 20%
+            # เลือกตัวที่อยู่สูงกว่า (center_y_ratio น้อยกว่า)
+            if top2["center_y_ratio"] < top1["center_y_ratio"]:
+                best = top2
+                if debug:
+                    print(f"🔄 Switched to higher candidate (y={top2['center_y_ratio']:.2f} vs {top1['center_y_ratio']:.2f})")
+            else:
+                best = top1
+        else:
+            best = top1
+    else:
+        best = candidates[0]
+    
     x, y, w, h = best["bbox"]
     
     if debug:
-        print(f"✅ Analog: เจอ digit window at ({x}, {y}, {w}, {h}), score={best['score']:.1f}, AR={best['aspect_ratio']:.1f}")
+        print(f"✅ Analog: เจอ digit window at ({x}, {y}, {w}, {h})")
+        print(f"   Score={best['score']:.1f}, AR={best['aspect_ratio']:.1f}, Y={best['center_y_ratio']:.2%}")
     
     # Crop with padding
     pad_x = int(w * 0.05)
@@ -2399,10 +2426,10 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
         
         # ✅ มิเตอร์อนาล็อก: ใช้ threshold เข้มงวดกว่า (ตัดเลขแดงทั้งหมด)
         if is_analog:
-            # เข้มงวดมาก: ตัดทุกสีแดง-ส้ม
-            lower_red1 = np.array([0, 60, 60])   # เข้มงวดกว่า
-            upper_red1 = np.array([15, 255, 255])
-            lower_red2 = np.array([165, 60, 60])  # เข้มงวดกว่า
+            # 🔥 แก้ไข: ขยาย range เพื่อตัดเลขแดง-ส้ม-ชมพูให้หมด
+            lower_red1 = np.array([0, 50, 50])    # ขยาย saturation/value threshold
+            upper_red1 = np.array([20, 255, 255]) # ขยาย hue range (0-20 แทน 0-15)
+            lower_red2 = np.array([160, 50, 50])  # ขยาย threshold
             upper_red2 = np.array([180, 255, 255])
         else:
             # มิเตอร์ดิจิทัล: ใช้ threshold ปกติ
@@ -2414,10 +2441,15 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
         mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
         
         # ✅ Morphological operations: ทำให้ mask ติดกัน
-        kernel_size = (7, 7) if is_analog else (5, 5)  # อนาล็อกใช้ kernel ใหญ่กว่า
+        kernel_size = (9, 9) if is_analog else (5, 5)  # 🔥 เพิ่มจาก 7→9 สำหรับอนาล็อก
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, kernel_size)
-        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel, iterations=3 if is_analog else 2)
-        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel, iterations=2 if is_analog else 1)
+        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel, iterations=4 if is_analog else 2)
+        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel, iterations=3 if is_analog else 1)
+        
+        # 🔥 เพิ่ม dilation เพื่อให้แน่ใจว่าตัดเลขแดงออกหมด
+        if is_analog:
+            kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask_red = cv2.dilate(mask_red, kernel_dilate, iterations=2)
         
         # ✅ เปลี่ยนเลขแดงเป็นสีขาว (255,255,255)
         img[mask_red > 0] = [255, 255, 255]
@@ -2838,6 +2870,34 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_r
         allow_negative = config.get('allow_negative', 'FALSE').strip().upper() == 'TRUE'
         if float(val) < 0 and not allow_negative:
             return False
+        
+        # 🔥 Analog meter: validation เข้มงวดกว่า
+        if is_analog_meter(config):
+            ln = check_digits_len(val)
+            # อนาล็อกมักเป็น 5-6 หลัก (เช่น 01283, 123456)
+            if expected_digits > 0:
+                # ต้องตรงพอดี หรือ +1 เท่านั้น
+                if ln < expected_digits or ln > expected_digits + 1:
+                    if debug:
+                        print(f"⚠️ Analog validation failed: {ln} digits, expected {expected_digits}")
+                    return False
+            else:
+                # ถ้าไม่กำหนด expected_digits ให้ใช้ default 4-7 หลัก
+                if ln < 4 or ln > 7:
+                    if debug:
+                        print(f"⚠️ Analog validation failed: {ln} digits (expected 4-7)")
+                    return False
+            
+            # 🔥 เช็คว่าค่าสมเหตุสมผลไหม (ไม่มากเกินไป)
+            # มิเตอร์น้ำปกติไม่เกิน 999,999 (6 หลัก)
+            if val > 999999:
+                if debug:
+                    print(f"⚠️ Analog validation failed: {val} > 999,999")
+                return False
+            
+            return True
+        
+        # Digital meter: ยืดหยุ่นกว่า
         if expected_digits <= 0:
             return True
         ln = check_digits_len(val)
@@ -3037,6 +3097,32 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_r
                 break
 
     final_val = float(best_val) if best_val is not None else 0.0
+    
+    # 🔥 Post-validation สำหรับ Analog meter
+    if is_analog_meter(config) and final_val > 0:
+        ln = check_digits_len(final_val)
+        
+        # ถ้าอ่านได้ 4 หลัก แต่ expected_digits = 5 → อาจขาดเลข 0 ข้างหน้า
+        if expected_digits == 5 and ln == 4:
+            if debug:
+                print(f"⚠️ Analog: {ln} หลัก แต่คาด {expected_digits} หลัก → อาจต้องเติม 0")
+            # ไม่แก้อัตโนมัติ เพราะอาจผิด แต่ให้ผ่านไป
+        
+        # ถ้าอ่านได้เลขแปลก ๆ (เช่น 50170 แทน 01283)
+        # เช็คว่าค่านี้สมเหตุสมผลเมื่อเทียบกับ history หรือไม่
+        if final_val > 0:
+            is_anomaly, anomaly_reason = detect_anomaly(final_val, point_id, expected_digits)
+            if is_anomaly:
+                if debug:
+                    print(f"⚠️ Analog post-validation: {anomaly_reason}")
+                # ลดคะแนนลง แต่ไม่ reject (อาจเป็นค่าจริง)
+                best_score -= 300
+                
+                # ถ้าคะแนนต่ำมาก ให้ reject
+                if best_score < 100:
+                    if debug:
+                        print(f"❌ Analog rejected: score too low ({best_score})")
+                    final_val = 0.0
     
     # ✅ dedupe candidates ตามค่า val (เก็บคะแนนดีที่สุด)
     if return_candidates:
