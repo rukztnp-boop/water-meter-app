@@ -127,6 +127,7 @@ st.markdown("""
 # --- CONFIGURATION & SECRETS ---
 # =========================================================
 if 'gcp_service_account' in st.secrets:
+if 'gcp_service_account' in st.secrets:
     try:
         key_dict = json.loads(st.secrets['gcp_service_account'])
         if 'private_key' in key_dict:
@@ -140,18 +141,20 @@ if 'gcp_service_account' in st.secrets:
                 "https://www.googleapis.com/auth/cloud-platform"
             ]
         )
+        
+        # Move these inside the try block
+        gc = gspread.authorize(creds)
+        DB_SHEET_NAME = 'WaterMeter_System_DB'
+        REAL_REPORT_SHEET = 'FM-OP-01-10WaterReport'
+        VISION_CLIENT = vision.ImageAnnotatorClient(credentials=creds)
+        STORAGE_CLIENT = storage.Client(credentials=creds)
+        
     except Exception as e:
         st.error(f"❌ Error loading secrets: {e}")
         st.stop()
 else:
     st.error("❌ Secrets not found.")
     st.stop()
-
-gc = gspread.authorize(creds)
-DB_SHEET_NAME = 'WaterMeter_System_DB'
-REAL_REPORT_SHEET = 'FM-OP-01-10WaterReport'
-VISION_CLIENT = vision.ImageAnnotatorClient(credentials=creds)
-STORAGE_CLIENT = storage.Client(credentials=creds)
 
 # =========================================================
 # --- CLOUD STORAGE HELPERS ---
@@ -2384,6 +2387,91 @@ def _has_red_digits(img):
     # ถ้ามีสีแดงมากกว่า 1% ถือว่ามีเลขแดง
     return red_ratio > 0.01
 
+def _extract_black_digits_only(image_bytes, config, debug=False):
+    """
+    🔥 สำหรับ Analog meter: ใช้ bounding box analysis แยกเลขดำออกจากเลขแดง
+    โดยใช้ spatial position (เลขดำอยู่ซ้าย, เลขแดงอยู่ขวา)
+    """
+    # Decode image
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        return image_bytes
+    
+    H, W = img.shape[:2]
+    
+    # 🔥 มองเฉพาะบริเวณกลาง (30-70% ความสูง) เพื่อหลีกเลี่ยง noise
+    y_start = int(H * 0.3)
+    y_end = int(H * 0.7)
+    roi_img = img[y_start:y_end, :].copy()
+    
+    # Convert to HSV and detect red regions
+    hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
+    
+    # Red color masks (aggressive)
+    lower_red1 = np.array([0, 50, 50])  # ลด saturation/value threshold
+    upper_red1 = np.array([20, 255, 255])  # ขยาย hue range
+    lower_red2 = np.array([160, 50, 50])
+    upper_red2 = np.array([180, 255, 255])
+    
+    mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
+    
+    # Find contours of red regions
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))  # ลด kernel size
+    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel, iterations=2)
+    
+    contours, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Find rightmost significant red region (เลขแดงมักมี area ใหญ่กว่า noise)
+    red_left_boundary = W  # เริ่มจากขวาสุด
+    significant_red_regions = []
+    
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 100:  # ลดจาก 200 → 100
+            continue
+        
+        x, y, w, h = cv2.boundingRect(cnt)
+        
+        # 🔥 Filter: ต้องมี aspect ratio เหมือนตัวเลข (สูงกว่ากว้าง หรือเกือบจะสี่เหลี่ยม)
+        aspect_ratio = h / w if w > 0 else 0
+        if aspect_ratio < 0.3 or aspect_ratio > 8:  # ยืดหยุ่นขึ้น (0.5→0.3, 5→8)
+            continue
+        
+        # 🔥 Filter: ต้องอยู่ด้านขวา (>35% ของความกว้าง)
+        if x < W * 0.35:  # ลดจาก 0.4 → 0.35
+            continue
+        
+        significant_red_regions.append((x, y, w, h, area))
+        
+        # เลขแดงมักอยู่ขวาสุด - เก็บตำแหน่งซ้ายสุดของ red region
+        if x < red_left_boundary:
+            red_left_boundary = x
+    
+    if debug:
+        print(f"🔍 Significant red regions (filtered): {len(significant_red_regions)}")
+        for i, (x, y, w, h, area) in enumerate(significant_red_regions[:5]):
+            print(f"   Region {i+1}: x={x}, y={y}, w={w}, h={h}, area={area:.0f}")
+        print(f"🔍 Red left boundary: x={red_left_boundary} (W={W})")
+    
+    # ถ้าเจอเลขแดง ให้ crop เฉพาะส่วนซ้าย (เลขดำ)
+    if red_left_boundary < W * 0.9:  # มีเลขแดงจริง
+        # Crop เฉพาะจนถึงก่อนเลขแดง (เผื่อ buffer 10px)
+        crop_right = red_left_boundary - 10
+        
+        if crop_right > W * 0.3:  # ต้องมีพื้นที่เหลือพอ (>30%)
+            img_cropped = img[:, :crop_right].copy()
+            
+            if debug:
+                print(f"✂️ Cropped to remove red digits: 0:{crop_right} (removed {W-crop_right}px)")
+            
+            # Encode back to bytes
+            ok, encoded = cv2.imencode(".jpg", img_cropped)
+            if ok:
+                return encoded.tobytes()
+    
+    return image_bytes
+
 def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -2419,8 +2507,25 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
 
     # ✅ มิเตอร์อนาล็อก: บังคับตัดเลขแดง/ทศนิยม (เอาเฉพาะเลขดำ)
     is_analog = is_analog_meter(config)
+    
+    # 🔥 Step 1: ถ้าเป็น analog meter ให้ crop เลขแดงออกก่อน (spatial analysis)
+    if is_analog and _has_red_digits(img):
+        debug_mode = config.get('debug', False)
+        ok, encoded = cv2.imencode(".jpg", img)
+        if ok:
+            image_bytes_cropped = _extract_black_digits_only(encoded.tobytes(), config, debug=debug_mode)
+            # Decode image ใหม่หลัง crop
+            nparr = np.frombuffer(image_bytes_cropped, np.uint8)
+            img_cropped = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img_cropped is not None:
+                img = img_cropped
+                H, W = img.shape[:2]
+                if debug_mode:
+                    print(f"✅ Spatial cropping applied: new size {W}x{H}")
+    
     ignore_red = config.get('ignore_red', False) or is_analog
     
+    # 🔥 Step 2: ใช้ color-based filtering (HSV) เพิ่มเติม
     if ignore_red:
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         
@@ -2874,18 +2979,18 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_r
         # 🔥 Analog meter: validation เข้มงวดกว่า
         if is_analog_meter(config):
             ln = check_digits_len(val)
-            # อนาล็อกมักเป็น 5-6 หลัก (เช่น 01283, 123456)
+            # อนาล็อกมักเป็น 2-7 หลัก (เช่น 91, 1283, 123456)
             if expected_digits > 0:
-                # ต้องตรงพอดี หรือ +1 เท่านั้น
-                if ln < expected_digits or ln > expected_digits + 1:
+                # ต้องตรงพอดี หรือ ±1 เท่านั้น (ยืดหยุ่น)
+                if ln < max(2, expected_digits - 1) or ln > expected_digits + 1:
                     if debug:
-                        print(f"⚠️ Analog validation failed: {ln} digits, expected {expected_digits}")
+                        print(f"⚠️ Analog validation failed: {ln} digits, expected {expected_digits}±1")
                     return False
             else:
-                # ถ้าไม่กำหนด expected_digits ให้ใช้ default 4-7 หลัก
-                if ln < 4 or ln > 7:
+                # ถ้าไม่กำหนด expected_digits ให้ใช้ default 2-7 หลัก
+                if ln < 2 or ln > 7:
                     if debug:
-                        print(f"⚠️ Analog validation failed: {ln} digits (expected 4-7)")
+                        print(f"⚠️ Analog validation failed: {ln} digits (expected 2-7)")
                     return False
             
             # 🔥 เช็คว่าค่าสมเหตุสมผลไหม (ไม่มากเกินไป)
