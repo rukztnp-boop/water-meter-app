@@ -2430,6 +2430,11 @@ def _extract_black_digits_only(image_bytes, config, debug=False):
     """
     🔥 สำหรับ Analog meter: ใช้ bounding box analysis แยกเลขดำออกจากเลขแดง
     โดยใช้ spatial position (เลขดำอยู่ซ้าย, เลขแดงอยู่ขวา)
+    
+    Strategy: 
+    1. Scan ทั้งภาพหาพื้นที่สีแดง (ไม่จำกัด ROI)
+    2. หา x-position ของเลขแดงที่อยู่ฝั่งซ้ายสุด
+    3. Crop ออกทุกอย่างที่อยู่ขวากว่าตำแหน่งนั้น
     """
     # Decode image
     nparr = np.frombuffer(image_bytes, np.uint8)
@@ -2439,73 +2444,73 @@ def _extract_black_digits_only(image_bytes, config, debug=False):
     
     H, W = img.shape[:2]
     
-    # 🔥 มองเฉพาะบริเวณกลาง (30-70% ความสูง) เพื่อหลีกเลี่ยง noise
-    y_start = int(H * 0.3)
-    y_end = int(H * 0.7)
-    roi_img = img[y_start:y_end, :].copy()
+    # Convert to HSV and detect red regions (scan ทั้งภาพ)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     
-    # Convert to HSV and detect red regions
-    hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
-    
-    # Red color masks (aggressive)
-    lower_red1 = np.array([0, 50, 50])  # ลด saturation/value threshold
-    upper_red1 = np.array([20, 255, 255])  # ขยาย hue range
-    lower_red2 = np.array([160, 50, 50])
+    # Red color masks (more aggressive)
+    lower_red1 = np.array([0, 40, 40])  # Lower threshold
+    upper_red1 = np.array([25, 255, 255])  # Wider hue range
+    lower_red2 = np.array([155, 40, 40])
     upper_red2 = np.array([180, 255, 255])
     
     mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
     
-    # Find contours of red regions
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))  # ลด kernel size
+    # Morphological operations to connect red regions
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel, iterations=1)
     
+    # Find contours of red regions
     contours, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Find rightmost significant red region (เลขแดงมักมี area ใหญ่กว่า noise)
-    red_left_boundary = W  # เริ่มจากขวาสุด
-    significant_red_regions = []
+    # Find leftmost red region that looks like a digit
+    red_left_boundary = W  # Start from right edge
+    red_regions_found = []
     
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 100:  # ลดจาก 200 → 100
+        if area < 50:  # Very small noise
             continue
         
         x, y, w, h = cv2.boundingRect(cnt)
         
-        # 🔥 Filter: ต้องมี aspect ratio เหมือนตัวเลข (สูงกว่ากว้าง หรือเกือบจะสี่เหลี่ยม)
+        # Basic filter: must have reasonable dimensions
         aspect_ratio = h / w if w > 0 else 0
-        if aspect_ratio < 0.3 or aspect_ratio > 8:  # ยืดหยุ่นขึ้น (0.5→0.3, 5→8)
+        if w < 5 or h < 10:  # Too small
+            continue
+        if aspect_ratio < 0.2 or aspect_ratio > 15:  # Too extreme
             continue
         
-        # 🔥 Filter: ต้องอยู่ด้านขวา (>35% ของความกว้าง)
-        if x < W * 0.35:  # ลดจาก 0.4 → 0.35
+        # Red digits are typically in right half or center-right
+        # But don't enforce strict position - just check it's not far left
+        if x < W * 0.25:  # Skip obvious noise on far left
             continue
         
-        significant_red_regions.append((x, y, w, h, area))
+        red_regions_found.append((x, y, w, h, area))
         
-        # เลขแดงมักอยู่ขวาสุด - เก็บตำแหน่งซ้ายสุดของ red region
+        # Track leftmost red region
         if x < red_left_boundary:
             red_left_boundary = x
     
     if debug:
-        print(f"🔍 Significant red regions (filtered): {len(significant_red_regions)}")
-        for i, (x, y, w, h, area) in enumerate(significant_red_regions[:5]):
-            print(f"   Region {i+1}: x={x}, y={y}, w={w}, h={h}, area={area:.0f}")
-        print(f"🔍 Red left boundary: x={red_left_boundary} (W={W})")
+        print(f"🔍 Red regions found: {len(red_regions_found)}")
+        for i, (x, y, w, h, area) in enumerate(sorted(red_regions_found, key=lambda r: r[0])[:5]):
+            print(f"   Region {i+1}: x={x}, y={y}, w={w}, h={h}, area={area:.0f}, aspect={h/w:.2f}")
+        print(f"🔍 Leftmost red at: x={red_left_boundary} (W={W}, ratio={red_left_boundary/W:.2%})")
     
-    # ถ้าเจอเลขแดง ให้ crop เฉพาะส่วนซ้าย (เลขดำ)
-    if red_left_boundary < W * 0.9:  # มีเลขแดงจริง
-        # Crop เฉพาะจนถึงก่อนเลขแดง (เผื่อ buffer 10px)
-        crop_right = red_left_boundary - 10
+    # If we found red digits, crop before them
+    if red_regions_found and red_left_boundary < W * 0.85:  # Found red and it's not at extreme right
+        # Crop with small buffer (5px)
+        crop_right = max(int(red_left_boundary - 5), int(W * 0.3))  # At least 30% width
         
-        if crop_right > W * 0.3:  # ต้องมีพื้นที่เหลือพอ (>30%)
+        if crop_right > W * 0.25:  # Must have reasonable remaining width
             img_cropped = img[:, :crop_right].copy()
             
             if debug:
-                print(f"✂️ Cropped to remove red digits: 0:{crop_right} (removed {W-crop_right}px)")
+                print(f"✂️ Cropped at x={crop_right} (removed {W-crop_right}px, {(W-crop_right)/W:.1%})")
             
             # Encode back to bytes
-            ok, encoded = cv2.imencode(".jpg", img_cropped)
+            ok, encoded = cv2.imencode(".jpg", img_cropped, [cv2.IMWRITE_JPEG_QUALITY, 95])
             if ok:
                 return encoded.tobytes()
     
