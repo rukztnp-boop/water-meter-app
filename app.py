@@ -126,12 +126,40 @@ st.markdown("""
 # =========================================================
 # --- CONFIGURATION & SECRETS ---
 # =========================================================
-if 'gcp_service_account' in st.secrets:
+
+# Try to load credentials from multiple sources
+creds = None
+key_dict = None
+
+# 1. Try environment variable (for Cloud Run)
+if 'GOOGLE_CREDENTIALS_JSON' in os.environ:
+    try:
+        key_dict = json.loads(os.environ['GOOGLE_CREDENTIALS_JSON'])
+        if 'private_key' in key_dict:
+            key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
+    except Exception as e:
+        st.error(f"❌ Error parsing GOOGLE_CREDENTIALS_JSON: {e}")
+
+# 2. Try Streamlit secrets (for Streamlit Cloud)
+elif 'gcp_service_account' in st.secrets:
     try:
         key_dict = json.loads(st.secrets['gcp_service_account'])
         if 'private_key' in key_dict:
             key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
+    except Exception as e:
+        st.error(f"❌ Error loading Streamlit secrets: {e}")
 
+# 3. Try local file (for local development)
+elif os.path.exists('service_account.json'):
+    try:
+        with open('service_account.json', 'r') as f:
+            key_dict = json.load(f)
+    except Exception as e:
+        st.error(f"❌ Error loading service_account.json: {e}")
+
+# Initialize credentials if we have key_dict
+if key_dict:
+    try:
         creds = service_account.Credentials.from_service_account_info(
             key_dict,
             scopes=[
@@ -141,7 +169,7 @@ if 'gcp_service_account' in st.secrets:
             ]
         )
         
-        # Move these inside the try block
+        # Initialize clients
         gc = gspread.authorize(creds)
         DB_SHEET_NAME = 'WaterMeter_System_DB'
         REAL_REPORT_SHEET = 'FM-OP-01-10WaterReport'
@@ -149,10 +177,10 @@ if 'gcp_service_account' in st.secrets:
         STORAGE_CLIENT = storage.Client(credentials=creds)
         
     except Exception as e:
-        st.error(f"❌ Error loading secrets: {e}")
+        st.error(f"❌ Error initializing GCP clients: {e}")
         st.stop()
 else:
-    st.error("❌ Secrets not found.")
+    st.error("❌ No credentials found. Please set GOOGLE_CREDENTIALS_JSON environment variable or add secrets.")
     st.stop()
 
 # =========================================================
