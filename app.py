@@ -2911,8 +2911,9 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_r
         if debug:
             print("📌 มิเตอร์อนาล็อก: บังคับไม่เอาทศนิยม (decimal_places = 0)")
     
-    # 🔥 ลอง Roboflow Detection ก่อน (แม่นกว่า OCR สำหรับ water meter)
-    if use_roboflow and HAS_ROBOFLOW:
+    # 🔥 Roboflow Detection - ใช้เฉพาะกับมิเตอร์อนาล็อกเท่านั้น!
+    # Digital/VSD meters ใช้ Vision OCR จะแม่นกว่า
+    if use_roboflow and HAS_ROBOFLOW and is_analog_meter(config):
         try:
             # ใช้รูปที่ preprocessed ROI (ถ้ามี)
             roi_bytes = image_bytes
@@ -2921,7 +2922,8 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_r
             
             digit_seq, confidence, preds = _roboflow_detect_digits(roi_bytes)
             
-            if digit_seq and confidence > 0.8:  # 🎯 เพิ่ม threshold 70%→80% เพื่อความแม่นยำสูงสุด
+            # 🎯 ลด threshold จาก 80% → 70% เพื่ออ่านได้มากขึ้น (แลกกับความแม่นยำเล็กน้อย)
+            if digit_seq and confidence > 0.70:
                 # แปลง digit_sequence เป็น float ตาม decimal_places
                 try:
                     val_str = str(digit_seq).strip()
@@ -2959,7 +2961,7 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_r
                         raise ValueError(f"Anomaly detected: {anomaly_reason}")
                     
                     # 🎯 Return ทันทีถ้า Roboflow สำเร็จ
-                    print(f"🎯 ใช้ผลลัพธ์ Roboflow: {val} (raw: {val_str}, conf: {confidence:.2%})")
+                    print(f"✅ Roboflow [ANALOG {point_id}]: อ่านค่า = {val} (confidence: {confidence:.2%})")
                     if return_candidates:
                         candidates = [{
                             "val": val,
@@ -2980,9 +2982,12 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_r
             print(f"⚠️ Roboflow exception: {str(e)[:100]} → fallback to OCR")
     
     # ✅ Fallback: ใช้ Vision OCR แบบเดิม
-    print("🔄 ใช้ Vision OCR (Google Cloud Vision)...")
+    if is_digital_meter(config):
+        print(f"🔄 ใช้ Vision OCR สำหรับ Digital/VSD meter [{point_id}]...")
+    else:
+        print(f"🔄 ใช้ Vision OCR (Roboflow ไม่พบหรือ confidence ต่ำ) [{point_id}]...")
     
-    # 🔥 สำหรับ VSD/Digital meters: ลองใช้ line-based extraction ก่อน
+    # 🔥 สำหรับ VSD/Digital meters: ใช้ line-based extraction ก่อน
     is_vsd_digital = is_digital_meter(config) and ("vsd" in str(config.get('name', '')).lower() or 
                                                      "acs" in str(config.get('name', '')).lower() or
                                                      "abb" in str(config.get('name', '')).lower())
