@@ -2643,43 +2643,61 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
     use_enhanced_analog = (variant == "auto" and is_analog_meter(config))
 
     if use_digital_logic or use_enhanced_analog:
-        # 🔥 Enhanced preprocessing สำหรับ digital/VSD meters (จากโค้ด reference ที่แม่น 90%)
-        # ขยายภาพถ้าเล็กเกินไป
+        # 🔥 สำหรับ Analog: เพิ่ม perspective correction และ adaptive histogram
+        if use_enhanced_analog:
+            # 1) CLAHE เพื่อปรับ contrast ให้ทนต่อแสงแฟลช
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            gray = clahe.apply(gray)
+            
+            # 2) Bilateral filter: ลดสัญญาณรบกวนแต่เก็บขอบไว้
+            gray = cv2.bilateralFilter(gray, 9, 75, 75)
+            
+            # 3) Adaptive threshold: ทนต่อแสงไม่สม่ำเสมอ
+            binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                          cv2.THRESH_BINARY, 21, 10)
+            
+            # 4) Denoise: ลบจุดเล็ก ๆ
+            kernel_denoise = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_denoise, iterations=1)
+            
+            # 5) Close gaps in digits
+            kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+            
+            ok, encoded = cv2.imencode(".png", binary)
+            return encoded.tobytes() if ok else image_bytes
+        
+        # Digital meter preprocessing (เหมือนเดิม)
         if min(H, W) < 300:
             gray = cv2.resize(gray, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
-            H, W = gray.shape[:2]
-        
-        # 1) CLAHE เพื่อปรับ contrast
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         g = clahe.apply(gray)
-        
-        # 2) Sharpening: เพิ่มความคมชัด
         blur = cv2.GaussianBlur(g, (0, 0), 1.0)
         sharp = cv2.addWeighted(g, 1.6, blur, -0.6, 0)
         
-        # 3) Bilateral filter: ลดสัญญาณรบกวนแต่เก็บขอบไว้
+        # ✅ เพิ่ม Morphological operations เพื่อชาร์ปเลขดิจิทัล
+        # 1) Bilateral filter: ลดสัญญาณรบกวนแต่เก็บขอบไว้
         sharp = cv2.bilateralFilter(sharp, 5, 50, 50)
         
-        # 4) Morphological closing: เติมหลุมเล็ก ๆ ในตัวเลข (ทำให้ตัวเลขแน่นขึ้น)
+        # 2) Morphological closing: เติมหลุมเล็ก ๆ ในตัวเลข (ทำให้ตัวเลขแน่นขึ้น)
         kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         sharp = cv2.morphologyEx(sharp, cv2.MORPH_CLOSE, kernel_close, iterations=1)
         
-        # 5) Morphological opening: ลบสัญญาณรบกวนเล็ก ๆ (ตัดเสี่ยวนอก)
+        # 3) Morphological opening: ลบสัญญาณรบกวนเล็ก ๆ (ตัดเสี่ยวนอก)
         kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
         sharp = cv2.morphologyEx(sharp, cv2.MORPH_OPEN, kernel_open, iterations=1)
         
-        # 6) Dilate: ขยายเลขให้ฟูกว่างขึ้นเล็กน้อยเพื่อให้ OCR เห็นชัด
+        # 4) Dilate: ขยายเลขให้ฟูกว่างขึ้นเล็กน้อยเพื่อให้ OCR เห็นชัด
         kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
         sharp = cv2.dilate(sharp, kernel_dilate, iterations=1)
         
-        # 7) Final sharpening: ชาร์พขอบเลขให้แหลมขึ้น
+        # 5) Final sharpening: ชาร์พขอบเลขให้แหลมขึ้น
         kernel_sharpen = np.array([[-1, -1, -1],
                                    [-1,  9, -1],
                                    [-1, -1, -1]])
         sharp = cv2.filter2D(sharp, -1, kernel_sharpen)
         sharp = np.clip(sharp, 0, 255).astype(np.uint8)
         
-        # 🔥 ใช้ PNG สำหรับ digital meters (lossless quality)
         ok, encoded = cv2.imencode(".png", sharp)
         return encoded.tobytes() if ok else image_bytes
     else:
