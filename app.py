@@ -274,10 +274,14 @@ def get_thai_sheet_name(sh, target_date):
     
     # Try English month patterns (short names)
     eng_patterns = [
+        f"{english_months_short[m_idx]}{yy2}",     # Jan69 (English + Thai Buddhist year)
+        f"{english_months_short[m_idx]} {yy2}",    # Jan 69
         f"{english_months_short[m_idx]}{ad_yy4}",  # Jan2026
         f"{english_months_short[m_idx]} {ad_yy4}", # Jan 2026
         f"{english_months_short[m_idx]}{ad_yy2}",  # Jan26
         f"{english_months_short[m_idx]} {ad_yy2}", # Jan 26
+        f"{english_months_long[m_idx]}{yy2}",      # January69
+        f"{english_months_long[m_idx]} {yy2}",     # January 69
         f"{english_months_long[m_idx]}{ad_yy4}",   # January2026
         f"{english_months_long[m_idx]} {ad_yy4}",  # January 2026
         f"{english_months_long[m_idx]}{ad_yy2}",   # January26
