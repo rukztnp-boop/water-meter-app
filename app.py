@@ -127,7 +127,6 @@ st.markdown("""
 # --- CONFIGURATION & SECRETS ---
 # =========================================================
 if 'gcp_service_account' in st.secrets:
-if 'gcp_service_account' in st.secrets:
     try:
         key_dict = json.loads(st.secrets['gcp_service_account'])
         if 'private_key' in key_dict:
