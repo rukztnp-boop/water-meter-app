@@ -3558,6 +3558,10 @@ def _norm_pid_key(s: str) -> str:
     # Pattern: _XX$ หรือ _XX_ โดยที่ X เป็นตัวเลขซ้ำกัน
     s = re.sub(r"_(\d)\1(?=_|$)", r"_\1_\1", s)  # _33 → _3_3, _22 → _2_2
     
+    # 🔥 แก้ VSD meters: GI_VSD_NO_2 และ GI_VSD_2 ให้เหมือนกัน
+    # แปลง _NO_X เป็น _X สำหรับ VSD patterns
+    s = re.sub(r"_(VSD)_NO_(\d+)$", r"_\1_\2", s)  # GI_VSD_NO_2 → GI_VSD_2
+    
     return s
 
 @st.cache_data(ttl=3600)
@@ -3569,7 +3573,19 @@ def build_pid_norm_map():
         pid = str(r.get("point_id", "")).strip().upper()
         if not pid:
             continue
-        norm_map[_norm_pid_key(pid)] = pid
+        normalized = _norm_pid_key(pid)
+        norm_map[normalized] = pid
+        
+        # เพิ่ม variant สำหรับ VSD: ทั้ง XX_VSD_2 และ XX_VSD_NO_2
+        if "_VSD_" in normalized and re.search(r"_VSD_(\d+)$", normalized):
+            # XX_VSD_2 → เพิ่ม XX_VSD_NO_2
+            with_no = re.sub(r"_(VSD)_(\d+)$", r"_\1_NO_\2", normalized)
+            norm_map[with_no] = pid
+        elif "_VSD_NO_" in normalized:
+            # XX_VSD_NO_2 → เพิ่ม XX_VSD_2
+            without_no = re.sub(r"_(VSD)_NO_(\d+)$", r"_\1_\2", normalized)
+            norm_map[without_no] = pid
+    
     return norm_map
 
 def _crop_bottom_bytes(image_bytes: bytes, frac: float = 0.40) -> bytes:
@@ -3602,15 +3618,16 @@ def find_point_id_from_text(ocr_text: str, norm_map: dict):
 
     # 2) fuzzy จาก pattern ที่เหมือน point_id
     # ✅ แก้ไข: รองรับหลาย pattern
-    # Pattern 1: รองรับ 1+ underscore และอาจไม่มีตัวเลข
-    # Pattern 2: รองรับที่มีตัวเลข
-    # Pattern 3: XX_YY_ZZ (รองรับไม่มีตัวเลข เช่น FN_WWT_AS)
+    # Pattern 1: XX_YY หรือ XX_YY_ZZ (รองรับทั้งมีและไม่มีตัวเลข)
+    # Pattern 2: XX_YY_1, XX_YY_A_1 (มีตัวเลข)
+    # Pattern 3: Fallback แบบเก่า
     cand = []
     
-    # Pattern 1: รองรับ 2+ ส่วนคั่นด้วย _ (อาจไม่มีตัวเลข เช่น FN_WWT_AS)
-    cand.extend(re.findall(r"[A-Z]{2,4}_[A-Z]{2,}(?:_[A-Z0-9]{1,})*", t))
+    # Pattern 1: 2-4 letters + _ + 2+ chars (อาจไม่มีตัวเลข เช่น FN_WWT_AS, GT_BP_3_3)
+    # รองรับ XX_YY, XX_YY_Z, XX_YY_ZZ, XX_YY_Z_A ฯลฯ
+    cand.extend(re.findall(r"[A-Z]{2,4}_[A-Z]{2,}(?:_[A-Z0-9]+)*", t))
     
-    # Pattern 2: รองรับที่มีตัวเลข
+    # Pattern 2: รองรับที่มีตัวเลข (backup)
     cand.extend(re.findall(r"[A-Z]{1,4}_[A-Z0-9_]{2,}", t))
     
     # Pattern 3: Fallback แบบเก่า
