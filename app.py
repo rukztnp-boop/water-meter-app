@@ -2342,7 +2342,7 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_r
             
             digit_seq, confidence, preds = _roboflow_detect_digits(roi_bytes)
             
-            if digit_seq and confidence > 0.6:  # threshold ความมั่นใจ
+            if digit_seq and confidence > 0.8:  # 🎯 เพิ่ม threshold 70%→80% เพื่อความแม่นยำสูงสุด
                 # แปลง digit_sequence เป็น float ตาม decimal_places
                 try:
                     val_str = str(digit_seq).strip()
@@ -2359,11 +2359,25 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_r
                         else:
                             val = float(val_str)
                     
-                    # Validate ตาม expected_digits
+                    # ❌ เช็คค่าติดลบ (ยกเว้นมิเตอร์ที่อนุญาต)
+                    allow_negative = config.get('allow_negative', 'FALSE').strip().upper() == 'TRUE'
+                    if val < 0 and not allow_negative:
+                        print(f"⚠️ Roboflow: ค่าติดลบ {val} แต่ allow_negative=FALSE → reject")
+                        raise ValueError("Negative value not allowed")
+                    
+                    # ✅ Validate ตาม expected_digits (เข้มงวดมาก - ต้องตรงพอดีหรือ +1 เท่านั้น)
                     if expected_digits > 0:
                         digit_count = len(str(int(abs(val))))
-                        if digit_count > expected_digits + 1:  # เกินจริง ๆ → ไม่ใช้
-                            raise ValueError("Too many digits")
+                        # อนุญาตเฉพาะ expected_digits หรือ expected_digits+1 เท่านั้น (ไม่ยอมรับ -1)
+                        if digit_count < expected_digits or digit_count > expected_digits + 1:
+                            print(f"⚠️ Roboflow: {digit_count} หลัก แต่ต้องการ {expected_digits} หลัก → reject")
+                            raise ValueError(f"Digit count mismatch: {digit_count} vs {expected_digits}")
+                    
+                    # 🔍 ตรวจสอบ anomaly (ค่ากระโดดผิดปกติ)
+                    is_anomaly, anomaly_reason = detect_anomaly(val, point_id, expected_digits)
+                    if is_anomaly:
+                        print(f"⚠️ Roboflow: ตรวจพบ anomaly - {anomaly_reason} → reject")
+                        raise ValueError(f"Anomaly detected: {anomaly_reason}")
                     
                     # 🎯 Return ทันทีถ้า Roboflow สำเร็จ
                     print(f"🎯 ใช้ผลลัพธ์ Roboflow: {val} (raw: {val_str}, conf: {confidence:.2%})")
@@ -2411,14 +2425,15 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_r
         """อนุญาตให้ผ่านแบบ 'ยืดหยุ่น' แต่จะไปจัดการด้วยคะแนนอีกที"""
         if val is None:
             return False
-        # ❌ มิเตอร์ไม่ควรติดลบ
-        if float(val) < 0:
+        # ❌ เช็คค่าติดลบ (ยกเว้นมิเตอร์ที่อนุญาต)
+        allow_negative = config.get('allow_negative', 'FALSE').strip().upper() == 'TRUE'
+        if float(val) < 0 and not allow_negative:
             return False
         if expected_digits <= 0:
             return True
         ln = check_digits_len(val)
-        # ยังยอมให้ +1 ได้ (กันเคสเลขโตขึ้นจริง) แต่จะโดนหักคะแนนหนัก
-        return 1 <= ln <= expected_digits + 1
+        # เข้มงวด: อนุญาตเฉพาะ expected_digits หรือ expected_digits+1 เท่านั้น
+        return expected_digits <= ln <= expected_digits + 1
 
     def looks_like_spec_context(text: str, start: int, end: int) -> bool:
         """ดูรอบ ๆ ตัวเลขว่าเป็นเลขสเปคเครื่อง (Hz/V/A/IP/Rev) ไหม"""
