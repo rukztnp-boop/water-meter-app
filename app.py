@@ -2020,11 +2020,22 @@ def _extract_vsd_previous_day_kwh(words: list, debug: bool = False) -> tuple[flo
         line_text = line["text"].lower()
         score = 0
         
-        # Pattern 1: "previous day"
-        if _fuzzy_match_text(line_text, "previous day", threshold=0.65):
+        # 🔥 Pattern 1: "previous day" (ต้องมีทั้ง previous + day)
+        has_previous = ("previous" in line_text or "previos" in line_text or 
+                       "previ0us" in line_text or "previou" in line_text)
+        has_day = "day" in line_text
+        has_hour = "hour" in line_text
+        
+        if has_previous and has_day and not has_hour:
+            # ต้องมี "previous" + "day" แต่ไม่มี "hour"
             score = 100
-        elif "previous" in line_text or "previos" in line_text or "previ0us" in line_text:
+        elif has_previous and not has_hour:
+            # มี "previous" แต่ไม่มี "hour" (อาจมี day หรือไม่มีก็ได้)
             score = 80
+        elif has_previous and has_hour:
+            # มี "previous" + "hour" → ไม่ใช่เป้าหมาย
+            score = 0
+            continue
         
         # Pattern 2: "01.53" or "01 53"
         if re.search(r"01\s*[.\s]\s*53", line_text):
