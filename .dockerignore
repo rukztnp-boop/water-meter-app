@@ -1,0 +1,17 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+*.jpg
+*.jpeg
+*.png
+รูป*/
+*error*/
+test_*.py
+debug_*.py
+*.md
+!README.md

@@ -1,7 +1,6 @@
 # Secrets
 .streamlit/secrets.toml
 service_account.json
-*.json
 
 # Python
 __pycache__/
@@ -27,3 +26,29 @@ Thumbs.db
 
 # Streamlit
 .streamlit/config.toml
+
+# Test & Debug files
+test_*.py
+debug_*.py
+*_test.py
+quick_*.py
+quick_*.sh
+visualize_*.py
+analyze_*.py
+batch_test_*.py
+read_screenshots.py
+
+# Test images & Debug images
+รูป*/
+*error*/
+error*/
+screenshots/
+debug_*.jpg
+debug_*.png
+*.jpg
+*.jpeg
+*.png
+
+# Excel files (if not needed in repo)
+# Uncomment if you don't need these tracked:
+# *.xlsx
