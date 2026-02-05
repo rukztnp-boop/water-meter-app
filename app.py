@@ -141,13 +141,14 @@ if 'GOOGLE_CREDENTIALS_JSON' in os.environ:
         st.error(f"❌ Error parsing GOOGLE_CREDENTIALS_JSON: {e}")
 
 # 2. Try Streamlit secrets (for Streamlit Cloud)
-elif 'gcp_service_account' in st.secrets:
+elif hasattr(st, 'secrets') and 'gcp_service_account' in st.secrets:
     try:
         key_dict = json.loads(st.secrets['gcp_service_account'])
         if 'private_key' in key_dict:
             key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
     except Exception as e:
-        st.error(f"❌ Error loading Streamlit secrets: {e}")
+        if hasattr(st, 'error'):
+            st.error(f"❌ Error loading Streamlit secrets: {e}")
 
 # 3. Try local file (for local development)
 elif os.path.exists('service_account.json'):
