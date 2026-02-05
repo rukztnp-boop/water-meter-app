@@ -118,25 +118,30 @@ st.markdown("""
 # =========================================================
 # --- CONFIGURATION & SECRETS ---
 # =========================================================
-if 'gcp_service_account' in st.secrets:
-    try:
-        key_dict = json.loads(st.secrets['gcp_service_account'])
-        if 'private_key' in key_dict:
-            key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
+try:
+    if 'gcp_service_account' in st.secrets:
+        try:
+            key_dict = json.loads(st.secrets['gcp_service_account'])
+            if 'private_key' in key_dict:
+                key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
 
-        creds = service_account.Credentials.from_service_account_info(
-            key_dict,
-            scopes=[
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive",
-                "https://www.googleapis.com/auth/cloud-platform"
-            ]
-        )
-    except Exception as e:
-        st.error(f"❌ Error loading secrets: {e}")
+            creds = service_account.Credentials.from_service_account_info(
+                key_dict,
+                scopes=[
+                    "https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive",
+                    "https://www.googleapis.com/auth/cloud-platform"
+                ]
+            )
+        except Exception as e:
+            st.error(f"❌ Error loading secrets: {e}")
+            st.stop()
+    else:
+        st.error("❌ Secrets not found. Please configure secrets.toml file.")
         st.stop()
-else:
-    st.error("❌ Secrets not found.")
+except Exception as e:
+    st.error(f"❌ Secrets file not found: {e}")
+    st.info("📝 Please create `.streamlit/secrets.toml` file with your GCP credentials.")
     st.stop()
 
 gc = gspread.authorize(creds)
