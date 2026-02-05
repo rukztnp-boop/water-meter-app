@@ -2732,6 +2732,18 @@ def _crop_bottom_bytes(image_bytes: bytes, frac: float = 0.40) -> bytes:
     out = _cv2_encode_jpg(crop, quality=92)
     return out or image_bytes
 
+def _crop_top_bytes(image_bytes: bytes, frac: float = 0.40) -> bytes:
+    """ครอปช่วงบนของรูป (สำหรับกรณี point_id อยู่บนสุด) เพื่อ OCR point_id"""
+    img = _cv2_decode_bytes(image_bytes)
+    if img is None:
+        return image_bytes
+    h, w = img.shape[:2]
+    y2 = int(h * frac)
+    crop = img[0:y2, 0:w].copy()
+    crop = _upscale_for_ocr(crop, max_side=2200)
+    out = _cv2_encode_jpg(crop, quality=92)
+    return out or image_bytes
+
 def find_point_id_from_text(ocr_text: str, norm_map: dict):
     t = _norm_pid_key(ocr_text)
     if not t:
@@ -2765,15 +2777,28 @@ def find_point_id_from_text(ocr_text: str, norm_map: dict):
     return best_pid if best_score >= 0.78 else None
 
 def extract_point_id_from_image(image_bytes: bytes, norm_map: dict):
-    """คืนค่า (point_id หรือ None, ocr_text ที่ใช้)"""
-    # pass1: OCR เฉพาะช่วงล่างก่อน
+    """คืนค่า (point_id หรือ None, ocr_text ที่ใช้)
+    
+    ลำดับการหา point_id (จากเร็วไปช้า):
+    1. Crop bottom 40% (กรณีปกติ - เทปเหลืองด้านล่าง)
+    2. Crop top 40% (กรณี point_id อยู่บนสุด เช่น VSD screens)
+    3. Full image (fallback)
+    """
+    # Pass 1: OCR เฉพาะช่วงล่างก่อน (กรณีปกติ)
     btm = _crop_bottom_bytes(image_bytes, frac=0.40)
     txt, _err = _vision_read_text(btm)
     pid = find_point_id_from_text(txt, norm_map)
     if pid:
         return pid, txt
 
-    # pass2: fallback OCR ทั้งภาพ
+    # Pass 2: OCR เฉพาะช่วงบน (กรณี point_id อยู่บนสุด)
+    top = _crop_top_bytes(image_bytes, frac=0.40)
+    txt_top, _err_top = _vision_read_text(top)
+    pid_top = find_point_id_from_text(txt_top, norm_map)
+    if pid_top:
+        return pid_top, txt_top
+
+    # Pass 3: Fallback OCR ทั้งภาพ
     txt2, _err2 = _vision_read_text(image_bytes)
     pid2 = find_point_id_from_text(txt2, norm_map)
     return pid2, txt2
