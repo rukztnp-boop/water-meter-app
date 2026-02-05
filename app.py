@@ -3088,8 +3088,8 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_r
             if words:
                 vsd_val, vsd_score = _extract_vsd_previous_day_kwh(words, debug=debug)
                 
-                # 🔥 ลด threshold จาก 800→600 เพื่ออ่านได้มากขึ้น
-                if vsd_val is not None and vsd_score >= 600:
+                # 🔥 ลด threshold จาก 600→400 เพื่อลด OCR fail
+                if vsd_val is not None and vsd_score >= 400:
                     if debug:
                         print(f"🔍 VSD candidate: {vsd_val} (score: {vsd_score})")
                     
@@ -3390,7 +3390,34 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_r
 
     final_val = float(best_val) if best_val is not None else 0.0
     
-    # 🔥 Post-validation สำหรับ Analog meter
+    # � ถ้ายังอ่านไม่ได้ (0.0) → ลอง raw variant ครั้งสุดท้าย
+    if final_val == 0.0 or final_val is None:
+        if debug:
+            print("🔄 ลอง raw variant เพื่อ fallback (no preprocessing)...")
+        try:
+            processed_raw = preprocess_image_cv(image_bytes, config, use_roi=False, variant="raw")
+            txt_raw, err_raw = _vision_read_text(processed_raw)
+            if txt_raw:
+                # หาเลขทั้งหมด
+                nums = re.findall(r"\d+\.?\d*", txt_raw)
+                if nums:
+                    for num_str in nums:
+                        try:
+                            val = float(num_str)
+                            if check_digits_ok(val):
+                                if debug:
+                                    print(f"✅ Raw fallback success: {val}")
+                                final_val = val
+                                if return_candidates:
+                                    all_candidates.append({"val": val, "score": 100, "tag": "raw_fallback"})
+                                break
+                        except:
+                            continue
+        except Exception as e:
+            if debug:
+                print(f"⚠️ Raw fallback error: {e}")
+    
+    # �🔥 Post-validation สำหรับ Analog meter
     if is_analog_meter(config) and final_val > 0:
         ln = check_digits_len(final_val)
         
@@ -3817,14 +3844,26 @@ def find_point_id_from_text(ocr_text: str, norm_map: dict):
     best_score = 0.0
     best_pid = None
     for c in cand[:12]:
+        # 🔧 แก้ OCR errors ที่พบบ่อย
+        c_fixed = c.replace('O', '0').replace('o', '0')  # O → 0
+        c_fixed = c_fixed.replace('I', '1').replace('l', '1')  # I/l → 1
+        c_fixed = c_fixed.replace('S', '5').replace('s', '5')  # S → 5
+        c_fixed = c_fixed.replace('Z', '2').replace('z', '2')  # Z → 2
+        c_fixed = c_fixed.replace('B', '8')  # B → 8
+        c_fixed = c_fixed.replace('G', '6')  # G → 6
+        
         for nkey, orig in norm_map.items():
-            sc = SequenceMatcher(None, c, nkey).ratio()
+            # ลอง match ทั้งแบบดั้งเดิมและแบบแก้ไข OCR errors
+            sc1 = SequenceMatcher(None, c, nkey).ratio()
+            sc2 = SequenceMatcher(None, c_fixed, nkey).ratio()
+            sc = max(sc1, sc2)
+            
             if sc > best_score:
                 best_score = sc
                 best_pid = orig
 
-    # ✅ ลด threshold จาก 0.78 → 0.70 เพื่อรองรับ OCR ที่อ่านผิดเล็กน้อย
-    return best_pid if best_score >= 0.70 else None
+    # ✅ ลด threshold จาก 0.70 → 0.60 เพื่อรองรับ OCR ที่อ่านผิดมากขึ้น
+    return best_pid if best_score >= 0.60 else None
 
 def extract_point_id_from_image(image_bytes: bytes, norm_map: dict):
     """คืนค่า (point_id หรือ None, ocr_text ที่ใช้)"""
@@ -3832,32 +3871,64 @@ def extract_point_id_from_image(image_bytes: bytes, norm_map: dict):
     btm = _crop_bottom_bytes(image_bytes, frac=0.40)
     txt, _err = _vision_read_text(btm)
     
-    # 🔍 Debug: แสดง OCR result
+    # 🔍 Debug: แสดง OCR result (เพิ่ม st.write เพื่อแสดงใน UI)
     if txt:
         print(f"🔍 OCR Bottom 40%: {txt[:200]}")
         normalized = _norm_pid_key(txt)
         print(f"🔍 Normalized: {normalized[:200]}")
+        # แสดงใน Streamlit UI ด้วย
+        try:
+            st.caption(f"🔍 OCR Bottom: {txt[:100]}")
+        except:
+            pass
     
     pid = find_point_id_from_text(txt, norm_map)
     if pid:
         print(f"✅ Found point_id from bottom: {pid}")
         return pid, txt
 
-    # pass2: fallback OCR ทั้งภาพ
-    txt2, _err2 = _vision_read_text(image_bytes)
+    # pass2: fallback OCR ทั้งภาพ (ขยาย crop area เป็น 50%)
+    btm2 = _crop_bottom_bytes(image_bytes, frac=0.50)
+    txt2, _err2 = _vision_read_text(btm2)
     
     if txt2:
-        print(f"🔍 OCR Full image: {txt2[:200]}")
+        print(f"🔍 OCR Bottom 50%: {txt2[:200]}")
         normalized2 = _norm_pid_key(txt2)
         print(f"🔍 Normalized: {normalized2[:200]}")
+        try:
+            st.caption(f"🔍 OCR Bottom 50%: {txt2[:100]}")
+        except:
+            pass
     
     pid2 = find_point_id_from_text(txt2, norm_map)
     if pid2:
-        print(f"✅ Found point_id from full: {pid2}")
+        print(f"✅ Found point_id from bottom 50%: {pid2}")
+        return pid2, txt2
+    
+    # pass3: fallback OCR ทั้งภาพ
+    txt3, _err3 = _vision_read_text(image_bytes)
+    
+    if txt3:
+        print(f"🔍 OCR Full image: {txt3[:200]}")
+        normalized3 = _norm_pid_key(txt3)
+        print(f"🔍 Normalized: {normalized3[:200]}")
+        try:
+            st.caption(f"🔍 OCR Full: {txt3[:100]}")
+        except:
+            pass
+    
+    pid3 = find_point_id_from_text(txt3, norm_map)
+    if pid3:
+        print(f"✅ Found point_id from full: {pid3}")
     else:
         print(f"⚠️ No point_id found. Available patterns in norm_map: {list(norm_map.keys())[:10]}")
+        # แสดงข้อความช่วยเหลือ
+        try:
+            st.warning(f"⚠️ ไม่พบ point_id ใน OCR text: '{txt3[:50] if txt3 else 'ว่างเปล่า'}'")
+        except:
+            pass
     
-    return pid2, txt2
+    return pid3, txt3
 
     
 # =========================================================
