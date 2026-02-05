@@ -2080,6 +2080,32 @@ def _extract_vsd_previous_day_kwh(words: list, debug: bool = False) -> tuple[flo
     if not target_line or target_score < 50:
         if debug:
             print("⚠️ VSD: ไม่เจอบรรทัด Previous day kWh")
+            print("🔄 Fallback: พยายามหาตัวเลขใหญ่ที่สุดในภาพ...")
+        
+        # 🔥 Fallback: ถ้าไม่เจอ "Previous day" ให้เอาเลขที่ใหญ่ที่สุดที่ไม่ใช่เมนู
+        max_val = None
+        max_score = 0
+        for line in lines:
+            for word in line["words"]:
+                text = word["text"].replace("O", "0").replace("o", "0").replace("l", "1").replace("I", "1")
+                if re.match(r"^\d+\.?\d*$", text):
+                    # ข้ามรหัสเมนู
+                    if re.match(r'^0[0-9]\.[0-9]{2}$', text):
+                        continue
+                    try:
+                        val = float(text)
+                        if val > 10:  # มากกว่า 10 (ไม่ใช่เลขเมนู)
+                            if max_val is None or val > max_val:
+                                max_val = val
+                                max_score = 400  # คะแนนต่ำกว่า line-based
+                    except:
+                        pass
+        
+        if max_val is not None:
+            if debug:
+                print(f"✅ VSD Fallback: เจอเลขใหญ่สุด = {max_val}")
+            return max_val, max_score
+        
         return None, 0
     
     if debug:
@@ -3004,13 +3030,17 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_r
             if words:
                 vsd_val, vsd_score = _extract_vsd_previous_day_kwh(words, debug=debug)
                 
-                if vsd_val is not None and vsd_score >= 800:
-                    # Validate
+                # 🔥 ลด threshold จาก 800→600 เพื่ออ่านได้มากขึ้น
+                if vsd_val is not None and vsd_score >= 600:
+                    if debug:
+                        print(f"🔍 VSD candidate: {vsd_val} (score: {vsd_score})")
+                    
+                    # Validate (ยืดหยุ่นกว่าเดิม)
                     if check_digits_ok(vsd_val):
-                        # ตรวจสอบ anomaly
+                        # ตรวจสอบ anomaly (แต่ไม่ reject ทันที)
                         is_anomaly, anomaly_reason = detect_anomaly(vsd_val, point_id, expected_digits)
                         if not is_anomaly:
-                            print(f"🎯 VSD Line-Based: {vsd_val} (คะแนน: {vsd_score})")
+                            print(f"✅ VSD Line-Based [{point_id}]: {vsd_val} (score: {vsd_score})")
                             if return_candidates:
                                 candidates = [{
                                     "val": vsd_val,
@@ -3023,7 +3053,23 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_r
                                 return vsd_val
                         else:
                             if debug:
-                                print(f"⚠️ VSD value rejected: {anomaly_reason}")
+                                print(f"⚠️ VSD anomaly warning: {anomaly_reason} (แต่ยังคงใช้ค่านี้)")
+                            # ยอมรับค่าที่มี anomaly แต่ลดคะแนน
+                            if vsd_score >= 700:
+                                print(f"✅ VSD Line-Based [{point_id}]: {vsd_val} (score: {vsd_score}, anomaly warning)")
+                                if return_candidates:
+                                    candidates = [{
+                                        "val": vsd_val,
+                                        "score": vsd_score - 200,  # ลดคะแนน
+                                        "method": "vsd_line_based_anomaly",
+                                        "tag": f"{'ROI' if use_roi else 'FULL'}_{variant}"
+                                    }]
+                                    return vsd_val, candidates
+                                else:
+                                    return vsd_val
+                    else:
+                        if debug:
+                            print(f"⚠️ VSD validation failed: {vsd_val}")
     
     attempts = [
         ("ROI_auto",  True,  "auto"),
@@ -3079,12 +3125,18 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_r
             
             return True
         
-        # Digital meter: ยืดหยุ่นกว่า
+        # Digital meter: ยืดหยุ่นมาก (±2 หลัก)
         if expected_digits <= 0:
             return True
         ln = check_digits_len(val)
-        # เข้มงวด: อนุญาตเฉพาะ expected_digits หรือ expected_digits+1 เท่านั้น
-        return expected_digits <= ln <= expected_digits + 1
+        # 🔥 ยืดหยุ่นกว่าเดิม: อนุญาต ±2 หลัก แทน ±1
+        if expected_digits - 2 <= ln <= expected_digits + 2:
+            if debug and ln != expected_digits:
+                print(f"⚠️ Digital: {ln} หลัก (expected {expected_digits}±2) - ยอมรับ")
+            return True
+        if debug:
+            print(f"❌ Digital validation: {ln} หลัก อยู่นอก range {expected_digits}±2")
+        return False
 
     def looks_like_spec_context(text: str, start: int, end: int) -> bool:
         """ดูรอบ ๆ ตัวเลขว่าเป็นเลขสเปคเครื่อง (Hz/V/A/IP/Rev) ไหม"""
@@ -5289,9 +5341,19 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
     )
 
     added_count = 0
+    skipped_files = []
+    MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB limit (Cloud Run รับได้ ~32MB แต่เหลือ buffer)
+    
     if exports_new:
         for f in exports_new:
             b = f.getvalue()
+            file_size_mb = len(b) / 1_000_000
+            
+            # 🔥 เช็คขนาดไฟล์ก่อนอัปโหลด
+            if len(b) > MAX_FILE_SIZE:
+                skipped_files.append((f.name, file_size_mb))
+                continue
+            
             h = hashlib.sha1(b).hexdigest()
             old = st.session_state["scada_files"].get(f.name)
             if (old is None) or (old.get("sha1") != h):
@@ -5305,7 +5367,16 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
                 added_count += 1
 
     if added_count:
-        st.success(f"เพิ่มไฟล์ใหม่ {added_count} ไฟล์ ✅ (ไฟล์เดิมยังอยู่)")
+        st.success(f"✅ เพิ่มไฟล์ใหม่ {added_count} ไฟล์")
+    
+    if skipped_files:
+        st.error(f"⚠️ ข้ามไฟล์ที่ใหญ่เกิน 20MB ({len(skipped_files)} ไฟล์):")
+        for fname, fsize in skipped_files:
+            st.caption(f"  - {fname} ({fsize:.1f} MB)")
+        st.info("💡 **แนวทางแก้ไข:**\n"
+                "1. แบ่งไฟล์ออกเป็นหลายไฟล์เล็กๆ (แยกตาม sheet หรือช่วงเวลา)\n"
+                "2. ลบ sheet ที่ไม่จำเป็นออกก่อนอัปโหลด\n"
+                "3. หากเป็นไฟล์ AF_Report_Gen.xlsx ที่มีหลาย sheet ให้เลือกแค่ sheet ที่ต้องการ")
 
     files_dict = st.session_state.get("scada_files", {})
     if not files_dict:
