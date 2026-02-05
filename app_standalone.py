@@ -10,6 +10,18 @@ class MockStreamlit:
     class secrets:
         pass
     
+    class session_state:
+        _data = {}
+        
+        def __getitem__(self, key):
+            return self._data.get(key)
+        
+        def __setitem__(self, key, value):
+            self._data[key] = value
+        
+        def __contains__(self, key):
+            return key in self._data
+    
     def set_page_config(self, **kwargs):
         pass
     
@@ -18,6 +30,35 @@ class MockStreamlit:
     
     def error(self, *args, **kwargs):
         pass
+    
+    def warning(self, *args, **kwargs):
+        pass
+    
+    def info(self, *args, **kwargs):
+        pass
+    
+    def success(self, *args, **kwargs):
+        pass
+    
+    def stop(self):
+        pass
+    
+    # Mock decorators
+    @staticmethod
+    def cache_data(*args, **kwargs):
+        def decorator(func):
+            return func
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+        return decorator
+    
+    @staticmethod
+    def cache_resource(*args, **kwargs):
+        def decorator(func):
+            return func
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+        return decorator
 
 # Inject mock before importing app
 sys.modules['streamlit'] = MockStreamlit()
