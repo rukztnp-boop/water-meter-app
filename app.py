@@ -2224,6 +2224,12 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False):
     keyword = str(config.get('keyword', '') or '').strip()
     expected_digits = int(config.get('expected_digits', 0) or 0)
     
+    # ✅ ตรวจสอบว่าเป็น analog/mechanical meter หรือไม่
+    meter_name = str(config.get('name', '') or '').lower()
+    meter_type_str = str(config.get('type', '') or '').lower()
+    is_analog = ('analog' in meter_name or 'mechanical' in meter_name or 
+                 'เลขมิเตอร์' in meter_name or 'analog' in meter_type_str)
+    
     attempts = [
         ("ROI_auto",  True,  "auto"),
         ("ROI_raw",   True,  "raw"),
@@ -2333,6 +2339,33 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False):
                             pass
 
         # ---- 2) กวาดเลขทั้งหมดในข้อความ ----
+        # ✅ สำหรับ analog meter: รวมตัวเลขที่แยกกันด้วย space
+        if is_analog and expected_digits > 0:
+            # ลองหาตัวเลขเดี่ยวๆ ที่อาจเป็น digit แยกกัน เช่น "0 6 1 3 9 24"
+            # แล้วรวมเป็น "61392" (ตัดเลข 0 นำหน้าออก)
+            single_digits = re.findall(r'\b(\d)\b', scan_text)
+            if len(single_digits) >= expected_digits - 2:  # มี digit เดี่ยวเยอะพอ
+                # รวมตัวเลขทั้งหมด
+                combined = ''.join(single_digits)
+                # ตัด leading zeros
+                combined_int = combined.lstrip('0') or '0'
+                try:
+                    val = float(combined_int)
+                    if decimal_places > 0:
+                        val = val / (10 ** decimal_places)
+                    if check_digits_ok(val):
+                        ln = check_digits_len(val)
+                        score = 700 + attempt_bonus  # คะแนนสูงสำหรับ analog
+                        # โบนัสถ้าจำนวนหลักตรง
+                        if expected_digits > 0:
+                            score += max(0, 160 - abs(ln - expected_digits) * 60)
+                            if ln == expected_digits:
+                                score += 100
+                        candidates.append({"val": float(val), "score": score})
+                except Exception:
+                    pass
+        
+        # ปกติ: กวาดเลขติดกัน
         for m in re.finditer(r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?", scan_text):
             n_str = m.group(0)
 
