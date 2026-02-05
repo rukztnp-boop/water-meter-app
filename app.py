@@ -131,32 +131,34 @@ st.markdown("""
 creds = None
 key_dict = None
 
-# 1. Try environment variable (for Cloud Run)
-if 'GOOGLE_CREDENTIALS_JSON' in os.environ:
+# 1. Try local file first (for local development & auto_processor)
+if os.path.exists('service_account.json'):
+    try:
+        with open('service_account.json', 'r') as f:
+            key_dict = json.load(f)
+    except Exception as e:
+        if hasattr(st, 'error'):
+            st.error(f"❌ Error loading service_account.json: {e}")
+
+# 2. Try environment variable (for Cloud Run)
+elif 'GOOGLE_CREDENTIALS_JSON' in os.environ:
     try:
         key_dict = json.loads(os.environ['GOOGLE_CREDENTIALS_JSON'])
         if 'private_key' in key_dict:
             key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
     except Exception as e:
-        st.error(f"❌ Error parsing GOOGLE_CREDENTIALS_JSON: {e}")
-
-# 2. Try Streamlit secrets (for Streamlit Cloud)
-elif hasattr(st, 'secrets') and 'gcp_service_account' in st.secrets:
-    try:
-        key_dict = json.loads(st.secrets['gcp_service_account'])
-        if 'private_key' in key_dict:
-            key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
-    except Exception as e:
         if hasattr(st, 'error'):
-            st.error(f"❌ Error loading Streamlit secrets: {e}")
+            st.error(f"❌ Error parsing GOOGLE_CREDENTIALS_JSON: {e}")
 
-# 3. Try local file (for local development)
-elif os.path.exists('service_account.json'):
+# 3. Try Streamlit secrets (for Streamlit Cloud)
+else:
     try:
-        with open('service_account.json', 'r') as f:
-            key_dict = json.load(f)
-    except Exception as e:
-        st.error(f"❌ Error loading service_account.json: {e}")
+        if 'gcp_service_account' in st.secrets:
+            key_dict = json.loads(st.secrets['gcp_service_account'])
+            if 'private_key' in key_dict:
+                key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
+    except Exception:
+        pass  # Silently ignore if secrets not available
 
 # Initialize credentials if we have key_dict
 if key_dict:
