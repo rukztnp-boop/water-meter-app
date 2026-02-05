@@ -75,18 +75,18 @@ def _lazy_import():
 CONFIG = {
     # โฟลเดอร์ที่ช่างจะวางไฟล์
     # รองรับ 2 รูปแบบ:
-    # 1. Folder เดียว: "C:\WaterMeter\Uploads"
-    # 2. Folder แยกตามวัน: "C:\WaterMeter\Uploads\{date}" (แนะนำ)
-    "WATCH_FOLDER": r"C:\WaterMeter\Uploads",
+    # 1. Folder เดียว: "D:\WaterMeter\Uploads"
+    # 2. Folder แยกตามวัน: "D:\WaterMeter\Uploads\{date}" (แนะนำ)
+    "WATCH_FOLDER": r"D:\WaterMeter\Uploads",
     
     # ใช้ folder แยกตามวันหรือไม่? (แนะนำให้เป็น True)
     "USE_DATE_FOLDERS": True,  # True = หา folder รูปแบบ "5_2_69", "6_2_69"
     
     # โฟลเดอร์เก็บไฟล์ที่ประมวลผลแล้ว
-    "PROCESSED_FOLDER": r"C:\WaterMeter\Processed",
+    "PROCESSED_FOLDER": r"D:\WaterMeter\Processed",
     
     # โฟลเดอร์เก็บ log
-    "LOG_FOLDER": r"C:\WaterMeter\Logs",
+    "LOG_FOLDER": r"D:\WaterMeter\Logs",
     
     # Pattern ของไฟล์ที่ต้องการประมวลผล
     "FILE_PATTERNS": [
