@@ -377,8 +377,16 @@ def move_to_processed(files):
     processed_folder = Path(CONFIG["PROCESSED_FOLDER"])
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    for file_path in files:
+    # ลบ duplicates ออก (ใช้ set แล้วแปลงกลับเป็น list)
+    unique_files = list(set([str(f) for f in files]))
+    
+    for file_path in unique_files:
         try:
+            # เช็คว่าไฟล์ยังอยู่หรือไม่ (อาจถูกย้ายไปแล้ว)
+            if not os.path.exists(file_path):
+                logger.debug(f"⏭ Skipped (already moved): {os.path.basename(file_path)}")
+                continue
+                
             filename = os.path.basename(file_path)
             dest = processed_folder / f"{timestamp}_{filename}"
             shutil.move(str(file_path), str(dest))
@@ -404,18 +412,22 @@ def process_manual():
     stats = process_files_batch([str(f) for f in files])
     
     if stats.get("success", 0) > 0:
-        move_to_processed([str(f) for f in files])
-        
-        # อัพเดท history
+        # อัพเดท history ก่อนย้ายไฟล์ (เพื่อเก็บ hash)
         history = load_processed_history()
-        for file_path in files:
-            filename = os.path.basename(file_path)
-            history[filename] = {
-                "hash": get_file_hash(str(file_path)),
-                "processed_at": datetime.now().isoformat(),
-                "records": stats.get("success", 0)
-            }
+        unique_files = list(set([str(f) for f in files]))
+        
+        for file_path in unique_files:
+            if os.path.exists(file_path):  # เช็คว่าไฟล์ยังอยู่
+                filename = os.path.basename(file_path)
+                history[filename] = {
+                    "hash": get_file_hash(str(file_path)),
+                    "processed_at": datetime.now().isoformat(),
+                    "records": stats.get("success", 0)
+                }
         save_processed_history(history)
+        
+        # ย้ายไฟล์หลังจาก save history แล้ว
+        move_to_processed([str(f) for f in files])
     
     logger.info("=" * 60)
     logger.info(f"✅ Processing complete!")
