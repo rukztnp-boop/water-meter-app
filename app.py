@@ -195,7 +195,7 @@ if not creds:
 
 gc = gspread.authorize(creds)
 DB_SHEET_NAME = 'WaterMeter_System_DB'
-REAL_REPORT_SHEET = 'TEST waterreport'
+REAL_REPORT_SHEET = 'FM-OP-01-10WaterReport'
 VISION_CLIENT = vision.ImageAnnotatorClient(credentials=creds)
 STORAGE_CLIENT = storage.Client(credentials=creds)
 
@@ -3465,7 +3465,7 @@ if mode == "📝 พนักงานจดมิเตอร์":
             if ok:
                 ok_r, msg_r = export_to_real_report(point_id, float(final_val), inspector, report_col, selected_date, debug=True)
                 if not ok_r:
-                    st.warning('⚠️ ส่งค่าไป TEST waterreport ไม่สำเร็จ: ' + msg_r)
+                    st.warning('⚠️ ส่งค่าไป FM-OP-01-10WaterReport ไม่สำเร็จ: ' + msg_r)
                 st.success("✅ บันทึกสำเร็จ")
 
                 # ไปจุดถัดไป
@@ -4322,7 +4322,7 @@ elif mode == "�👮‍♂️ Admin Approval":
                                         
                                     ok_r, msg_r = export_to_real_report(point_id, choice, str(item.get('inspector', '')), report_col, approve_date, debug=True)
                                     if not ok_r:
-                                        st.warning('⚠️ ส่งค่าไป TEST waterreport ไม่สำเร็จ: ' + msg_r)
+                                        st.warning('⚠️ ส่งค่าไป FM-OP-01-10WaterReport ไม่สำเร็จ: ' + msg_r)
                                     updated = True; break
                             if updated: st.success("Approved!"); st.rerun()
                             else: st.warning("หา row ไม่เจอ")
