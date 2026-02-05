@@ -4841,7 +4841,7 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
         st.session_state["bulk_candidates_storage"] = {rows[i]["file"]: rows[i].get("candidates", []) for i in range(len(rows))}
         st.session_state["bulk_processing"] = False  # 🔓 ปลดล็อก
         st.success(f"✅ ประมวลผลเสร็จ {len(rows)} รูป")
-        # ⚠️ ไม่ rerun() เพราะจะทำให้วนกลับไป phase 1
+        st.rerun()  # ✅ rerun เพื่อแสดงผลลัพธ์
 
     rows = st.session_state.get("bulk_rows")
     if not rows:
