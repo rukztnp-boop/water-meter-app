@@ -3746,6 +3746,12 @@ def extract_dashboard_flow_values(image_bytes: bytes, debug: bool = False):
 
 def _norm_pid_key(s: str) -> str:
     s = str(s or "").upper().strip()
+    
+    # 🔥 แก้ OCR errors ก่อนทำอย่างอื่น
+    s = s.replace('O', '0').replace('o', '0')  # O → 0
+    s = s.replace('I', '1').replace('l', '1').replace('|', '1')  # I/l/| → 1
+    
+    # แปลง dash และ space เป็น underscore
     s = s.replace("-", "_")
     s = re.sub(r"\s+", "_", s)          # space -> _
     s = re.sub(r"[^A-Z0-9_]", "", s)    # ตัดสัญลักษณ์แปลกๆ
@@ -3805,6 +3811,10 @@ def _crop_bottom_bytes(image_bytes: bytes, frac: float = 0.40) -> bytes:
     return out or image_bytes
 
 def find_point_id_from_text(ocr_text: str, norm_map: dict):
+    """
+    หา point_id จาก OCR text
+    รองรับ: dash→underscore, space→underscore, O→0, I→1
+    """
     t = _norm_pid_key(ocr_text)
     if not t:
         return None
@@ -3821,7 +3831,44 @@ def find_point_id_from_text(ocr_text: str, norm_map: dict):
         return best
 
     # 2) fuzzy จาก pattern ที่เหมือน point_id
-    # ✅ แก้ไข: รองรับหลาย pattern
+    # 🔥 Pattern หลากหลายขึ้น เพื่อรองรับ "BP2-1 GS BP 21" → "GS_BP_2_1"
+    cand = []
+    
+    # Pattern 1: XX_YY_Z_A (มาตรฐาน)
+    cand.extend(re.findall(r"[A-Z]{2,4}_[A-Z0-9]{1,4}(?:_[A-Z0-9]{1,4}){0,3}", t))
+    
+    # Pattern 2: หา pattern ที่มี underscore 2+ ตัว
+    cand.extend(re.findall(r"[A-Z]{1,4}(?:_[A-Z0-9]{1,4}){2,}", t))
+    
+    # Pattern 3: Fallback
+    if not cand:
+        cand = re.findall(r"[A-Z]{1,4}_[A-Z0-9_]{3,20}", t)
+    
+    if not cand:
+        return None
+
+    best_score = 0.0
+    best_pid = None
+    for c in cand[:15]:  # เพิ่มจาก 12→15
+        # 🔧 แก้ OCR errors เพิ่มเติม
+        c_fixed = c.replace('O', '0').replace('o', '0')
+        c_fixed = c_fixed.replace('I', '1').replace('l', '1')
+        c_fixed = c_fixed.replace('S', '5').replace('s', '5')
+        c_fixed = c_fixed.replace('Z', '2').replace('z', '2')
+        c_fixed = c_fixed.replace('B', '8')
+        c_fixed = c_fixed.replace('G', '6')
+        
+        for nkey, orig in norm_map.items():
+            sc1 = SequenceMatcher(None, c, nkey).ratio()
+            sc2 = SequenceMatcher(None, c_fixed, nkey).ratio()
+            sc = max(sc1, sc2)
+            
+            if sc > best_score:
+                best_score = sc
+                best_pid = orig
+
+    # ✅ ลด threshold จาก 0.60 → 0.55
+    return best_pid if best_score >= 0.55 else None
     # Pattern 1: XX_YY หรือ XX_YY_ZZ (รองรับทั้งมีและไม่มีตัวเลข)
     # Pattern 2: XX_YY_1, XX_YY_A_1 (มีตัวเลข)
     # Pattern 3: Fallback แบบเก่า
@@ -3862,8 +3909,8 @@ def find_point_id_from_text(ocr_text: str, norm_map: dict):
                 best_score = sc
                 best_pid = orig
 
-    # ✅ ลด threshold จาก 0.70 → 0.60 เพื่อรองรับ OCR ที่อ่านผิดมากขึ้น
-    return best_pid if best_score >= 0.60 else None
+    # ✅ ลด threshold จาก 0.70 → 0.60 → 0.55 เพื่อรองรับ OCR ที่อ่านผิดมากขึ้น
+    return best_pid if best_score >= 0.55 else None
 
 def extract_point_id_from_image(image_bytes: bytes, norm_map: dict):
     """คืนค่า (point_id หรือ None, ocr_text ที่ใช้)"""
