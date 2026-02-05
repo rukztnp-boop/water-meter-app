@@ -337,9 +337,13 @@ def process_files_batch(files, target_date=None):
         current_time = app['get_thai_time']()
         timestamp_str = current_time.strftime("%Y-%m-%d %H:%M:%S")
         
-        for point_id, info in results.items():
-            val = info.get("value")
-            if val is not None:
+        # results is a list of dicts, not a dict itself
+        for result in results:
+            point_id = result.get("point_id")
+            val = result.get("value")
+            status = result.get("status")
+            
+            if val is not None and status == "OK":
                 try:
                     row = [
                         timestamp_str,
@@ -357,6 +361,9 @@ def process_files_batch(files, target_date=None):
                 except Exception as e:
                     failed_count += 1
                     logger.error(f"  ✗ {point_id}: {e}")
+            else:
+                failed_count += 1
+                logger.warning(f"  ⚠ {point_id}: {status or 'No value'}")
         
         logger.info(f"✅ Saved {success_count}/{len(results)} records to Google Sheets")
         
