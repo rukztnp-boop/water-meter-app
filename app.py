@@ -4732,16 +4732,6 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
 
     # ✅ อัตโนมัติ process ทันทีที่อัพเสร็จ (ไม่ต้องกดปุ่ม)
     if st.session_state["bulk_rows"] is None:
-        # 🔒 ป้องกันการ rerun ระหว่าง processing
-        if "bulk_processing" not in st.session_state:
-            st.session_state["bulk_processing"] = False
-        
-        if st.session_state["bulk_processing"]:
-            st.warning("⏳ กำลังประมวลผล... กรุณารอสักครู่")
-            st.stop()
-        
-        st.session_state["bulk_processing"] = True
-        
         rows = []
         
         # ⚡ โหลด DailyReadings 1 ครั้งก่อนเริ่ม loop (ลดเวลามาก)
@@ -4839,7 +4829,6 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
         
         st.session_state["bulk_rows"] = rows
         st.session_state["bulk_candidates_storage"] = {rows[i]["file"]: rows[i].get("candidates", []) for i in range(len(rows))}
-        st.session_state["bulk_processing"] = False  # 🔓 ปลดล็อก
         st.success(f"✅ ประมวลผลเสร็จ {len(rows)} รูป")
         st.rerun()  # ✅ rerun เพื่อแสดงผลลัพธ์
 
