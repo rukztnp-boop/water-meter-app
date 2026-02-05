@@ -37,32 +37,21 @@ import pandas as pd
 # ใช้ functions จาก app.py
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Lazy import container to avoid triggering Streamlit UI code
-_app_modules = {}
+# Import from standalone wrapper instead of app.py directly
+sys.path.insert(0, os.path.dirname(__file__))
 
-def _lazy_import():
-    """Import functions from app.py only when needed"""
-    if _app_modules:
-        return _app_modules  # Already imported
-    
-    try:
-        from app import (
-            load_scada_excel_mapping,
-            extract_scada_values_from_exports,
-            gc,
-            DB_SHEET_NAME,
-            get_thai_time
-        )
-        _app_modules['load_scada_excel_mapping'] = load_scada_excel_mapping
-        _app_modules['extract_scada_values_from_exports'] = extract_scada_values_from_exports
-        _app_modules['gc'] = gc
-        _app_modules['DB_SHEET_NAME'] = DB_SHEET_NAME
-        _app_modules['get_thai_time'] = get_thai_time
-        return _app_modules
-    except ImportError as e:
-        print(f"❌ Error importing from app.py: {e}")
-        print("ตรวจสอบว่าไฟล์ app.py อยู่ในโฟลเดอร์เดียวกัน")
-        sys.exit(1)
+try:
+    from app_standalone import (
+        load_scada_excel_mapping,
+        extract_scada_values_from_exports,
+        gc,
+        DB_SHEET_NAME,
+        get_thai_time
+    )
+except ImportError as e:
+    print(f"❌ Error importing from app_standalone.py: {e}")
+    print("ตรวจสอบว่าไฟล์ app_standalone.py และ app.py อยู่ในโฟลเดอร์เดียวกัน")
+    sys.exit(1)
 
 # ==================== Configuration ====================
 
@@ -273,13 +262,12 @@ def process_files_batch(files, target_date=None):
     Returns:
         dict: สถิติการประมวลผล
     """
-    app = _lazy_import()  # Import functions only when needed
     if not files:
         logger.warning("⚠️ No files to process")
         return {"success": 0, "failed": 0, "total": 0}
     
     if target_date is None:
-        target_date = app['get_thai_time']().date()
+        target_date = get_thai_time().date()
     
     logger.info(f"📅 Target date: {target_date}")
     logger.info(f"📂 Processing {len(files)} file(s)...")
@@ -291,7 +279,7 @@ def process_files_batch(files, target_date=None):
             logger.error(f"❌ Mapping file not found: {mapping_file}")
             return {"success": 0, "failed": 0, "total": 0, "error": "Mapping file not found"}
         
-        mapping = app['load_scada_excel_mapping'](str(mapping_file))
+        mapping = load_scada_excel_mapping(str(mapping_file))
         logger.info(f"✅ Loaded {len(mapping)} mapping entries")
     except Exception as e:
         logger.error(f"❌ Error loading mapping: {e}")
@@ -315,7 +303,7 @@ def process_files_batch(files, target_date=None):
     # 3. Extract values
     try:
         logger.info("🔄 Extracting values from Excel files...")
-        results, missing = app['extract_scada_values_from_exports'](
+        results, missing = extract_scada_values_from_exports(
             uploaded_exports=uploaded_exports,
             mapping_rows=mapping,
             target_date=target_date,
@@ -331,10 +319,10 @@ def process_files_batch(files, target_date=None):
     failed_count = 0
     
     try:
-        sh = app['gc'].open(app['DB_SHEET_NAME'])
+        sh = gc.open(DB_SHEET_NAME)
         ws = sh.worksheet("DailyReadings")
         
-        current_time = app['get_thai_time']()
+        current_time = get_thai_time()
         timestamp_str = current_time.strftime("%Y-%m-%d %H:%M:%S")
         
         # results is a list of dicts, not a dict itself
