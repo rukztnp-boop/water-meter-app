@@ -6,6 +6,23 @@ import os
 import sys
 
 # Mock streamlit to prevent UI initialization
+class MockSidebar:
+    """Mock sidebar that returns itself for chaining"""
+    def radio(self, *args, **kwargs):
+        return kwargs.get('index', 0) if 'index' in kwargs else None
+    
+    def selectbox(self, *args, **kwargs):
+        return kwargs.get('index', 0) if 'index' in kwargs else None
+    
+    def button(self, *args, **kwargs):
+        return False
+    
+    def text_input(self, *args, **kwargs):
+        return ""
+    
+    def file_uploader(self, *args, **kwargs):
+        return None
+
 class MockStreamlit:
     class secrets:
         pass
@@ -21,6 +38,12 @@ class MockStreamlit:
         
         def __contains__(self, key):
             return key in self._data
+        
+        def get(self, key, default=None):
+            return self._data.get(key, default)
+    
+    # Add sidebar
+    sidebar = MockSidebar()
     
     def set_page_config(self, **kwargs):
         pass
@@ -42,6 +65,21 @@ class MockStreamlit:
     
     def stop(self):
         pass
+    
+    def write(self, *args, **kwargs):
+        pass
+    
+    def button(self, *args, **kwargs):
+        return False
+    
+    def text_input(self, *args, **kwargs):
+        return ""
+    
+    def file_uploader(self, *args, **kwargs):
+        return None
+    
+    def download_button(self, *args, **kwargs):
+        return False
     
     # Mock decorators
     @staticmethod
