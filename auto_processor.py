@@ -44,8 +44,10 @@ try:
     from app_standalone import (
         load_scada_excel_mapping,
         extract_scada_values_from_exports,
+        export_scada_to_waterreport,
         gc,
         DB_SHEET_NAME,
+        REAL_REPORT_SHEET,
         get_thai_time
     )
 except ImportError as e:
@@ -314,7 +316,7 @@ def process_files_batch(files, target_date=None):
         logger.error(f"❌ Error extracting values: {e}")
         return {"success": 0, "failed": 0, "total": 0, "error": str(e)}
     
-    # 4. บันทึกลง Google Sheets
+    # 4. บันทึกลง Google Sheets (DailyReadings)
     success_count = 0
     failed_count = 0
     
@@ -353,7 +355,7 @@ def process_files_batch(files, target_date=None):
                 failed_count += 1
                 logger.warning(f"  ⚠ {point_id}: {status or 'No value'}")
         
-        logger.info(f"✅ Saved {success_count}/{len(results)} records to Google Sheets")
+        logger.info(f"✅ Saved {success_count}/{len(results)} records to Google Sheets (DailyReadings)")
         
     except Exception as e:
         logger.error(f"❌ Error saving to Google Sheets: {e}")
@@ -363,6 +365,38 @@ def process_files_batch(files, target_date=None):
             "total": len(results),
             "error": str(e)
         }
+    
+    # 5. บันทึกลง WaterReport (FM-OP-01-10WaterReport)
+    try:
+        logger.info("🔄 Saving to WaterReport...")
+        
+        # เตรียมข้อมูลสำหรับ export_scada_to_waterreport
+        scada_results = []
+        for result in results:
+            if result.get("value") is not None and result.get("status") == "OK":
+                scada_results.append({
+                    "point_id": result.get("point_id"),
+                    "value": result.get("value"),
+                    "status": "OK"
+                })
+        
+        if scada_results:
+            success_msg, fail_msg = export_scada_to_waterreport(
+                scada_results=scada_results,
+                target_date=target_date,
+                mode="scada_auto"
+            )
+            
+            if success_msg:
+                logger.info(f"✅ {success_msg}")
+            if fail_msg:
+                logger.warning(f"⚠️ {fail_msg}")
+        else:
+            logger.warning("⚠️ No valid data to export to WaterReport")
+            
+    except Exception as e:
+        logger.error(f"❌ Error saving to WaterReport: {e}")
+        # ไม่ return error เพราะ DailyReadings สำเร็จแล้ว
     
     return {
         "success": success_count,

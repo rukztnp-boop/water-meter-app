@@ -105,8 +105,10 @@ sys.modules['streamlit'] = MockStreamlit()
 from app import (
     load_scada_excel_mapping,
     extract_scada_values_from_exports,
+    export_scada_to_waterreport,
     gc,
     DB_SHEET_NAME,
+    REAL_REPORT_SHEET,
     get_thai_time
 )
 
