@@ -2761,7 +2761,12 @@ def find_point_id_from_text(ocr_text: str, norm_map: dict):
         return best
 
     # 2) fuzzy จาก pattern ที่เหมือน point_id
-    cand = re.findall(r"[A-Z]{1,3}_[A-Z0-9]{1,10}(?:_[A-Z0-9]{1,10}){1,5}", t)
+    # ปรับ pattern ให้รองรับทั้ง 2-3 segments และมากกว่า
+    # เช่น XX_YY_123, XX_YYY_ZZ_123
+    cand = re.findall(r"[A-Z]{1,4}_[A-Z0-9]{1,10}(?:_[A-Z0-9]{1,10})+", t)
+    if not cand:
+        # Fallback: ลองแบบเก่า
+        cand = re.findall(r"[A-Z]{1,3}_[A-Z0-9]{1,10}(?:_[A-Z0-9]{1,10}){1,5}", t)
     if not cand:
         return None
 
