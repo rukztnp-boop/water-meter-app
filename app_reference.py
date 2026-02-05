@@ -22,22 +22,6 @@ from google.cloud import storage
 from datetime import datetime, timedelta, timezone, time # ✅ เพิ่ม time
 import string
 
-# ✅ 1.3: Daily Report Logging System
-try:
-    from daily_report_logger import (
-        update_log_success,
-        update_log_failed,
-        print_daily_report,
-        get_daily_summary,
-    )
-    HAS_LOGGER = True
-except ImportError:
-    HAS_LOGGER = False
-    def update_log_success(*args, **kwargs): pass
-    def update_log_failed(*args, **kwargs): pass
-    def print_daily_report(*args, **kwargs): return "Logger not available"
-    def get_daily_summary(*args, **kwargs): return {}
-
 # =========================================================
 # --- SQL SERVER IMPORTS (สำหรับ CUTEST SCADA Integration) ---
 # =========================================================
@@ -118,18 +102,12 @@ st.markdown("""
 # =========================================================
 # --- CONFIGURATION & SECRETS ---
 # =========================================================
-import os
-
-# Try to load credentials from multiple sources (for Cloud Run compatibility)
-creds = None
-
-# Option 1: Try environment variable (for Cloud Run)
-if os.getenv('GCP_SERVICE_ACCOUNT_JSON'):
+if 'gcp_service_account' in st.secrets:
     try:
-        key_dict = json.loads(os.getenv('GCP_SERVICE_ACCOUNT_JSON'))
+        key_dict = json.loads(st.secrets['gcp_service_account'])
         if 'private_key' in key_dict:
             key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
-        
+
         creds = service_account.Credentials.from_service_account_info(
             key_dict,
             scopes=[
@@ -139,58 +117,10 @@ if os.getenv('GCP_SERVICE_ACCOUNT_JSON'):
             ]
         )
     except Exception as e:
-        st.error(f"❌ Error loading from environment variable: {e}")
-
-# Option 2: Try secrets.toml (for local/Streamlit Cloud)
-if not creds:
-    try:
-        if 'gcp_service_account' in st.secrets:
-            try:
-                key_dict = json.loads(st.secrets['gcp_service_account'])
-                if 'private_key' in key_dict:
-                    key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
-
-                creds = service_account.Credentials.from_service_account_info(
-                    key_dict,
-                    scopes=[
-                        "https://www.googleapis.com/auth/spreadsheets",
-                        "https://www.googleapis.com/auth/drive",
-                        "https://www.googleapis.com/auth/cloud-platform"
-                    ]
-                )
-            except Exception as e:
-                st.error(f"❌ Error loading secrets: {e}")
-    except Exception as e:
-        pass  # secrets.toml doesn't exist, try next option
-
-# Option 3: Try service_account.json file (for local development)
-if not creds:
-    try:
-        if os.path.exists('service_account.json'):
-            creds = service_account.Credentials.from_service_account_file(
-                'service_account.json',
-                scopes=[
-                    "https://www.googleapis.com/auth/spreadsheets",
-                    "https://www.googleapis.com/auth/drive",
-                    "https://www.googleapis.com/auth/cloud-platform"
-                ]
-            )
-    except Exception as e:
-        pass
-
-# If no credentials found, show error
-if not creds:
-    st.error("❌ No GCP credentials found!")
-    st.info("""
-    Please configure credentials using one of these methods:
-    
-    **For Cloud Run:**
-    - Set environment variable `GCP_SERVICE_ACCOUNT_JSON` with service account JSON
-    
-    **For Local/Streamlit Cloud:**
-    - Create `.streamlit/secrets.toml` with `gcp_service_account` key
-    - Or place `service_account.json` file in project root
-    """)
+        st.error(f"❌ Error loading secrets: {e}")
+        st.stop()
+else:
+    st.error("❌ Secrets not found.")
     st.stop()
 
 gc = gspread.authorize(creds)
@@ -279,69 +209,19 @@ def col_to_index(col_str):
     return num
 
 # ✅ แก้ไข: รับวันที่เข้ามาเพื่อหา Sheet เดือนที่ถูกต้อง (เผื่อลงย้อนหลังข้ามเดือน)
-# ✅ Support both Thai and English month names with comprehensive month rollover handling
 def get_thai_sheet_name(sh, target_date):
-    """Find the correct monthly sheet based on target_date.
-    
-    Supports multiple naming conventions:
-    - Thai months: ม.ค. 68, ก.พ. 68, etc.
-    - English months: Jan2026, Feb2026, January2026, etc.
-    
-    Args:
-        sh: gspread Spreadsheet object
-        target_date: datetime.date object to find the correct month
-    
-    Returns:
-        Sheet title if found, None otherwise
-    """
     thai_months = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
-    english_months_short = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-    english_months_long = ["January", "February", "March", "April", "May", "June", 
-                           "July", "August", "September", "October", "November", "December"]
     
     # ใช้วันที่ที่เลือก (target_date) แทนเวลาปัจจุบัน
     m_idx = target_date.month - 1
-    # ปีพุทธศักราช (2 หรือ 4 หลัก)
-    yy2 = str(target_date.year + 543)[-2:]
-    yy4 = str(target_date.year + 543)
-    # ปีค.ศ. (2 หรือ 4 หลัก)
-    ad_yy2 = str(target_date.year)[-2:]
-    ad_yy4 = str(target_date.year)
+    # ปีพุทธศักราช
+    yy = str(target_date.year + 543)[-2:]
     
+    patterns = [f"{thai_months[m_idx]}{yy}", f"{thai_months[m_idx][:-1]}{yy}", f"{thai_months[m_idx]} {yy}", f"{thai_months[m_idx][:-1]} {yy}"]
     all_sheets = [s.title for s in sh.worksheets()]
-    
-    # Try Thai month patterns first (highest priority)
-    thai_patterns = [
-        f"{thai_months[m_idx]}{yy2}",      # ม.ค.68
-        f"{thai_months[m_idx][:-1]}{yy2}", # ม.ค68  (without dot)
-        f"{thai_months[m_idx]} {yy2}",     # ม.ค. 68
-        f"{thai_months[m_idx][:-1]} {yy2}",# ม.ค 68
-        f"{thai_months[m_idx]}{yy4}",      # ม.ค.2568
-        f"{thai_months[m_idx][:-1]}{yy4}", # ม.ค2568
-        f"{thai_months[m_idx]} {yy4}",     # ม.ค. 2568
-        f"{thai_months[m_idx][:-1]} {yy4}",# ม.ค 2568
-    ]
-    
-    for p in thai_patterns:
+    for p in patterns:
         if p in all_sheets:
             return p
-    
-    # Try English month patterns (short names)
-    eng_patterns = [
-        f"{english_months_short[m_idx]}{ad_yy4}",  # Jan2026
-        f"{english_months_short[m_idx]} {ad_yy4}", # Jan 2026
-        f"{english_months_short[m_idx]}{ad_yy2}",  # Jan26
-        f"{english_months_short[m_idx]} {ad_yy2}", # Jan 26
-        f"{english_months_long[m_idx]}{ad_yy4}",   # January2026
-        f"{english_months_long[m_idx]} {ad_yy4}",  # January 2026
-        f"{english_months_long[m_idx]}{ad_yy2}",   # January26
-        f"{english_months_long[m_idx]} {ad_yy2}",  # January 26
-    ]
-    
-    for p in eng_patterns:
-        if p in all_sheets:
-            return p
-    
     return None
 
 def find_day_row_exact(ws, day: int):
@@ -428,29 +308,17 @@ def export_to_real_report(point_id, read_value, inspector, report_col, target_da
     if not sheet_name:
         try:
             thai_months = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
-            english_months_short = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-            english_months_long = ["January", "February", "March", "April", "May", "June", 
-                                   "July", "August", "September", "October", "November", "December"]
-            
             m_idx = target_date.month - 1
-            yy2_thai = str(target_date.year + 543)[-2:]
-            yy4_thai = str(target_date.year + 543)
-            yy2_ad = str(target_date.year)[-2:]
-            yy4_ad = str(target_date.year)
-            
-            m_norm_thai = thai_months[m_idx].replace(".", "").replace(" ", "")
+            yy2 = str(target_date.year + 543)[-2:]
+            yy4 = str(target_date.year + 543)
+            m_norm = thai_months[m_idx].replace(".", "").replace(" ", "")
 
             def norm(x):
-                return str(x).replace(".", "").replace(" ", "").lower().strip()
+                return str(x).replace(".", "").replace(" ", "").strip()
 
             for t in [s.title for s in sh.worksheets()]:
                 tn = norm(t)
-                # Check Thai month patterns
-                if (m_norm_thai.lower() in tn) and (yy2_thai in tn or yy4_thai in tn):
-                    sheet_name = t
-                    break
-                # Check English month patterns (case-insensitive)
-                if (english_months_short[m_idx].lower() in tn or english_months_long[m_idx].lower() in tn) and (yy2_ad in tn or yy4_ad in tn):
+                if (m_norm in tn) and (yy2 in tn or yy4 in tn):
                     sheet_name = t
                     break
         except Exception:
@@ -1035,9 +903,6 @@ def save_to_db(point_id, inspector, meter_type, manual_val, ai_val, status, targ
 def _normalize_scada_time(value):
     """
     แปลงเวลาให้เป็นรูปแบบ 'HH:MM' เพื่อเทียบกันง่าย (รองรับ time/datetime/str/float)
-    
-    ✅ 24:00 standardization:
-    - 24:00 → 23:55 (standard for end-of-day)
     """
     import datetime as _dt
     if value is None:
@@ -1048,41 +913,22 @@ def _normalize_scada_time(value):
         seconds = int(round(float(value) * 24 * 60 * 60))
         h = (seconds // 3600) % 24
         m = (seconds % 3600) // 60
-        result = f"{h:02d}:{m:02d}"
-        # Apply 24:00 → 23:55 conversion
-        if h == 24 and m == 0:
-            return "23:55"
-        return result
+        return f"{h:02d}:{m:02d}"
 
     if isinstance(value, _dt.datetime):
         value = value.time()
     if isinstance(value, _dt.time):
-        result = f"{value.hour:02d}:{value.minute:02d}"
-        # Apply 24:00 → 23:55 conversion
-        if value.hour == 24 and value.minute == 0:
-            return "23:55"
-        return result
+        return f"{value.hour:02d}:{value.minute:02d}"
 
     s = str(value).strip()
-    # 23.55 or 24.00
+    # 23.55
     if re.match(r"^\d{1,2}\.\d{2}$", s):
         h, m = s.split(".")
-        h = int(h)
-        m = int(m)
-        # ✅ 24:00 → 23:55 conversion
-        if h == 24 and m == 0:
-            return "23:55"
-        return f"{h:02d}:{m:02d}"
-    
-    # 23:55 or 24:00 or 23:55:00 or 24:00:00
+        return f"{int(h):02d}:{int(m):02d}"
+    # 23:55 or 23:55:00
     if re.match(r"^\d{1,2}:\d{2}", s):
         parts = s.split(":")
-        h = int(parts[0])
-        m = int(parts[1])
-        # ✅ 24:00 → 23:55 conversion
-        if h == 24 and m == 0:
-            return "23:55"
-        return f"{h:02d}:{m:02d}"
+        return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
 
     return None
 
@@ -1160,123 +1006,12 @@ def _find_cell_exact(ws, target_text: str, max_rows=60, max_cols=40):
     return None
 
 
-def _hhmm_to_minutes(hhmm: str, normalize_24_00=True):
-    """
-    แปลง HH:MM เป็นจำนวนนาทีตั้งแต่เที่ยงคืน
-    
-    ✅ 24:00 standardization:
-    - 24:00 ถือว่าเป็น 23:55 (สุดท้ายของวัน)
-    - กำหนดมาตรฐาน: "24:00 ของวัน D" = "23:55 ของวัน D"
-    
-    Args:
-        hhmm: string format "HH:MM" (e.g., "24:00", "23:55")
-        normalize_24_00: if True, convert 24:00 → 23:55
-    
-    Returns:
-        minutes since midnight, or None if invalid
-    """
+def _hhmm_to_minutes(hhmm: str):
     try:
         h, m = str(hhmm).split(":")
-        h = int(h)
-        m = int(m)
-        
-        # ✅ Handle 24:00 normalization
-        if normalize_24_00 and h == 24 and m == 0:
-            # 24:00 ของวัน D = 23:55 ของวัน D
-            return 23 * 60 + 55
-        
-        # Validate time range
-        if h < 0 or h > 23 or m < 0 or m > 59:
-            return None
-        
-        return h * 60 + m
+        return int(h) * 60 + int(m)
     except Exception:
         return None
-
-
-def _minutes_to_hhmm(minutes: int) -> str:
-    """
-    แปลงนาทีมาเป็น HH:MM format
-    """
-    try:
-        h = minutes // 60
-        m = minutes % 60
-        return f"{h:02d}:{m:02d}"
-    except Exception:
-        return None
-
-
-def _normalize_time_to_standard(hhmm: str) -> str:
-    """
-    Normalize any time format to standard HH:MM
-    
-    ✅ 24:00 standardization (สำคัญ):
-    - Input: "24:00" → Output: "23:55"
-    - This is the company standard for end-of-day
-    
-    Returns:
-        Normalized time string, or None if invalid
-    """
-    try:
-        # First normalize to HH:MM
-        normalized = _normalize_scada_time(hhmm)
-        if not normalized:
-            return None
-        
-        h, m = normalized.split(":")
-        h = int(h)
-        m = int(m)
-        
-        # ✅ Apply 24:00 → 23:55 conversion
-        if h == 24 and m == 0:
-            return "23:55"
-        
-        if h < 0 or h > 23 or m < 0 or m > 59:
-            return None
-        
-        return f"{h:02d}:{m:02d}"
-    except Exception:
-        return None
-
-
-def _find_nearest_time_row(time_rows: list, target_minutes: int, max_diff_minutes: int = 300) -> int:
-    """
-    Find the row with time closest to target_minutes (nearest time algorithm)
-    
-    ✅ Key feature: Handles missing data by finding nearest available time
-    
-    Args:
-        time_rows: list of tuples (row_number, minutes_since_midnight)
-        target_minutes: target time in minutes (e.g., 1435 for 23:55)
-        max_diff_minutes: max allowed difference (default 5 mins = 300 sec)
-    
-    Returns:
-        row_number if found, None otherwise
-    
-    Example:
-        time_rows = [(10, 1430), (11, 1435), (12, 1440)]  # 23:50, 23:55, 24:00→23:55
-        target = 1435  # 23:55
-        → returns 11 (exact match)
-        
-        If 23:55 data missing, still finds nearest (23:50 or 00:00)
-    """
-    if not time_rows:
-        return None
-    
-    if target_minutes is None:
-        # No target specified, return last available
-        return time_rows[-1][0]
-    
-    # Find closest match
-    nearest = min(time_rows, key=lambda x: abs(x[1] - target_minutes))
-    diff = abs(nearest[1] - target_minutes)
-    
-    # Only return if within acceptable range
-    if diff <= max_diff_minutes:
-        return nearest[0]
-    
-    # If no match within range, return last available (fallback)
-    return time_rows[-1][0]
 
 
 
@@ -1319,9 +1054,10 @@ def _extract_value_from_ws(ws, target_time_hhmm, value_col_letter: str, time_hea
     # เลือกแถวที่ “ใกล้เวลาเป้าหมายที่สุด”
     if target_time_hhmm:
         tmm = _hhmm_to_minutes(target_time_hhmm)
-        target_row = _find_nearest_time_row(time_rows, tmm, max_diff_minutes=300)
-        if target_row is None:
+        if tmm is None:
             target_row = time_rows[-1][0]
+        else:
+            target_row = min(time_rows, key=lambda x: abs(x[1] - tmm))[0]
     else:
         target_row = time_rows[-1][0]
 
@@ -1732,9 +1468,10 @@ def extract_scada_values_from_exports(
             return ctx["target_row_cache"][target_time_hhmm]
 
         tmm = _hhmm_to_minutes(target_time_hhmm)
-        row = _find_nearest_time_row(ctx["time_rows"], tmm, max_diff_minutes=300)
-        if row is None:
+        if tmm is None:
             row = ctx["time_rows"][-1][0]
+        else:
+            row = min(ctx["time_rows"], key=lambda x: abs(x[1] - tmm))[0]
 
         ctx["target_row_cache"][target_time_hhmm] = row
         return row
@@ -3870,22 +3607,14 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                 wm = "overwrite" if write_mode_ui.startswith("เขียนทับ") else "empty_only"
                 ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True, write_mode=wm)
 
-                # ✅ 1.3: Update logging with results
-                if HAS_LOGGER:
-                    update_log_success(ok_pids)
-                    if fail_report:
-                        update_log_failed(fail_report)
-                    # Show daily report
-                    st.info(print_daily_report())
-
                 # ✅ Show results
                 if ok_pids:
                     st.success(f"✅ ลง WaterReport สำเร็จ: {len(ok_pids)} จุด")
                 
-                if fail_report:
-                    st.error(f"❌ ไม่สำเร็จ: {len(fail_report)} จุด")
+                if fail_list or fail_report:
+                    st.error(f"❌ ไม่สำเร็จ: {len(fail_list) + len(fail_report)} จุด")
                     with st.expander("📋 ดูรายละเอียด:"):
-                        for pid, reason in fail_report:
+                        for pid, reason in (fail_list + list(fail_report)):
                             st.caption(f"  • {pid}: {reason}")
                 
                 # ✅ Update rows status carefully
@@ -4044,18 +3773,10 @@ elif mode == "🖥️ Dashboard Screenshot (OCR)":
         with st.spinner("กำลังบันทึกลง WaterReport..."):
             ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True)
 
-        # ✅ 1.3: Update logging with results
-        if HAS_LOGGER:
-            update_log_success(ok_pids)
-            if fail_report:
-                update_log_failed(fail_report)
-            # Show daily report
-            st.info(print_daily_report())
-
         st.success(f"✅ บันทึกสำเร็จ: {len(ok_pids)} จุด")
-        if fail_report:
-            st.error(f"❌ ไม่สำเร็จ: {len(fail_report)} จุด")
-            st.write([[pid, reason] for pid, reason in fail_report])
+        if fail_list or fail_report:
+            st.error(f"❌ ไม่สำเร็จ: {len(fail_list) + len(fail_report)} จุด")
+            st.write([[pid, reason] for pid, reason in (fail_list + list(fail_report))])
 
 elif mode == "�️ SQL Server (CUTEST SCADA - Test)":
     st.title("🗄️ SQL Server Integration (Test Mode)")
@@ -4730,16 +4451,8 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
                 wm = "overwrite" if write_mode_ui.startswith("เขียนทับ") else "empty_only"
                 ok_pids, fail_report = export_many_to_real_report_batch(report_items, report_date, debug=True, write_mode=wm)
 
-            # ✅ 1.3: Update logging with results
-            if HAS_LOGGER:
-                update_log_success(ok_pids)
-                if fail_report:
-                    update_log_failed(fail_report)
-                # Show daily report
-                st.info(print_daily_report())
-
             report_ok = len(ok_pids)
-            report_fail = list(fail_report)
+            report_fail = fail_list + list(fail_report)
 
             # แยก 'ข้ามเพราะช่องมีข้อมูลแล้ว' ออกจาก error จริง
             skipped = [(pid, reason) for pid, reason in report_fail if str(reason) == 'SKIP_NON_EMPTY']

@@ -118,18 +118,12 @@ st.markdown("""
 # =========================================================
 # --- CONFIGURATION & SECRETS ---
 # =========================================================
-import os
-
-# Try to load credentials from multiple sources (for Cloud Run compatibility)
-creds = None
-
-# Option 1: Try environment variable (for Cloud Run)
-if os.getenv('GCP_SERVICE_ACCOUNT_JSON'):
+if 'gcp_service_account' in st.secrets:
     try:
-        key_dict = json.loads(os.getenv('GCP_SERVICE_ACCOUNT_JSON'))
+        key_dict = json.loads(st.secrets['gcp_service_account'])
         if 'private_key' in key_dict:
             key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
-        
+
         creds = service_account.Credentials.from_service_account_info(
             key_dict,
             scopes=[
@@ -139,58 +133,10 @@ if os.getenv('GCP_SERVICE_ACCOUNT_JSON'):
             ]
         )
     except Exception as e:
-        st.error(f"❌ Error loading from environment variable: {e}")
-
-# Option 2: Try secrets.toml (for local/Streamlit Cloud)
-if not creds:
-    try:
-        if 'gcp_service_account' in st.secrets:
-            try:
-                key_dict = json.loads(st.secrets['gcp_service_account'])
-                if 'private_key' in key_dict:
-                    key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
-
-                creds = service_account.Credentials.from_service_account_info(
-                    key_dict,
-                    scopes=[
-                        "https://www.googleapis.com/auth/spreadsheets",
-                        "https://www.googleapis.com/auth/drive",
-                        "https://www.googleapis.com/auth/cloud-platform"
-                    ]
-                )
-            except Exception as e:
-                st.error(f"❌ Error loading secrets: {e}")
-    except Exception as e:
-        pass  # secrets.toml doesn't exist, try next option
-
-# Option 3: Try service_account.json file (for local development)
-if not creds:
-    try:
-        if os.path.exists('service_account.json'):
-            creds = service_account.Credentials.from_service_account_file(
-                'service_account.json',
-                scopes=[
-                    "https://www.googleapis.com/auth/spreadsheets",
-                    "https://www.googleapis.com/auth/drive",
-                    "https://www.googleapis.com/auth/cloud-platform"
-                ]
-            )
-    except Exception as e:
-        pass
-
-# If no credentials found, show error
-if not creds:
-    st.error("❌ No GCP credentials found!")
-    st.info("""
-    Please configure credentials using one of these methods:
-    
-    **For Cloud Run:**
-    - Set environment variable `GCP_SERVICE_ACCOUNT_JSON` with service account JSON
-    
-    **For Local/Streamlit Cloud:**
-    - Create `.streamlit/secrets.toml` with `gcp_service_account` key
-    - Or place `service_account.json` file in project root
-    """)
+        st.error(f"❌ Error loading secrets: {e}")
+        st.stop()
+else:
+    st.error("❌ Secrets not found.")
     st.stop()
 
 gc = gspread.authorize(creds)

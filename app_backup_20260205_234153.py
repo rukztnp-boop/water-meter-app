@@ -22,6 +22,14 @@ from google.cloud import storage
 from datetime import datetime, timedelta, timezone, time # ✅ เพิ่ม time
 import string
 
+# ✅ Roboflow Inference SDK สำหรับ Water Meter Detection
+try:
+    from inference_sdk import InferenceHTTPClient
+    HAS_ROBOFLOW = True
+except ImportError:
+    HAS_ROBOFLOW = False
+    InferenceHTTPClient = None
+
 # ✅ 1.3: Daily Report Logging System
 try:
     from daily_report_logger import (
@@ -118,18 +126,43 @@ st.markdown("""
 # =========================================================
 # --- CONFIGURATION & SECRETS ---
 # =========================================================
-import os
 
-# Try to load credentials from multiple sources (for Cloud Run compatibility)
+# Try to load credentials from multiple sources
 creds = None
+key_dict = None
 
-# Option 1: Try environment variable (for Cloud Run)
-if os.getenv('GCP_SERVICE_ACCOUNT_JSON'):
+# 1. Try local file first (for local development & auto_processor)
+if os.path.exists('service_account.json'):
     try:
-        key_dict = json.loads(os.getenv('GCP_SERVICE_ACCOUNT_JSON'))
+        with open('service_account.json', 'r') as f:
+            key_dict = json.load(f)
+    except Exception as e:
+        if hasattr(st, 'error'):
+            st.error(f"❌ Error loading service_account.json: {e}")
+
+# 2. Try environment variable (for Cloud Run)
+elif 'GOOGLE_CREDENTIALS_JSON' in os.environ:
+    try:
+        key_dict = json.loads(os.environ['GOOGLE_CREDENTIALS_JSON'])
         if 'private_key' in key_dict:
             key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
-        
+    except Exception as e:
+        if hasattr(st, 'error'):
+            st.error(f"❌ Error parsing GOOGLE_CREDENTIALS_JSON: {e}")
+
+# 3. Try Streamlit secrets (for Streamlit Cloud)
+else:
+    try:
+        if 'gcp_service_account' in st.secrets:
+            key_dict = json.loads(st.secrets['gcp_service_account'])
+            if 'private_key' in key_dict:
+                key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
+    except Exception:
+        pass  # Silently ignore if secrets not available
+
+# Initialize credentials if we have key_dict
+if key_dict:
+    try:
         creds = service_account.Credentials.from_service_account_info(
             key_dict,
             scopes=[
@@ -138,66 +171,20 @@ if os.getenv('GCP_SERVICE_ACCOUNT_JSON'):
                 "https://www.googleapis.com/auth/cloud-platform"
             ]
         )
+        
+        # Initialize clients
+        gc = gspread.authorize(creds)
+        DB_SHEET_NAME = 'WaterMeter_System_DB'
+        REAL_REPORT_SHEET = 'FM-OP-01-10WaterReport'
+        VISION_CLIENT = vision.ImageAnnotatorClient(credentials=creds)
+        STORAGE_CLIENT = storage.Client(credentials=creds)
+        
     except Exception as e:
-        st.error(f"❌ Error loading from environment variable: {e}")
-
-# Option 2: Try secrets.toml (for local/Streamlit Cloud)
-if not creds:
-    try:
-        if 'gcp_service_account' in st.secrets:
-            try:
-                key_dict = json.loads(st.secrets['gcp_service_account'])
-                if 'private_key' in key_dict:
-                    key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
-
-                creds = service_account.Credentials.from_service_account_info(
-                    key_dict,
-                    scopes=[
-                        "https://www.googleapis.com/auth/spreadsheets",
-                        "https://www.googleapis.com/auth/drive",
-                        "https://www.googleapis.com/auth/cloud-platform"
-                    ]
-                )
-            except Exception as e:
-                st.error(f"❌ Error loading secrets: {e}")
-    except Exception as e:
-        pass  # secrets.toml doesn't exist, try next option
-
-# Option 3: Try service_account.json file (for local development)
-if not creds:
-    try:
-        if os.path.exists('service_account.json'):
-            creds = service_account.Credentials.from_service_account_file(
-                'service_account.json',
-                scopes=[
-                    "https://www.googleapis.com/auth/spreadsheets",
-                    "https://www.googleapis.com/auth/drive",
-                    "https://www.googleapis.com/auth/cloud-platform"
-                ]
-            )
-    except Exception as e:
-        pass
-
-# If no credentials found, show error
-if not creds:
-    st.error("❌ No GCP credentials found!")
-    st.info("""
-    Please configure credentials using one of these methods:
-    
-    **For Cloud Run:**
-    - Set environment variable `GCP_SERVICE_ACCOUNT_JSON` with service account JSON
-    
-    **For Local/Streamlit Cloud:**
-    - Create `.streamlit/secrets.toml` with `gcp_service_account` key
-    - Or place `service_account.json` file in project root
-    """)
+        st.error(f"❌ Error initializing GCP clients: {e}")
+        st.stop()
+else:
+    st.error("❌ No credentials found. Please set GOOGLE_CREDENTIALS_JSON environment variable or add secrets.")
     st.stop()
-
-gc = gspread.authorize(creds)
-DB_SHEET_NAME = 'WaterMeter_System_DB'
-REAL_REPORT_SHEET = 'TEST waterreport'
-VISION_CLIENT = vision.ImageAnnotatorClient(credentials=creds)
-STORAGE_CLIENT = storage.Client(credentials=creds)
 
 # =========================================================
 # --- CLOUD STORAGE HELPERS ---
@@ -328,10 +315,14 @@ def get_thai_sheet_name(sh, target_date):
     
     # Try English month patterns (short names)
     eng_patterns = [
+        f"{english_months_short[m_idx]}{yy2}",     # Jan69 (English + Thai Buddhist year)
+        f"{english_months_short[m_idx]} {yy2}",    # Jan 69
         f"{english_months_short[m_idx]}{ad_yy4}",  # Jan2026
         f"{english_months_short[m_idx]} {ad_yy4}", # Jan 2026
         f"{english_months_short[m_idx]}{ad_yy2}",  # Jan26
         f"{english_months_short[m_idx]} {ad_yy2}", # Jan 26
+        f"{english_months_long[m_idx]}{yy2}",      # January69
+        f"{english_months_long[m_idx]} {yy2}",     # January 69
         f"{english_months_long[m_idx]}{ad_yy4}",   # January2026
         f"{english_months_long[m_idx]} {ad_yy4}",  # January 2026
         f"{english_months_long[m_idx]}{ad_yy2}",   # January26
@@ -647,6 +638,79 @@ def append_rows_dailyreadings_batch(rows: list):
         return True, f"APPENDED {len(rows)}"
     except Exception as e:
         return False, str(e)
+
+def export_scada_to_waterreport(scada_results: list, target_date, mode="scada_auto"):
+    """
+    Wrapper function สำหรับบันทึกข้อมูล SCADA ลง WaterReport
+    
+    Args:
+        scada_results: list[dict] มี keys: point_id, value, status
+        target_date: datetime.date วันที่ต้องการบันทึก
+        mode: str ("scada_auto" หรืออื่นๆ)
+    
+    Returns:
+        tuple: (success_message, fail_message)
+    """
+    if not scada_results:
+        return None, "No data to export"
+    
+    # โหลด PointsMaster เพื่อเอา report_col
+    try:
+        sh = gc.open(DB_SHEET_NAME)
+        ws_pm = sh.worksheet("PointsMaster")
+        pm_rows = ws_pm.get_all_records()
+    except Exception as e:
+        return None, f"ไม่สามารถโหลด PointsMaster: {e}"
+    
+    # สร้าง mapping point_id -> report_col
+    pm_map = {}
+    for row in pm_rows:
+        pid = str(row.get("point_id", "")).strip().upper()
+        report_col = str(row.get("report_col", "")).strip()
+        if pid and report_col and report_col not in ("-", "—", "–", ""):
+            pm_map[pid] = report_col
+    
+    # เตรียมข้อมูลสำหรับ export_many_to_real_report_batch
+    items = []
+    for result in scada_results:
+        pid = str(result.get("point_id", "")).strip().upper()
+        val = result.get("value")
+        status = result.get("status")
+        
+        if status == "OK" and val is not None:
+            report_col = pm_map.get(pid)
+            if report_col:
+                items.append({
+                    "point_id": pid,
+                    "value": val,
+                    "report_col": report_col
+                })
+    
+    if not items:
+        return None, "ไม่มีจุดที่มี report_col ให้บันทึก"
+    
+    # เรียก export_many_to_real_report_batch
+    try:
+        ok_pids, fail_list = export_many_to_real_report_batch(
+            items=items,
+            target_date=target_date,
+            debug=False,
+            write_mode="overwrite"
+        )
+        
+        success_msg = None
+        fail_msg = None
+        
+        if ok_pids:
+            success_msg = f"ส่งค่าไป {REAL_REPORT_SHEET} สำเร็จ: {len(ok_pids)} จุด"
+        
+        if fail_list:
+            fail_msg = f"ส่งไม่สำเร็จ: {len(fail_list)} จุด"
+        
+        return success_msg, fail_msg
+        
+    except Exception as e:
+        return None, f"Error exporting to WaterReport: {e}"
         
 # =========================================================
 # --- ✅ WATERREPORT PROGRESS (92 จุด) ---
@@ -1975,6 +2039,227 @@ def normalize_number_str(s: str, decimals: int = 0) -> str:
     if decimals == 0: s = s.replace(".", "")
     return s
 
+def _fuzzy_match_text(text1: str, text2: str, threshold: float = 0.7) -> bool:
+    """
+    เช็คว่า text1 กับ text2 คล้ายกันมากพอหรือไม่ (สำหรับ OCR ที่อาจผิดพลาด)
+    """
+    text1 = text1.lower().replace(" ", "").replace("0", "o").replace("1", "i").replace("|", "i")
+    text2 = text2.lower().replace(" ", "").replace("0", "o").replace("1", "i").replace("|", "i")
+    
+    if text1 == text2:
+        return True
+    
+    # Simple character overlap ratio
+    common = sum(1 for c in text1 if c in text2)
+    ratio = common / max(len(text1), len(text2), 1)
+    return ratio >= threshold
+
+def _group_words_into_lines(words: list, y_tolerance: int = 15) -> list:
+    """
+    จัดกลุ่มคำที่มี center_y ใกล้กันเป็นบรรทัดเดียวกัน
+    คืนค่า: list of lines, แต่ละ line = {"words": [...], "y": center_y, "text": str}
+    """
+    if not words:
+        return []
+    
+    # Sort by y position
+    sorted_words = sorted(words, key=lambda w: w["center_y"])
+    
+    lines = []
+    current_line = []
+    current_y = sorted_words[0]["center_y"]
+    
+    for word in sorted_words:
+        if abs(word["center_y"] - current_y) <= y_tolerance:
+            current_line.append(word)
+        else:
+            # Start new line
+            if current_line:
+                # Sort words in line by x position
+                current_line.sort(key=lambda w: w["center_x"])
+                line_text = " ".join([w["text"] for w in current_line])
+                lines.append({
+                    "words": current_line,
+                    "y": sum(w["center_y"] for w in current_line) / len(current_line),
+                    "text": line_text
+                })
+            current_line = [word]
+            current_y = word["center_y"]
+    
+    # Add last line
+    if current_line:
+        current_line.sort(key=lambda w: w["center_x"])
+        line_text = " ".join([w["text"] for w in current_line])
+        lines.append({
+            "words": current_line,
+            "y": sum(w["center_y"] for w in current_line) / len(current_line),
+            "text": line_text
+        })
+    
+    return lines
+
+def _extract_vsd_previous_day_kwh(words: list, debug: bool = False) -> tuple[float, int]:
+    """
+    🔥 สำหรับ VSD/Digital (ACS580): หาบรรทัด "Previous day kWh (01.53)" 
+    และดึงค่าฝั่งขวาสุดของบรรทัดนั้น
+    
+    คืนค่า: (value: float, confidence_score: int)
+    """
+    if not words:
+        return None, 0
+    
+    # จัดกลุ่มเป็นบรรทัด
+    lines = _group_words_into_lines(words, y_tolerance=15)
+    
+    if debug:
+        print(f"📋 VSD OCR: พบ {len(lines)} บรรทัด")
+        for i, line in enumerate(lines):
+            print(f"  Line {i}: {line['text']}")
+    
+    # หาบรรทัดที่มี "Previous day" หรือ "01.53" หรือ "01 53"
+    target_line = None
+    target_score = 0
+    
+    for line in lines:
+        line_text = line["text"].lower()
+        score = 0
+        
+        # 🔥 Pattern 1: "previous day" (ต้องมีทั้ง previous + day)
+        has_previous = ("previous" in line_text or "previos" in line_text or 
+                       "previ0us" in line_text or "previou" in line_text)
+        has_day = "day" in line_text
+        has_hour = "hour" in line_text
+        
+        if has_previous and has_day and not has_hour:
+            # ต้องมี "previous" + "day" แต่ไม่มี "hour"
+            score = 100
+        elif has_previous and not has_hour:
+            # มี "previous" แต่ไม่มี "hour" (อาจมี day หรือไม่มีก็ได้)
+            score = 80
+        elif has_previous and has_hour:
+            # มี "previous" + "hour" → ไม่ใช่เป้าหมาย
+            score = 0
+            continue
+        
+        # Pattern 2: "01.53" or "01 53"
+        if re.search(r"01\s*[.\s]\s*53", line_text):
+            score = max(score, 90)
+        
+        # Pattern 3: "kwh" nearby
+        if "kwh" in line_text or "kw h" in line_text:
+            score += 30
+        
+        if score > target_score:
+            target_score = score
+            target_line = line
+    
+    if not target_line or target_score < 50:
+        if debug:
+            print("⚠️ VSD: ไม่เจอบรรทัด Previous day kWh")
+            print("🔄 Fallback: พยายามหาตัวเลขใหญ่ที่สุดในภาพ...")
+        
+        # 🔥 Fallback: ถ้าไม่เจอ "Previous day" ให้เอาเลขที่ใหญ่ที่สุดที่ไม่ใช่เมนู
+        max_val = None
+        max_score = 0
+        for line in lines:
+            for word in line["words"]:
+                text = word["text"].replace("O", "0").replace("o", "0").replace("l", "1").replace("I", "1")
+                if re.match(r"^\d+\.?\d*$", text):
+                    # ข้ามรหัสเมนู
+                    if re.match(r'^0[0-9]\.[0-9]{2}$', text):
+                        continue
+                    try:
+                        val = float(text)
+                        if val > 10:  # มากกว่า 10 (ไม่ใช่เลขเมนู)
+                            if max_val is None or val > max_val:
+                                max_val = val
+                                max_score = 400  # คะแนนต่ำกว่า line-based
+                    except:
+                        pass
+        
+        if max_val is not None:
+            if debug:
+                print(f"✅ VSD Fallback: เจอเลขใหญ่สุด = {max_val}")
+            return max_val, max_score
+        
+        return None, 0
+    
+    if debug:
+        print(f"🎯 VSD: เจอบรรทัดเป้าหมาย (score={target_score}): {target_line['text']}")
+    
+    # ดึงตัวเลขทั้งหมดในบรรทัดนี้
+    numbers = []
+    for word in target_line["words"]:
+        # ลองแปลงเป็นตัวเลข
+        text = word["text"].replace("O", "0").replace("o", "0").replace("l", "1").replace("I", "1").replace("|", "1")
+        
+        # Match number pattern
+        if re.match(r"^\d+\.?\d*$", text):
+            try:
+                val = float(text)
+                numbers.append({
+                    "value": val,
+                    "x": word["center_x"],
+                    "text": text
+                })
+            except:
+                pass
+    
+    # 🔥 ถ้าบรรทัดปัจจุบันไม่มีเลข หรือมีแต่เลขเมนู ให้ดูบรรทัดถัดไป
+    next_line = None
+    target_idx = lines.index(target_line)
+    if target_idx + 1 < len(lines):
+        next_line = lines[target_idx + 1]
+    
+    if not numbers or (numbers and all(re.match(r"^0[0-9]\.[0-9]{2}$", n["text"]) for n in numbers)):
+        if debug:
+            print("⚠️ VSD: บรรทัดปัจจุบันไม่มีค่า kWh ที่ชัดเจน, ลองดูบรรทัดถัดไป...")
+        
+        # ดึงตัวเลขจากบรรทัดถัดไป
+        if next_line:
+            for word in next_line["words"]:
+                text = word["text"].replace("O", "0").replace("o", "0").replace("l", "1").replace("I", "1").replace("|", "1")
+                if re.match(r"^\d+\.?\d*$", text):
+                    try:
+                        val = float(text)
+                        # Skip เลขเมนู (01.XX, 02.XX, etc.)
+                        if not re.match(r"^0[0-9]\.[0-9]{2}$", text):
+                            numbers.append({
+                                "value": val,
+                                "x": word["center_x"],
+                                "text": text
+                            })
+                    except:
+                        pass
+            if debug and numbers:
+                print(f"✅ เจอค่าในบรรทัดถัดไป: {next_line['text']}")
+    
+    if not numbers:
+        if debug:
+            print("⚠️ VSD: ไม่เจอตัวเลขในบรรทัดเป้าหมายและบรรทัดถัดไป")
+        return None, 0
+    
+    # เลือกเลขที่อยู่ฝั่งขวาสุด (x มากสุด)
+    # แต่ต้องไม่เป็นเลข 01.53 หรือ 01.52 ซึ่งเป็นรหัสเมนู
+    numbers.sort(key=lambda n: n["x"], reverse=True)
+    
+    for num in numbers:
+        # Skip menu codes (01.XX, 02.XX, etc.)
+        if re.match(r"^0[0-9]\.[0-9]{2}$", num["text"]):
+            if debug:
+                print(f"  ข้าม {num['value']} (รหัสเมนู)")
+            continue
+        
+        if debug:
+            print(f"✅ VSD: เลือกเลขฝั่งขวา = {num['value']}")
+        
+        return num["value"], 1200  # High confidence score
+    
+    # ถ้าทุกเลขเป็นรหัสเมนู ให้คืนเลขแรก (อาจเป็นค่าจริงที่มีรูปแบบคล้าย)
+    if debug:
+        print(f"⚠️ VSD: ทุกเลขเป็นรูปแบบเมนู, คืนเลขฝั่งขวา = {numbers[0]['value']}")
+    return numbers[0]["value"], 800
+
 # ✅ Template matching สำหรับเลขดิจิทัล (เพิ่ม confidence)
 def _create_digit_templates():
     """
@@ -2110,6 +2395,257 @@ def is_digital_meter(config):
     blob = f"{config.get('type','')} {config.get('name','')} {config.get('keyword','')}".lower()
     return ("digital" in blob) or ("scada" in blob) or (int(config.get('decimals', 0) or 0) > 0)
 
+def is_analog_meter(config):
+    """เช็คว่าเป็นมิเตอร์อนาล็อก (ไม่ใช่ดิจิทัล)"""
+    return not is_digital_meter(config)
+
+def _detect_analog_digit_window(img, debug=False):
+    """
+    🔥 Auto-detect digit window ในมิเตอร์น้ำอนาล็อก
+    คืนค่า: (cropped_img, bbox) หรือ (None, None) ถ้าหาไม่เจอ
+    bbox = (x1, y1, x2, y2)
+    """
+    if img is None:
+        return None, None
+    
+    H, W = img.shape[:2]
+    
+    # Convert to grayscale
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img
+    
+    # Apply bilateral filter to reduce noise while keeping edges
+    filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+    
+    # Edge detection
+    edges = cv2.Canny(filtered, 50, 150)
+    
+    # Morphological operations to connect nearby edges
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    
+    # Find contours
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if debug:
+        print(f"🔍 Analog: พบ {len(contours)} contours")
+    
+    # Filter contours by aspect ratio and position
+    candidates = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        
+        # Skip too small or too large
+        if w < W * 0.15 or h < H * 0.05:
+            continue
+        if w > W * 0.9 or h > H * 0.5:
+            continue
+        
+        # Aspect ratio: digit window มักเป็นแนวนอน (กว้าง > สูง)
+        aspect_ratio = w / h
+        if aspect_ratio < 2 or aspect_ratio > 12:
+            continue
+        
+        # 🔥 Position: digit window มักอยู่ช่วงบน-กลาง (25%-55% ของความสูง)
+        # ปรับให้เข้มงวดกว่า เพื่อไม่ให้ไปเลือกเลขแดงที่ด้านล่าง
+        center_y = y + h/2
+        if center_y < H * 0.20 or center_y > H * 0.55:
+            continue
+        
+        # Calculate score
+        score = 0
+        
+        # ยิ่งอยู่ตรงกลางยิ่งดี
+        center_x = x + w/2
+        h_center_dist = abs(center_x - W/2) / W
+        score += (1 - h_center_dist) * 50
+        
+        # 🔥 ยิ่งอยู่ช่วงบนยิ่งดี (30-40% ของความสูง) - ปรับให้สูงกว่าเดิม
+        ideal_y_ratio = 0.35  # ตำแหน่งในอุดมคติ
+        v_center_dist = abs(center_y/H - ideal_y_ratio)
+        # ลดคะแนนอย่างรุนแรงถ้าอยู่ต่ำเกิน 45%
+        if center_y/H > 0.45:
+            score -= 50
+        else:
+            score += (1 - v_center_dist * 4) * 60  # เพิ่มน้ำหนักคะแนนตำแหน่ง
+        
+        # Aspect ratio ประมาณ 5-8 ดีที่สุด
+        ar_score = 1 - abs(aspect_ratio - 6.5) / 6.5
+        score += ar_score * 30
+        
+        # Size: ยิ่งใหญ่ยิ่งดี (แต่ไม่ใหญ่เกินไป)
+        size_ratio = (w * h) / (W * H)
+        if 0.08 < size_ratio < 0.4:
+            score += min(size_ratio * 100, 30)
+        
+        candidates.append({
+            "bbox": (x, y, w, h),
+            "score": score,
+            "aspect_ratio": aspect_ratio,
+            "center_y_ratio": center_y/H
+        })
+    
+    if not candidates:
+        if debug:
+            print("⚠️ Analog: ไม่เจอ digit window")
+        return None, None
+    
+    # 🔥 เลือก candidate ที่มีคะแนนสูงสุด และอยู่สูงที่สุด (ถ้าคะแนนใกล้เคียงกัน)
+    # เรียง candidates ตามคะแนน แล้วถ้ามีหลายตัวคะแนนใกล้กัน ให้เลือกที่อยู่สูงกว่า
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    
+    # ถ้า top 2 มีคะแนนใกล้กัน (ห่างกันไม่เกิน 20%) ให้เลือกที่อยู่สูงกว่า
+    if len(candidates) >= 2:
+        top1, top2 = candidates[0], candidates[1]
+        score_diff = abs(top1["score"] - top2["score"])
+        if score_diff < abs(top1["score"] * 0.2):  # ห่างกันน้อยกว่า 20%
+            # เลือกตัวที่อยู่สูงกว่า (center_y_ratio น้อยกว่า)
+            if top2["center_y_ratio"] < top1["center_y_ratio"]:
+                best = top2
+                if debug:
+                    print(f"🔄 Switched to higher candidate (y={top2['center_y_ratio']:.2f} vs {top1['center_y_ratio']:.2f})")
+            else:
+                best = top1
+        else:
+            best = top1
+    else:
+        best = candidates[0]
+    
+    x, y, w, h = best["bbox"]
+    
+    if debug:
+        print(f"✅ Analog: เจอ digit window at ({x}, {y}, {w}, {h})")
+        print(f"   Score={best['score']:.1f}, AR={best['aspect_ratio']:.1f}, Y={best['center_y_ratio']:.2%}")
+    
+    # Crop with padding
+    pad_x = int(w * 0.05)
+    pad_y = int(h * 0.15)
+    x1 = max(0, x - pad_x)
+    y1 = max(0, y - pad_y)
+    x2 = min(W, x + w + pad_x)
+    y2 = min(H, y + h + pad_y)
+    
+    cropped = img[y1:y2, x1:x2]
+    
+    return cropped, (x1, y1, x2, y2)
+
+def _has_red_digits(img):
+    """
+    ตรวจสอบว่ามีเลขสีแดงในภาพหรือไม่
+    """
+    if img is None or len(img.shape) != 3:
+        return False
+    
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    
+    # Red color range
+    lower_red1 = np.array([0, 70, 50])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 70, 50])
+    upper_red2 = np.array([180, 255, 255])
+    
+    mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
+    
+    # นับจำนวนพิกเซลสีแดง
+    red_pixels = np.sum(mask_red > 0)
+    total_pixels = img.shape[0] * img.shape[1]
+    red_ratio = red_pixels / total_pixels
+    
+    # ถ้ามีสีแดงมากกว่า 1% ถือว่ามีเลขแดง
+    return red_ratio > 0.01
+
+def _extract_black_digits_only(image_bytes, config, debug=False):
+    """
+    🔥 สำหรับ Analog meter: ใช้ bounding box analysis แยกเลขดำออกจากเลขแดง
+    โดยใช้ spatial position (เลขดำอยู่ซ้าย, เลขแดงอยู่ขวา)
+    
+    Strategy: 
+    1. Scan ทั้งภาพหาพื้นที่สีแดง (ไม่จำกัด ROI)
+    2. หา x-position ของเลขแดงที่อยู่ฝั่งซ้ายสุด
+    3. Crop ออกทุกอย่างที่อยู่ขวากว่าตำแหน่งนั้น
+    """
+    # Decode image
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        return image_bytes
+    
+    H, W = img.shape[:2]
+    
+    # Convert to HSV and detect red regions (scan ทั้งภาพ)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    
+    # Red color masks (more aggressive)
+    lower_red1 = np.array([0, 40, 40])  # Lower threshold
+    upper_red1 = np.array([25, 255, 255])  # Wider hue range
+    lower_red2 = np.array([155, 40, 40])
+    upper_red2 = np.array([180, 255, 255])
+    
+    mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
+    
+    # Morphological operations to connect red regions
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel, iterations=1)
+    
+    # Find contours of red regions
+    contours, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Find leftmost red region that looks like a digit
+    red_left_boundary = W  # Start from right edge
+    red_regions_found = []
+    
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 50:  # Very small noise
+            continue
+        
+        x, y, w, h = cv2.boundingRect(cnt)
+        
+        # Basic filter: must have reasonable dimensions
+        aspect_ratio = h / w if w > 0 else 0
+        if w < 5 or h < 10:  # Too small
+            continue
+        if aspect_ratio < 0.2 or aspect_ratio > 15:  # Too extreme
+            continue
+        
+        # Red digits are typically in right half or center-right
+        # But don't enforce strict position - just check it's not far left
+        if x < W * 0.25:  # Skip obvious noise on far left
+            continue
+        
+        red_regions_found.append((x, y, w, h, area))
+        
+        # Track leftmost red region
+        if x < red_left_boundary:
+            red_left_boundary = x
+    
+    if debug:
+        print(f"🔍 Red regions found: {len(red_regions_found)}")
+        for i, (x, y, w, h, area) in enumerate(sorted(red_regions_found, key=lambda r: r[0])[:5]):
+            print(f"   Region {i+1}: x={x}, y={y}, w={w}, h={h}, area={area:.0f}, aspect={h/w:.2f}")
+        print(f"🔍 Leftmost red at: x={red_left_boundary} (W={W}, ratio={red_left_boundary/W:.2%})")
+    
+    # If we found red digits, crop before them
+    if red_regions_found and red_left_boundary < W * 0.85:  # Found red and it's not at extreme right
+        # Crop with small buffer (5px)
+        crop_right = max(int(red_left_boundary - 5), int(W * 0.3))  # At least 30% width
+        
+        if crop_right > W * 0.25:  # Must have reasonable remaining width
+            img_cropped = img[:, :crop_right].copy()
+            
+            if debug:
+                print(f"✂️ Cropped at x={crop_right} (removed {W-crop_right}px, {(W-crop_right)/W:.1%})")
+            
+            # Encode back to bytes
+            ok, encoded = cv2.imencode(".jpg", img_cropped, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            if ok:
+                return encoded.tobytes()
+    
+    return image_bytes
+
 def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -2134,22 +2670,65 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
             if x2 > x1 and y2 > y1:
                 img = img[y1:y2, x1:x2]
                 H, W = img.shape[:2]
+        elif is_analog_meter(config):
+            # 🔥 Analog meter ไม่มี ROI: ใช้ auto-detection หา digit window
+            digit_window, bbox = _detect_analog_digit_window(img, debug=False)
+            if digit_window is not None:
+                img = digit_window
+                H, W = img.shape[:2]
+                # บันทึก bbox ไว้ใน config ชั่วคราว (สำหรับ debug)
+                config['_auto_digit_bbox'] = bbox
 
-    if config.get('ignore_red', False):
+    # ✅ มิเตอร์อนาล็อก: บังคับตัดเลขแดง/ทศนิยม (เอาเฉพาะเลขดำ)
+    is_analog = is_analog_meter(config)
+    
+    # 🔥 Step 1: ถ้าเป็น analog meter ให้ crop เลขแดงออกก่อน (spatial analysis)
+    if is_analog and _has_red_digits(img):
+        debug_mode = config.get('debug', False)
+        ok, encoded = cv2.imencode(".jpg", img)
+        if ok:
+            image_bytes_cropped = _extract_black_digits_only(encoded.tobytes(), config, debug=debug_mode)
+            # Decode image ใหม่หลัง crop
+            nparr = np.frombuffer(image_bytes_cropped, np.uint8)
+            img_cropped = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img_cropped is not None:
+                img = img_cropped
+                H, W = img.shape[:2]
+                if debug_mode:
+                    print(f"✅ Spatial cropping applied: new size {W}x{H}")
+    
+    ignore_red = config.get('ignore_red', False) or is_analog
+    
+    # 🔥 Step 2: ใช้ color-based filtering (HSV) เพิ่มเติม
+    if ignore_red:
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        # ✅ เข้มงวดมาก: ตัดเฉพาะเลขแดงเจาะจง
-        # Red range ที่เข้มงวด: H=[0,10] หรือ [170,180] + S>=85 + V>=70
-        lower_red1 = np.array([0, 85, 70])
-        upper_red1 = np.array([10, 255, 255])
-        lower_red2 = np.array([170, 85, 70])
-        upper_red2 = np.array([180, 255, 255])
+        
+        # ✅ มิเตอร์อนาล็อก: ใช้ threshold เข้มงวดกว่า (ตัดเลขแดงทั้งหมด)
+        if is_analog:
+            # 🔥 แก้ไข: ขยาย range เพื่อตัดเลขแดง-ส้ม-ชมพูให้หมด
+            lower_red1 = np.array([0, 50, 50])    # ขยาย saturation/value threshold
+            upper_red1 = np.array([20, 255, 255]) # ขยาย hue range (0-20 แทน 0-15)
+            lower_red2 = np.array([160, 50, 50])  # ขยาย threshold
+            upper_red2 = np.array([180, 255, 255])
+        else:
+            # มิเตอร์ดิจิทัล: ใช้ threshold ปกติ
+            lower_red1 = np.array([0, 85, 70])
+            upper_red1 = np.array([10, 255, 255])
+            lower_red2 = np.array([170, 85, 70])
+            upper_red2 = np.array([180, 255, 255])
         
         mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
         
         # ✅ Morphological operations: ทำให้ mask ติดกัน
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel, iterations=2)
-        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel, iterations=1)
+        kernel_size = (9, 9) if is_analog else (5, 5)  # 🔥 เพิ่มจาก 7→9 สำหรับอนาล็อก
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, kernel_size)
+        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel, iterations=4 if is_analog else 2)
+        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel, iterations=3 if is_analog else 1)
+        
+        # 🔥 เพิ่ม dilation เพื่อให้แน่ใจว่าตัดเลขแดงออกหมด
+        if is_analog:
+            kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask_red = cv2.dilate(mask_red, kernel_dilate, iterations=2)
         
         # ✅ เปลี่ยนเลขแดงเป็นสีขาว (255,255,255)
         img[mask_red > 0] = [255, 255, 255]
@@ -2162,40 +2741,47 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
     if variant == "invert": gray = 255 - gray
 
     use_digital_logic = (variant == "soft") or (variant == "auto" and is_digital_meter(config))
-    # ✅ Analog meter with ignore_red should also use enhanced preprocessing
-    use_enhanced_analog = (variant == "auto" and not is_digital_meter(config) and config.get('ignore_red', False))
+    # ✅ Analog meter: ใช้ enhanced preprocessing เสมอ
+    use_enhanced_analog = (variant == "auto" and is_analog_meter(config))
 
     if use_digital_logic or use_enhanced_analog:
+        # 🔥 Enhanced preprocessing สำหรับ digital/VSD meters (จากโค้ด reference ที่แม่น 90%)
+        # ขยายภาพถ้าเล็กเกินไป
         if min(H, W) < 300:
             gray = cv2.resize(gray, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+            H, W = gray.shape[:2]
+        
+        # 1) CLAHE เพื่อปรับ contrast
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         g = clahe.apply(gray)
+        
+        # 2) Sharpening: เพิ่มความคมชัด
         blur = cv2.GaussianBlur(g, (0, 0), 1.0)
         sharp = cv2.addWeighted(g, 1.6, blur, -0.6, 0)
         
-        # ✅ เพิ่ม Morphological operations เพื่อชาร์ปเลขดิจิทัล
-        # 1) Bilateral filter: ลดสัญญาณรบกวนแต่เก็บขอบไว้
+        # 3) Bilateral filter: ลดสัญญาณรบกวนแต่เก็บขอบไว้
         sharp = cv2.bilateralFilter(sharp, 5, 50, 50)
         
-        # 2) Morphological closing: เติมหลุมเล็ก ๆ ในตัวเลข (ทำให้ตัวเลขแน่นขึ้น)
+        # 4) Morphological closing: เติมหลุมเล็ก ๆ ในตัวเลข (ทำให้ตัวเลขแน่นขึ้น)
         kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         sharp = cv2.morphologyEx(sharp, cv2.MORPH_CLOSE, kernel_close, iterations=1)
         
-        # 3) Morphological opening: ลบสัญญาณรบกวนเล็ก ๆ (ตัดเสี่ยวนอก)
+        # 5) Morphological opening: ลบสัญญาณรบกวนเล็ก ๆ (ตัดเสี่ยวนอก)
         kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
         sharp = cv2.morphologyEx(sharp, cv2.MORPH_OPEN, kernel_open, iterations=1)
         
-        # 4) Dilate: ขยายเลขให้ฟูกว่างขึ้นเล็กน้อยเพื่อให้ OCR เห็นชัด
+        # 6) Dilate: ขยายเลขให้ฟูกว่างขึ้นเล็กน้อยเพื่อให้ OCR เห็นชัด
         kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
         sharp = cv2.dilate(sharp, kernel_dilate, iterations=1)
         
-        # 5) Final sharpening: ชาร์พขอบเลขให้แหลมขึ้น
+        # 7) Final sharpening: ชาร์พขอบเลขให้แหลมขึ้น
         kernel_sharpen = np.array([[-1, -1, -1],
                                    [-1,  9, -1],
                                    [-1, -1, -1]])
         sharp = cv2.filter2D(sharp, -1, kernel_sharpen)
         sharp = np.clip(sharp, 0, 255).astype(np.uint8)
         
+        # 🔥 ใช้ PNG สำหรับ digital meters (lossless quality)
         ok, encoded = cv2.imencode(".png", sharp)
         return encoded.tobytes() if ok else image_bytes
     else:
@@ -2203,6 +2789,77 @@ def preprocess_image_cv(image_bytes, config, use_roi=True, variant="auto"):
         th = cv2.adaptiveThreshold(gray2, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7)
         ok, encoded = cv2.imencode(".png", th)
         return encoded.tobytes() if ok else image_bytes
+
+def _roboflow_detect_digits(image_bytes, api_key=None, model_id="water-meter-monitoring/1"):
+    """
+    🔥 ใช้ Roboflow YOLO Model ตรวจจับตัวเลขบนมาตรวัดน้ำแบบ Object Detection
+    - แม่นกว่า OCR ธรรมดาเพราะ train มาเจาะจง
+    - ได้ bounding box + confidence score แต่ละหลัก
+    - เรียงตามตำแหน่ง x (จากซ้ายไปขวา)
+    
+    คืนค่า: (digit_sequence: str, confidence: float, predictions: list) หรือ (None, 0, [])
+    """
+    if not HAS_ROBOFLOW:
+        print("⚠️ Roboflow SDK ไม่ได้ติดตั้ง")
+        return None, 0, []
+    
+    if not api_key:
+        # ลองอ่านจาก secrets (ถ้ามี)
+        try:
+            api_key = st.secrets.get('roboflow_api_key', None)
+        except:
+            api_key = None
+    
+    if not api_key:
+        print("⚠️ ไม่พบ roboflow_api_key → ใช้ Vision OCR แทน")
+        return None, 0, []
+    
+    try:
+        # Initialize client
+        client = InferenceHTTPClient(
+            api_url="https://detect.roboflow.com",
+            api_key=api_key
+        )
+        
+        # เซฟรูปชั่วคราวเพื่อส่งให้ Roboflow (ต้องการ file path หรือ bytes)
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp.write(image_bytes)
+            tmp_path = tmp.name
+        
+        try:
+            # Run inference
+            print("🔥 กำลังใช้ Roboflow AI ตรวจจับตัวเลข...")
+            result = client.infer(tmp_path, model_id=model_id)
+            predictions = result.get('predictions', [])
+            
+            if not predictions:
+                print("⚠️ Roboflow ไม่พบตัวเลข → fallback to OCR")
+                return None, 0, []
+            
+            # เรียงตาม x coordinate (จากซ้ายไปขวา)
+            sorted_preds = sorted(predictions, key=lambda p: p.get('x', 0))
+            
+            # สร้างเลขจาก class labels
+            digit_sequence = ''.join([str(pred.get('class', '')) for pred in sorted_preds])
+            
+            # คำนวณ average confidence
+            avg_confidence = sum([pred.get('confidence', 0) for pred in sorted_preds]) / len(sorted_preds)
+            
+            print(f"✅ Roboflow: ตรวจพบ '{digit_sequence}' (confidence: {avg_confidence:.2%}, หลัก: {len(sorted_preds)})")
+            return digit_sequence, avg_confidence, sorted_preds
+        
+        finally:
+            # ลบไฟล์ชั่วคราว
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
+    
+    except Exception as e:
+        # Log error แล้ว fallback to Vision OCR
+        print(f"⚠️ Roboflow error: {str(e)[:100]} → fallback to OCR")
+        return None, 0, []
 
 def _vision_read_text(processed_bytes):
     try:
@@ -2219,10 +2876,258 @@ def _vision_read_text(processed_bytes):
     except Exception as e:
         return "", str(e)
 
-def ocr_process(image_bytes, config, debug=False, return_candidates=False):
+def _vision_read_text_with_boxes(processed_bytes):
+    """
+    🔥 อ่าน OCR พร้อม bounding boxes สำหรับ VSD/Digital meters
+    คืนค่า: (full_text: str, words: list[dict], error: str)
+    words = [{"text": str, "bbox": (x1,y1,x2,y2), "center_y": float}, ...]
+    """
+    try:
+        image = vision.Image(content=processed_bytes)
+        ctx = vision.ImageContext(language_hints=["en"])
+        resp = VISION_CLIENT.text_detection(image=image, image_context=ctx)
+        
+        if getattr(resp, "error", None) and resp.error.message:
+            return "", [], resp.error.message
+        
+        if not resp.text_annotations or len(resp.text_annotations) < 2:
+            return "", [], ""
+        
+        # text_annotations[0] = full text
+        # text_annotations[1:] = individual words/symbols
+        full_text = resp.text_annotations[0].description or ""
+        
+        words = []
+        for annotation in resp.text_annotations[1:]:
+            if not annotation.description:
+                continue
+            
+            # Extract bounding box
+            vertices = annotation.bounding_poly.vertices
+            if len(vertices) < 4:
+                continue
+            
+            xs = [v.x for v in vertices]
+            ys = [v.y for v in vertices]
+            x1, y1 = min(xs), min(ys)
+            x2, y2 = max(xs), max(ys)
+            center_y = (y1 + y2) / 2
+            center_x = (x1 + x2) / 2
+            
+            words.append({
+                "text": annotation.description,
+                "bbox": (x1, y1, x2, y2),
+                "center_y": center_y,
+                "center_x": center_x,
+                "width": x2 - x1,
+                "height": y2 - y1
+            })
+        
+        return full_text, words, ""
+    
+    except Exception as e:
+        return "", [], str(e)
+
+def detect_anomaly(new_value: float, point_id: str, expected_digits: int = 0) -> tuple[bool, str]:
+    """
+    ตรวจจับค่าผิดปกติ - ถ้าค่ากระโดดผิดธรรมชาติ
+    คืนค่า: (is_anomaly: bool, reason: str)
+    """
+    try:
+        # ดึงค่าล่าสุดจาก DailyReadings
+        sh = gc.open(DB_SHEET_NAME)
+        ws = sh.worksheet("DailyReadings")
+        
+        # อ่านแถวล่าสุด 10 แถว (ตามหลัง header)
+        rows = ws.get_all_values()
+        if len(rows) <= 1:
+            return False, ""  # ไม่มีข้อมูลเก่า
+        
+        # หาค่าล่าสุดของ point_id นี้
+        last_value = None
+        for row in reversed(rows[1:]):  # ข้าม header
+            if len(row) >= 7 and row[2] == point_id:  # col[2] = point_id
+                try:
+                    # col[4] = manual_val, col[5] = ai_val
+                    val_str = row[5] if row[5] and row[5].strip() and row[5].strip() != '-' else row[4]
+                    if val_str and val_str.strip() and val_str.strip() != '-':
+                        last_value = float(val_str)
+                        break
+                except:
+                    continue
+        
+        if last_value is None:
+            return False, ""  # ไม่มีค่าเก่า
+        
+        # ตรวจสอบการกระโดด
+        ratio = new_value / last_value if last_value > 0 else float('inf')
+        
+        # กรณีที่ 1: ค่าใหม่กระโดดขึ้นมากกว่า 100 เท่า
+        if ratio > 100:
+            return True, f"⚠️ ค่ากระโดดสูงเกินไป: {last_value:,.2f} → {new_value:,.2f} (x{ratio:.0f})"
+        
+        # กรณีที่ 2: ค่าใหม่ลดลงกว่า 50% (มิเตอร์ไม่ควรถอยหลัง)
+        if ratio < 0.5:
+            return True, f"⚠️ ค่าลดลงผิดปกติ: {last_value:,.2f} → {new_value:,.2f} (ลด {(1-ratio)*100:.0f}%)"
+        
+        # กรณีที่ 3: จำนวนหลักเพิ่มขึ้นมากกว่า 1 หลัก
+        if expected_digits > 0:
+            last_digits = len(str(int(abs(last_value))))
+            new_digits = len(str(int(abs(new_value))))
+            if new_digits > last_digits + 1:
+                return True, f"⚠️ จำนวนหลักกระโดด: {last_digits} หลัก → {new_digits} หลัก ({last_value:,.2f} → {new_value:,.2f})"
+        
+        return False, ""
+    
+    except Exception as e:
+        # Silent fail - ถ้า check ไม่ได้ก็ไม่ block
+        return False, ""
+
+def ocr_process(image_bytes, config, debug=False, return_candidates=False, use_roboflow=True):
     decimal_places = int(config.get('decimals', 0) or 0)
     keyword = str(config.get('keyword', '') or '').strip()
     expected_digits = int(config.get('expected_digits', 0) or 0)
+    point_id = str(config.get('point_id', '')).strip()
+    
+    # ✅ มิเตอร์อนาล็อก: บังคับ decimal_places = 0 (ไม่เอาทศนิยม)
+    if is_analog_meter(config):
+        decimal_places = 0
+        if debug:
+            print("📌 มิเตอร์อนาล็อก: บังคับไม่เอาทศนิยม (decimal_places = 0)")
+    
+    # 🔥 Roboflow Detection - ใช้เฉพาะกับมิเตอร์อนาล็อกเท่านั้น!
+    # Digital/VSD meters ใช้ Vision OCR จะแม่นกว่า
+    if use_roboflow and HAS_ROBOFLOW and is_analog_meter(config):
+        try:
+            # ใช้รูปที่ preprocessed ROI (ถ้ามี)
+            roi_bytes = image_bytes
+            if config.get('roi_x1') and config.get('roi_x2'):
+                roi_bytes = preprocess_image_cv(image_bytes, config, use_roi=True, variant="raw")
+            
+            digit_seq, confidence, preds = _roboflow_detect_digits(roi_bytes)
+            
+            # 🎯 ลด threshold จาก 80% → 70% เพื่ออ่านได้มากขึ้น (แลกกับความแม่นยำเล็กน้อย)
+            if digit_seq and confidence > 0.70:
+                # แปลง digit_sequence เป็น float ตาม decimal_places
+                try:
+                    val_str = str(digit_seq).strip()
+                    
+                    # ถ้ามีจุดทศนิยมใน sequence แล้ว
+                    if '.' in val_str:
+                        val = float(val_str)
+                    else:
+                        # ใส่จุดทศนิยมตาม config
+                        if decimal_places > 0 and len(val_str) > decimal_places:
+                            int_part = val_str[:-decimal_places]
+                            dec_part = val_str[-decimal_places:]
+                            val = float(f"{int_part}.{dec_part}")
+                        else:
+                            val = float(val_str)
+                    
+                    # ❌ เช็คค่าติดลบ (ยกเว้นมิเตอร์ที่อนุญาต)
+                    allow_negative = config.get('allow_negative', 'FALSE').strip().upper() == 'TRUE'
+                    if val < 0 and not allow_negative:
+                        print(f"⚠️ Roboflow: ค่าติดลบ {val} แต่ allow_negative=FALSE → reject")
+                        raise ValueError("Negative value not allowed")
+                    
+                    # ✅ Validate ตาม expected_digits (เข้มงวดมาก - ต้องตรงพอดีหรือ +1 เท่านั้น)
+                    if expected_digits > 0:
+                        digit_count = len(str(int(abs(val))))
+                        # อนุญาตเฉพาะ expected_digits หรือ expected_digits+1 เท่านั้น (ไม่ยอมรับ -1)
+                        if digit_count < expected_digits or digit_count > expected_digits + 1:
+                            print(f"⚠️ Roboflow: {digit_count} หลัก แต่ต้องการ {expected_digits} หลัก → reject")
+                            raise ValueError(f"Digit count mismatch: {digit_count} vs {expected_digits}")
+                    
+                    # 🔍 ตรวจสอบ anomaly (ค่ากระโดดผิดปกติ)
+                    is_anomaly, anomaly_reason = detect_anomaly(val, point_id, expected_digits)
+                    if is_anomaly:
+                        print(f"⚠️ Roboflow: ตรวจพบ anomaly - {anomaly_reason} → reject")
+                        raise ValueError(f"Anomaly detected: {anomaly_reason}")
+                    
+                    # 🎯 Return ทันทีถ้า Roboflow สำเร็จ
+                    print(f"✅ Roboflow [ANALOG {point_id}]: อ่านค่า = {val} (confidence: {confidence:.2%})")
+                    if return_candidates:
+                        candidates = [{
+                            "val": val,
+                            "score": confidence * 1000,  # scale to match OCR scoring
+                            "raw": val_str,
+                            "method": "roboflow",
+                            "confidence": confidence,
+                            "predictions": len(preds)
+                        }]
+                        return val, candidates
+                    else:
+                        return val
+                
+                except (ValueError, ZeroDivisionError) as e:
+                    print(f"⚠️ Roboflow parsing error: {e} → fallback to OCR")
+        
+        except Exception as e:
+            print(f"⚠️ Roboflow exception: {str(e)[:100]} → fallback to OCR")
+    
+    # ✅ Fallback: ใช้ Vision OCR แบบเดิม
+    if is_digital_meter(config):
+        print(f"🔄 ใช้ Vision OCR สำหรับ Digital/VSD meter [{point_id}]...")
+    else:
+        print(f"🔄 ใช้ Vision OCR (Roboflow ไม่พบหรือ confidence ต่ำ) [{point_id}]...")
+    
+    # 🔥 สำหรับ VSD/Digital meters: ใช้ line-based extraction ก่อน
+    is_vsd_digital = is_digital_meter(config) and ("vsd" in str(config.get('name', '')).lower() or 
+                                                     "acs" in str(config.get('name', '')).lower() or
+                                                     "abb" in str(config.get('name', '')).lower())
+    
+    if is_vsd_digital:
+        if debug:
+            print("🔥 ตรวจพบ VSD/Digital meter → ใช้ line-based extraction")
+        
+        # ลอง ROI ก่อน
+        for use_roi, variant in [(True, "auto"), (True, "soft"), (False, "auto")]:
+            processed = preprocess_image_cv(image_bytes, config, use_roi=use_roi, variant=variant)
+            full_text, words, err = _vision_read_text_with_boxes(processed)
+            
+            if words:
+                vsd_val, vsd_score = _extract_vsd_previous_day_kwh(words, debug=debug)
+                
+                # 🔥 ลด threshold จาก 600→400 เพื่อลด OCR fail
+                if vsd_val is not None and vsd_score >= 400:
+                    if debug:
+                        print(f"🔍 VSD candidate: {vsd_val} (score: {vsd_score})")
+                    
+                    # Validate (ยืดหยุ่นกว่าเดิม)
+                    if check_digits_ok(vsd_val):
+                        # ตรวจสอบ anomaly (แต่ไม่ reject ทันที)
+                        is_anomaly, anomaly_reason = detect_anomaly(vsd_val, point_id, expected_digits)
+                        if not is_anomaly:
+                            print(f"✅ VSD Line-Based [{point_id}]: {vsd_val} (score: {vsd_score})")
+                            if return_candidates:
+                                candidates = [{
+                                    "val": vsd_val,
+                                    "score": vsd_score,
+                                    "method": "vsd_line_based",
+                                    "tag": f"{'ROI' if use_roi else 'FULL'}_{variant}"
+                                }]
+                                return vsd_val, candidates
+                            else:
+                                return vsd_val
+                        else:
+                            if debug:
+                                print(f"⚠️ VSD anomaly warning: {anomaly_reason} (แต่ยังคงใช้ค่านี้)")
+                            # ยอมรับค่าที่มี anomaly แต่ลดคะแนน
+                            if vsd_score >= 700:
+                                print(f"✅ VSD Line-Based [{point_id}]: {vsd_val} (score: {vsd_score}, anomaly warning)")
+                                if return_candidates:
+                                    candidates = [{
+                                        "val": vsd_val,
+                                        "score": vsd_score - 200,  # ลดคะแนน
+                                        "method": "vsd_line_based_anomaly",
+                                        "tag": f"{'ROI' if use_roi else 'FULL'}_{variant}"
+                                    }]
+                                    return vsd_val, candidates
+                                else:
+                                    return vsd_val
+                    else:
+                        if debug:
+                            print(f"⚠️ VSD validation failed: {vsd_val}")
     
     attempts = [
         ("ROI_auto",  True,  "auto"),
@@ -2247,14 +3152,49 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False):
         """อนุญาตให้ผ่านแบบ 'ยืดหยุ่น' แต่จะไปจัดการด้วยคะแนนอีกที"""
         if val is None:
             return False
-        # ❌ มิเตอร์ไม่ควรติดลบ
-        if float(val) < 0:
+        # ❌ เช็คค่าติดลบ (ยกเว้นมิเตอร์ที่อนุญาต)
+        allow_negative = config.get('allow_negative', 'FALSE').strip().upper() == 'TRUE'
+        if float(val) < 0 and not allow_negative:
             return False
+        
+        # 🔥 Analog meter: validation เข้มงวดกว่า
+        if is_analog_meter(config):
+            ln = check_digits_len(val)
+            # อนาล็อกมักเป็น 2-7 หลัก (เช่น 91, 1283, 123456)
+            if expected_digits > 0:
+                # ต้องตรงพอดี หรือ ±1 เท่านั้น (ยืดหยุ่น)
+                if ln < max(2, expected_digits - 1) or ln > expected_digits + 1:
+                    if debug:
+                        print(f"⚠️ Analog validation failed: {ln} digits, expected {expected_digits}±1")
+                    return False
+            else:
+                # ถ้าไม่กำหนด expected_digits ให้ใช้ default 2-7 หลัก
+                if ln < 2 or ln > 7:
+                    if debug:
+                        print(f"⚠️ Analog validation failed: {ln} digits (expected 2-7)")
+                    return False
+            
+            # 🔥 เช็คว่าค่าสมเหตุสมผลไหม (ไม่มากเกินไป)
+            # มิเตอร์น้ำปกติไม่เกิน 999,999 (6 หลัก)
+            if val > 999999:
+                if debug:
+                    print(f"⚠️ Analog validation failed: {val} > 999,999")
+                return False
+            
+            return True
+        
+        # Digital meter: ยืดหยุ่นมาก (±2 หลัก)
         if expected_digits <= 0:
             return True
         ln = check_digits_len(val)
-        # ยังยอมให้ +1 ได้ (กันเคสเลขโตขึ้นจริง) แต่จะโดนหักคะแนนหนัก
-        return 1 <= ln <= expected_digits + 1
+        # 🔥 ยืดหยุ่นกว่าเดิม: อนุญาต ±2 หลัก แทน ±1
+        if expected_digits - 2 <= ln <= expected_digits + 2:
+            if debug and ln != expected_digits:
+                print(f"⚠️ Digital: {ln} หลัก (expected {expected_digits}±2) - ยอมรับ")
+            return True
+        if debug:
+            print(f"❌ Digital validation: {ln} หลัก อยู่นอก range {expected_digits}±2")
+        return False
 
     def looks_like_spec_context(text: str, start: int, end: int) -> bool:
         """ดูรอบ ๆ ตัวเลขว่าเป็นเลขสเปคเครื่อง (Hz/V/A/IP/Rev) ไหม"""
@@ -2300,6 +3240,48 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False):
         if variant in ("soft", "auto"):
             attempt_bonus += 10
         
+        # ---- 🔥 0) VSD/Digital (ACS580): ล็อกที่บรรทัด "Previous day kWh (01.53)" ก่อน ----
+        # สำหรับมิเตอร์ VSD/Digital ที่มีหน้าจอแสดง "Previous day kWh (01.53)" 
+        # ต้องดึงเลขฝั่งขวาของบรรทัดนั้น ไม่ใช่เลข 01.53 ซึ่งเป็นรหัสเมนู
+        vsd_patterns = [
+            r"Previous\s+day\s+kWh[^\d]*([\d.,]+)",  # "Previous day kWh 38.87"
+            r"01\.53[^\d]*([\d.,]+)",                 # "01.53 38.87"
+            r"01\s*\.\s*53[^\d]*([\d.,]+)",          # "01 . 53 38.87" (มีช่องว่าง)
+        ]
+        
+        for vsd_pat in vsd_patterns:
+            vsd_match = re.search(vsd_pat, raw_text, re.IGNORECASE)
+            if vsd_match:
+                val_str = vsd_match.group(1)
+                # ทำความสะอาด: O→0, o→0, l→1, I→1, |→1
+                val_str = val_str.replace("O", "0").replace("o", "0").replace("l", "1").replace("I", "1").replace("|", "1")
+                val_str = normalize_number_str(val_str, decimal_places)
+                if val_str:
+                    try:
+                        val = float(val_str)
+                        if decimal_places > 0 and "." not in val_str:
+                            val = val / (10 ** decimal_places)
+                        if check_digits_ok(val):
+                            # ให้คะแนนสูงมาก เพราะเจอ Previous day kWh โดยตรง
+                            score = 1100 + attempt_bonus
+                            ln = check_digits_len(val)
+                            
+                            # โบนัสถ้าตรงตาม expected_digits
+                            if expected_digits > 0:
+                                score += max(0, 180 - abs(ln - expected_digits) * 60)
+                                if ln == expected_digits:
+                                    score += 100
+                                if ln == expected_digits + 1:
+                                    score -= 50
+                            
+                            candidates.append({"val": float(val), "score": score, "tag": f"{tag}_VSD"})
+                            if debug:
+                                print(f"🎯 VSD/Digital: เจอ 'Previous day kWh' → {val} (คะแนน: {score})")
+                    except Exception as e:
+                        if debug:
+                            print(f"⚠️ VSD parsing error: {e}")
+                        pass
+        
         # ---- 1) ลองจับจาก keyword ก่อน (แม่นสุด) ----
         if keyword:
             kw = re.escape(keyword)
@@ -2339,6 +3321,15 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False):
             # เช็คว่าเลขนี้เป็นสเปคเครื่องไหม (ใช้ scan_text ตัวเดียวกัน)
             if looks_like_spec_context(scan_text, m.start(), m.end()):
                 continue
+            
+            # 🔥 กันรหัสเมนู VSD/ACS580 (เช่น 01.53, 01.52, 02.01, etc.)
+            # เลขเมนูมักเป็น XX.XX โดย XX < 100 และมี 2 หลักทศนิยม
+            if re.match(r'^0[0-9]\.[0-9]{2}$', n_str.strip()):
+                # เช็คว่าบริบทรอบ ๆ เลขนี้มี "Previous" หรือไม่
+                ctx_before = scan_text[max(0, m.start() - 30):m.start()].lower()
+                if "previous" not in ctx_before:
+                    # ถ้าไม่มี "Previous" ข้างหน้า แสดงว่าน่าจะเป็นรหัสเมนู ให้ข้าม
+                    continue
 
             n_str2 = normalize_number_str(n_str, decimal_places)
             if not n_str2:
@@ -2398,6 +3389,59 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False):
                 break
 
     final_val = float(best_val) if best_val is not None else 0.0
+    
+    # � ถ้ายังอ่านไม่ได้ (0.0) → ลอง raw variant ครั้งสุดท้าย
+    if final_val == 0.0 or final_val is None:
+        if debug:
+            print("🔄 ลอง raw variant เพื่อ fallback (no preprocessing)...")
+        try:
+            processed_raw = preprocess_image_cv(image_bytes, config, use_roi=False, variant="raw")
+            txt_raw, err_raw = _vision_read_text(processed_raw)
+            if txt_raw:
+                # หาเลขทั้งหมด
+                nums = re.findall(r"\d+\.?\d*", txt_raw)
+                if nums:
+                    for num_str in nums:
+                        try:
+                            val = float(num_str)
+                            if check_digits_ok(val):
+                                if debug:
+                                    print(f"✅ Raw fallback success: {val}")
+                                final_val = val
+                                if return_candidates:
+                                    all_candidates.append({"val": val, "score": 100, "tag": "raw_fallback"})
+                                break
+                        except:
+                            continue
+        except Exception as e:
+            if debug:
+                print(f"⚠️ Raw fallback error: {e}")
+    
+    # �🔥 Post-validation สำหรับ Analog meter
+    if is_analog_meter(config) and final_val > 0:
+        ln = check_digits_len(final_val)
+        
+        # ถ้าอ่านได้ 4 หลัก แต่ expected_digits = 5 → อาจขาดเลข 0 ข้างหน้า
+        if expected_digits == 5 and ln == 4:
+            if debug:
+                print(f"⚠️ Analog: {ln} หลัก แต่คาด {expected_digits} หลัก → อาจต้องเติม 0")
+            # ไม่แก้อัตโนมัติ เพราะอาจผิด แต่ให้ผ่านไป
+        
+        # ถ้าอ่านได้เลขแปลก ๆ (เช่น 50170 แทน 01283)
+        # เช็คว่าค่านี้สมเหตุสมผลเมื่อเทียบกับ history หรือไม่
+        if final_val > 0:
+            is_anomaly, anomaly_reason = detect_anomaly(final_val, point_id, expected_digits)
+            if is_anomaly:
+                if debug:
+                    print(f"⚠️ Analog post-validation: {anomaly_reason}")
+                # ลดคะแนนลง แต่ไม่ reject (อาจเป็นค่าจริง)
+                best_score -= 300
+                
+                # ถ้าคะแนนต่ำมาก ให้ reject
+                if best_score < 100:
+                    if debug:
+                        print(f"❌ Analog rejected: score too low ({best_score})")
+                    final_val = 0.0
     
     # ✅ dedupe candidates ตามค่า val (เก็บคะแนนดีที่สุด)
     if return_candidates:
@@ -2702,10 +3746,32 @@ def extract_dashboard_flow_values(image_bytes: bytes, debug: bool = False):
 
 def _norm_pid_key(s: str) -> str:
     s = str(s or "").upper().strip()
+    
+    # 🔥 แก้ OCR errors ก่อนทำอย่างอื่น
+    s = s.replace('O', '0').replace('o', '0')  # O → 0
+    s = s.replace('I', '1').replace('l', '1').replace('|', '1')  # I/l/| → 1
+    
+    # แปลง dash และ space เป็น underscore
     s = s.replace("-", "_")
     s = re.sub(r"\s+", "_", s)          # space -> _
     s = re.sub(r"[^A-Z0-9_]", "", s)    # ตัดสัญลักษณ์แปลกๆ
     s = re.sub(r"_+", "_", s).strip("_")
+    
+    # 🔥 แก้ไข OCR ที่อาจอ่านผิด (common mistakes)
+    # แปลง _S เป็น _3 เฉพาะกรณีที่ตามด้วยตัวเลข หรือท้ายสุด (เช่น BP_S → BP_3, GT_S11 → GT_311)
+    # แต่ไม่แปลง _AS, _BS ที่เป็นส่วนหนึ่งของ ID (เช่น FN_WWT_AS)
+    s = re.sub(r"_S(\d)", r"_3\1", s)   # _S1 → _31
+    s = re.sub(r"_S$", r"_3", s)         # _S ท้ายสุด → _3
+    # ไม่แปลง S ที่เป็นตัวอักษรเริ่มต้น เช่น S11A หรือ _AS, _BS
+    
+    # 🔥 แก้ไข: แปลงเลข 2 หลักติดกันให้เป็น X_Y (เช่น 33 → 3_3, 22 → 2_2)
+    # Pattern: _XX$ หรือ _XX_ โดยที่ X เป็นตัวเลขซ้ำกัน
+    s = re.sub(r"_(\d)\1(?=_|$)", r"_\1_\1", s)  # _33 → _3_3, _22 → _2_2
+    
+    # 🔥 แก้ VSD meters: GI_VSD_NO_2 และ GI_VSD_2 ให้เหมือนกัน
+    # แปลง _NO_X เป็น _X สำหรับ VSD patterns
+    s = re.sub(r"_(VSD)_NO_(\d+)$", r"_\1_\2", s)  # GI_VSD_NO_2 → GI_VSD_2
+    
     return s
 
 @st.cache_data(ttl=3600)
@@ -2717,7 +3783,19 @@ def build_pid_norm_map():
         pid = str(r.get("point_id", "")).strip().upper()
         if not pid:
             continue
-        norm_map[_norm_pid_key(pid)] = pid
+        normalized = _norm_pid_key(pid)
+        norm_map[normalized] = pid
+        
+        # เพิ่ม variant สำหรับ VSD: ทั้ง XX_VSD_2 และ XX_VSD_NO_2
+        if "_VSD_" in normalized and re.search(r"_VSD_(\d+)$", normalized):
+            # XX_VSD_2 → เพิ่ม XX_VSD_NO_2
+            with_no = re.sub(r"_(VSD)_(\d+)$", r"_\1_NO_\2", normalized)
+            norm_map[with_no] = pid
+        elif "_VSD_NO_" in normalized:
+            # XX_VSD_NO_2 → เพิ่ม XX_VSD_2
+            without_no = re.sub(r"_(VSD)_NO_(\d+)$", r"_\1_\2", normalized)
+            norm_map[without_no] = pid
+    
     return norm_map
 
 def _crop_bottom_bytes(image_bytes: bytes, frac: float = 0.40) -> bytes:
@@ -2733,6 +3811,10 @@ def _crop_bottom_bytes(image_bytes: bytes, frac: float = 0.40) -> bytes:
     return out or image_bytes
 
 def find_point_id_from_text(ocr_text: str, norm_map: dict):
+    """
+    หา point_id จาก OCR text
+    รองรับ: dash→underscore, space→underscore, O→0, I→1
+    """
     t = _norm_pid_key(ocr_text)
     if not t:
         return None
@@ -2749,34 +3831,151 @@ def find_point_id_from_text(ocr_text: str, norm_map: dict):
         return best
 
     # 2) fuzzy จาก pattern ที่เหมือน point_id
-    cand = re.findall(r"[A-Z]{1,3}_[A-Z0-9]{1,10}(?:_[A-Z0-9]{1,10}){1,5}", t)
+    # 🔥 Pattern หลากหลายขึ้น เพื่อรองรับ "BP2-1 GS BP 21" → "GS_BP_2_1"
+    cand = []
+    
+    # Pattern 1: XX_YY_Z_A (มาตรฐาน)
+    cand.extend(re.findall(r"[A-Z]{2,4}_[A-Z0-9]{1,4}(?:_[A-Z0-9]{1,4}){0,3}", t))
+    
+    # Pattern 2: หา pattern ที่มี underscore 2+ ตัว
+    cand.extend(re.findall(r"[A-Z]{1,4}(?:_[A-Z0-9]{1,4}){2,}", t))
+    
+    # Pattern 3: Fallback
+    if not cand:
+        cand = re.findall(r"[A-Z]{1,4}_[A-Z0-9_]{3,20}", t)
+    
+    if not cand:
+        return None
+
+    best_score = 0.0
+    best_pid = None
+    for c in cand[:15]:  # เพิ่มจาก 12→15
+        # 🔧 แก้ OCR errors เพิ่มเติม
+        c_fixed = c.replace('O', '0').replace('o', '0')
+        c_fixed = c_fixed.replace('I', '1').replace('l', '1')
+        c_fixed = c_fixed.replace('S', '5').replace('s', '5')
+        c_fixed = c_fixed.replace('Z', '2').replace('z', '2')
+        c_fixed = c_fixed.replace('B', '8')
+        c_fixed = c_fixed.replace('G', '6')
+        
+        for nkey, orig in norm_map.items():
+            sc1 = SequenceMatcher(None, c, nkey).ratio()
+            sc2 = SequenceMatcher(None, c_fixed, nkey).ratio()
+            sc = max(sc1, sc2)
+            
+            if sc > best_score:
+                best_score = sc
+                best_pid = orig
+
+    # ✅ ลด threshold จาก 0.60 → 0.55
+    return best_pid if best_score >= 0.55 else None
+    # Pattern 1: XX_YY หรือ XX_YY_ZZ (รองรับทั้งมีและไม่มีตัวเลข)
+    # Pattern 2: XX_YY_1, XX_YY_A_1 (มีตัวเลข)
+    # Pattern 3: Fallback แบบเก่า
+    cand = []
+    
+    # Pattern 1: 2-4 letters + _ + 2+ chars (อาจไม่มีตัวเลข เช่น FN_WWT_AS, GT_BP_3_3)
+    # รองรับ XX_YY, XX_YY_Z, XX_YY_ZZ, XX_YY_Z_A ฯลฯ
+    cand.extend(re.findall(r"[A-Z]{2,4}_[A-Z]{2,}(?:_[A-Z0-9]+)*", t))
+    
+    # Pattern 2: รองรับที่มีตัวเลข (backup)
+    cand.extend(re.findall(r"[A-Z]{1,4}_[A-Z0-9_]{2,}", t))
+    
+    # Pattern 3: Fallback แบบเก่า
+    if not cand:
+        cand = re.findall(r"[A-Z]{1,3}_[A-Z0-9]{1,10}(?:_[A-Z0-9]{1,10}){1,5}", t)
+    
     if not cand:
         return None
 
     best_score = 0.0
     best_pid = None
     for c in cand[:12]:
+        # 🔧 แก้ OCR errors ที่พบบ่อย
+        c_fixed = c.replace('O', '0').replace('o', '0')  # O → 0
+        c_fixed = c_fixed.replace('I', '1').replace('l', '1')  # I/l → 1
+        c_fixed = c_fixed.replace('S', '5').replace('s', '5')  # S → 5
+        c_fixed = c_fixed.replace('Z', '2').replace('z', '2')  # Z → 2
+        c_fixed = c_fixed.replace('B', '8')  # B → 8
+        c_fixed = c_fixed.replace('G', '6')  # G → 6
+        
         for nkey, orig in norm_map.items():
-            sc = SequenceMatcher(None, c, nkey).ratio()
+            # ลอง match ทั้งแบบดั้งเดิมและแบบแก้ไข OCR errors
+            sc1 = SequenceMatcher(None, c, nkey).ratio()
+            sc2 = SequenceMatcher(None, c_fixed, nkey).ratio()
+            sc = max(sc1, sc2)
+            
             if sc > best_score:
                 best_score = sc
                 best_pid = orig
 
-    return best_pid if best_score >= 0.78 else None
+    # ✅ ลด threshold จาก 0.70 → 0.60 → 0.55 เพื่อรองรับ OCR ที่อ่านผิดมากขึ้น
+    return best_pid if best_score >= 0.55 else None
 
 def extract_point_id_from_image(image_bytes: bytes, norm_map: dict):
     """คืนค่า (point_id หรือ None, ocr_text ที่ใช้)"""
     # pass1: OCR เฉพาะช่วงล่างก่อน
     btm = _crop_bottom_bytes(image_bytes, frac=0.40)
     txt, _err = _vision_read_text(btm)
+    
+    # 🔍 Debug: แสดง OCR result (เพิ่ม st.write เพื่อแสดงใน UI)
+    if txt:
+        print(f"🔍 OCR Bottom 40%: {txt[:200]}")
+        normalized = _norm_pid_key(txt)
+        print(f"🔍 Normalized: {normalized[:200]}")
+        # แสดงใน Streamlit UI ด้วย
+        try:
+            st.caption(f"🔍 OCR Bottom: {txt[:100]}")
+        except:
+            pass
+    
     pid = find_point_id_from_text(txt, norm_map)
     if pid:
+        print(f"✅ Found point_id from bottom: {pid}")
         return pid, txt
 
-    # pass2: fallback OCR ทั้งภาพ
-    txt2, _err2 = _vision_read_text(image_bytes)
+    # pass2: fallback OCR ทั้งภาพ (ขยาย crop area เป็น 50%)
+    btm2 = _crop_bottom_bytes(image_bytes, frac=0.50)
+    txt2, _err2 = _vision_read_text(btm2)
+    
+    if txt2:
+        print(f"🔍 OCR Bottom 50%: {txt2[:200]}")
+        normalized2 = _norm_pid_key(txt2)
+        print(f"🔍 Normalized: {normalized2[:200]}")
+        try:
+            st.caption(f"🔍 OCR Bottom 50%: {txt2[:100]}")
+        except:
+            pass
+    
     pid2 = find_point_id_from_text(txt2, norm_map)
-    return pid2, txt2
+    if pid2:
+        print(f"✅ Found point_id from bottom 50%: {pid2}")
+        return pid2, txt2
+    
+    # pass3: fallback OCR ทั้งภาพ
+    txt3, _err3 = _vision_read_text(image_bytes)
+    
+    if txt3:
+        print(f"🔍 OCR Full image: {txt3[:200]}")
+        normalized3 = _norm_pid_key(txt3)
+        print(f"🔍 Normalized: {normalized3[:200]}")
+        try:
+            st.caption(f"🔍 OCR Full: {txt3[:100]}")
+        except:
+            pass
+    
+    pid3 = find_point_id_from_text(txt3, norm_map)
+    if pid3:
+        print(f"✅ Found point_id from full: {pid3}")
+    else:
+        print(f"⚠️ No point_id found. Available patterns in norm_map: {list(norm_map.keys())[:10]}")
+        # แสดงข้อความช่วยเหลือ
+        try:
+            st.warning(f"⚠️ ไม่พบ point_id ใน OCR text: '{txt3[:50] if txt3 else 'ว่างเปล่า'}'")
+        except:
+            pass
+    
+    return pid3, txt3
 
     
 # =========================================================
@@ -3050,6 +4249,64 @@ def apply_history_guard(point_id: str, best_val: float, candidates: list, config
         msg += f" (เมื่อวาน={prev:.0f})"
     
     return picked, msg
+
+def apply_history_guard_fast(point_id: str, best_val: float, candidates: list, config: dict, selected_date, daily_df):
+    """
+    ⚡ Version เร็วกว่า: รับ daily_df มาจากข้างนอกแทนการโหลดใหม่ทุกครั้ง
+    คืนค่า: (final_value, message)
+    """
+    if not is_cumulative_meter(config):
+        return best_val, ""
+    
+    prev = get_last_good_value_fast(point_id, selected_date - timedelta(days=1), daily_df)
+    if prev is None:
+        return best_val, "ℹ️ ไม่มีข้อมูลประวัติ (วันแรกจึงใช้ค่า AI ตรง ๆ)"
+    
+    max_delta = estimate_max_delta(point_id, selected_date - timedelta(days=1), fallback=20000)
+    picked, msg, _changed = pick_by_history(best_val, candidates, prev_val=prev, max_delta=max_delta)
+    
+    if msg.startswith("✅"):
+        msg += f" (เมื่อวาน={prev:.0f})"
+    
+    return picked, msg
+
+def get_last_good_value_fast(point_id: str, upto_date, daily_df):
+    """
+    ⚡ Version เร็วกว่า: รับ daily_df มาจากข้างนอกแทนการโหลดใหม่
+    คืนค่า Manual_Value ล่าสุด (ไม่ใช่ FLAGGED) ที่ timestamp <= upto_date
+    """
+    if daily_df.empty:
+        return None
+    
+    # Normalize column names
+    if "point_id" not in daily_df.columns:
+        return None
+    
+    pid = _norm_pid(point_id)
+    daily_df_norm = daily_df.copy()
+    daily_df_norm["point_id_norm"] = daily_df_norm["point_id"].astype(str).map(_norm_pid)
+    daily_df_norm["Status"] = daily_df_norm.get("Status", "").astype(str).str.strip().str.upper()
+    
+    df_sub = daily_df_norm[daily_df_norm["point_id_norm"] == pid]
+    df_sub = df_sub[~df_sub["Status"].str.contains("FLAGGED", na=False)]
+    
+    if df_sub.empty:
+        return None
+    
+    df_sub["timestamp_dt"] = pd.to_datetime(df_sub["timestamp"], errors="coerce")
+    df_sub = df_sub.dropna(subset=["timestamp_dt"])
+    
+    cutoff = pd.to_datetime(str(upto_date) + " 23:59:59")
+    df_sub = df_sub[df_sub["timestamp_dt"] <= cutoff]
+    
+    if df_sub.empty:
+        return None
+    
+    df_sub = df_sub.sort_values("timestamp_dt")
+    last = pd.to_numeric(df_sub.iloc[-1].get("Manual_Value", None), errors="coerce")
+    if pd.isna(last):
+        return None
+    return float(last)
 
 # =========================================================
 # --- UI LOGIC ---
@@ -3475,35 +4732,58 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
 
     # ✅ อัตโนมัติ process ทันทีที่อัพเสร็จ (ไม่ต้องกดปุ่ม)
     if st.session_state["bulk_rows"] is None:
-        st.info("🔄 กำลังประมวลผลรูป...")
         rows = []
         
+        # ⚡ โหลด DailyReadings 1 ครั้งก่อนเริ่ม loop (ลดเวลามาก)
+        with st.spinner("📥 กำลังโหลดข้อมูลประวัติ..."):
+            daily_df = load_dailyreadings_tail(limit=4000)
+        
         # สร้าง progress bar ด้านนอก loop เพื่อให้เห็น realtime
-        progress_container = st.empty()
-        status_container = st.empty()
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # ⚡ Phase 1: OCR point_id เท่านั้น (เร็วกว่า)
+        st.info("📍 Phase 1/2: กำลังอ่าน point_id จากรูป...")
+        pid_results = []  # [{name, pid, bytes}]
         
         for i, it in enumerate(images, start=1):
             img_name = it["name"]
             img_bytes = it["bytes"]
-
-            # Update progress text
-            status_container.text(f"📍 กำลังประมวลผล: {i}/{len(images)} - {img_name[:40]}")
-            progress_container.progress(i / len(images))
-
+            
+            status_text.text(f"📍 อ่าน point_id: {i}/{len(images)} - {img_name[:40]}")
+            progress_bar.progress(i / len(images))
+            
             pid, _pid_text = extract_point_id_from_image(img_bytes, norm_map)
             pid_u = str(pid).strip().upper() if pid else ""
-
+            
+            pid_results.append({
+                "name": img_name,
+                "pid": pid_u,
+                "bytes": img_bytes
+            })
+        
+        # ⚡ Phase 2: OCR ค่ามิเตอร์ (เฉพาะรูปที่มี point_id)
+        st.info("🔢 Phase 2/2: กำลังอ่านค่ามิเตอร์...")
+        
+        for i, pr in enumerate(pid_results, start=1):
+            img_name = pr["name"]
+            img_bytes = pr["bytes"]
+            pid_u = pr["pid"]
+            
+            status_text.text(f"🔢 อ่านค่ามิเตอร์: {i}/{len(pid_results)} - {img_name[:40]}")
+            progress_bar.progress(i / len(pid_results))
+            
             cfg = get_meter_config(pid_u) if pid_u else None
             ai_val = None
             msg = ""
             stt = "NO_PID"
             candidates_list = []
-
+            
             if pid_u and cfg:
                 try:
                     best, cand = ocr_process(img_bytes, cfg, return_candidates=True)
-                    # ✅ ใช้ History Guard + candidates
-                    best2, hmsg = apply_history_guard(pid_u, best, cand, cfg, report_date)
+                    # ✅ ใช้ History Guard + candidates (ใช้ daily_df ที่โหลดไว้แล้ว)
+                    best2, hmsg = apply_history_guard_fast(pid_u, best, cand, cfg, report_date, daily_df)
                     ai_val = float(best2)
                     msg = hmsg or ""
                     stt = "OK"
@@ -3515,7 +4795,24 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
             elif pid_u and not cfg:
                 stt = "NO_CONFIG"
                 msg = "ไม่พบ config ของจุดนี้ใน PointsMaster"
-
+            
+            # ⚡ ลดขนาดรูปก่อนเก็บ (thumbnail 800px) - ประหยัด memory มาก
+            try:
+                from PIL import Image
+                img_pil = Image.open(io.BytesIO(img_bytes))
+                # Resize เป็น thumbnail ถ้ากว้างเกิน 800px
+                if img_pil.width > 800:
+                    ratio = 800 / img_pil.width
+                    new_size = (800, int(img_pil.height * ratio))
+                    img_pil = img_pil.resize(new_size, Image.Resampling.LANCZOS)
+                
+                # แปลงกลับเป็น bytes
+                buf = io.BytesIO()
+                img_pil.save(buf, format="JPEG", quality=85)
+                img_bytes_small = buf.getvalue()
+            except Exception:
+                img_bytes_small = img_bytes  # fallback ใช้รูปเดิม
+            
             rows.append({
                 "file": img_name,
                 "point_id": pid_u or "",
@@ -3524,16 +4821,16 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                 "status": stt,
                 "note": msg,
                 "candidates": candidates_list,
-                "image_bytes": img_bytes,  # ✅ เก็บรูปไว้
+                "image_bytes": img_bytes_small,  # ✅ เก็บรูปขนาดเล็ก
             })
-
-        progress_container.empty()
-        status_container.empty()
+        
+        progress_bar.empty()
+        status_text.empty()
         
         st.session_state["bulk_rows"] = rows
         st.session_state["bulk_candidates_storage"] = {rows[i]["file"]: rows[i].get("candidates", []) for i in range(len(rows))}
         st.success(f"✅ ประมวลผลเสร็จ {len(rows)} รูป")
-        st.rerun()
+        st.rerun()  # ✅ rerun เพื่อแสดงผลลัพธ์
 
     rows = st.session_state.get("bulk_rows")
     if not rows:
@@ -4318,9 +5615,19 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
     )
 
     added_count = 0
+    skipped_files = []
+    MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB limit (Cloud Run รับได้ ~32MB แต่เหลือ buffer)
+    
     if exports_new:
         for f in exports_new:
             b = f.getvalue()
+            file_size_mb = len(b) / 1_000_000
+            
+            # 🔥 เช็คขนาดไฟล์ก่อนอัปโหลด
+            if len(b) > MAX_FILE_SIZE:
+                skipped_files.append((f.name, file_size_mb))
+                continue
+            
             h = hashlib.sha1(b).hexdigest()
             old = st.session_state["scada_files"].get(f.name)
             if (old is None) or (old.get("sha1") != h):
@@ -4334,7 +5641,40 @@ elif mode == "📥 อัปโหลด Excel (SCADA Export)":
                 added_count += 1
 
     if added_count:
-        st.success(f"เพิ่มไฟล์ใหม่ {added_count} ไฟล์ ✅ (ไฟล์เดิมยังอยู่)")
+        st.success(f"✅ เพิ่มไฟล์ใหม่ {added_count} ไฟล์")
+    
+    if skipped_files:
+        st.error(f"❌ **ไม่สามารถอัปโหลดไฟล์ใหญ่เกิน 20MB** ({len(skipped_files)} ไฟล์):")
+        for fname, fsize in skipped_files:
+            st.caption(f"  • **{fname}** → {fsize:.1f} MB (เกิน limit)")
+        
+        st.warning("### 🚫 ทำไมมี limit 20MB?")
+        st.markdown("""
+        **Cloud Run มีข้อจำกัด request payload ที่ 32MB** (เราตั้ง 20MB เพื่อเหลือ buffer)
+        
+        ไฟล์ **AF_Report_Gen.xlsx** ขนาด 79-100 MB จึงใหญ่เกินไปมาก 😢
+        """)
+        
+        st.info("### 💡 วิธีแก้ไข: แยกไฟล์ออกมาใช้งาน")
+        st.markdown("""
+        **สำหรับไฟล์ AF_Report_Gen.xlsx โดยเฉพาะ:**
+        
+        1. **เปิดไฟล์ใน Excel**
+        2. **คลิกขวาที่ชื่อ Sheet** ที่ต้องการ (เช่น Total, PV, FM_01)
+        3. **เลือก "Move or Copy..."**
+        4. **เลือก "(new book)"** → คลิก OK
+        5. **Save as** ไฟล์ใหม่ชื่อเช่น `AF_Report_Gen_Total.xlsx`
+        6. **อัปโหลดไฟล์ใหม่** ที่มีขนาดเล็กกว่า (ประมาณ 5-15 MB)
+        
+        **หรือ:** ใช้ไฟล์อื่นแทน เช่น Daily_Report.xlsx, UF_System.xlsx ซึ่งมักเล็กกว่า
+        
+        ---
+        
+        **สำหรับไฟล์ขนาดใหญ่ทั่วไป:**
+        - ลบ sheet ที่ไม่ได้ใช้ออก
+        - ลบข้อมูลเก่าที่ไม่จำเป็น (เช่น ข้อมูล > 6 เดือน)
+        - แบ่งออกเป็นหลายไฟล์ตามช่วงเวลา (เช่น Q1, Q2, Q3, Q4)
+        """)
 
     files_dict = st.session_state.get("scada_files", {})
     if not files_dict:
