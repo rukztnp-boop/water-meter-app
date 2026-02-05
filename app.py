@@ -4614,27 +4614,36 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
 
     # ✅ อัตโนมัติ process ทันทีที่อัพเสร็จ (ไม่ต้องกดปุ่ม)
     if st.session_state["bulk_rows"] is None:
-        st.info("🔄 กำลังประมวลผลรูป...")
+        # 🔒 ป้องกันการ rerun ระหว่าง processing
+        if "bulk_processing" not in st.session_state:
+            st.session_state["bulk_processing"] = False
+        
+        if st.session_state["bulk_processing"]:
+            st.warning("⏳ กำลังประมวลผล... กรุณารอสักครู่")
+            st.stop()
+        
+        st.session_state["bulk_processing"] = True
+        
         rows = []
         
         # ⚡ โหลด DailyReadings 1 ครั้งก่อนเริ่ม loop (ลดเวลามาก)
-        daily_df = load_dailyreadings_tail(limit=4000)
+        with st.spinner("📥 กำลังโหลดข้อมูลประวัติ..."):
+            daily_df = load_dailyreadings_tail(limit=4000)
         
         # สร้าง progress bar ด้านนอก loop เพื่อให้เห็น realtime
-        progress_container = st.empty()
-        status_container = st.empty()
-        stage_container = st.empty()
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
         # ⚡ Phase 1: OCR point_id เท่านั้น (เร็วกว่า)
-        stage_container.info("📍 Phase 1/2: กำลังอ่าน point_id จากรูป...")
+        st.info("📍 Phase 1/2: กำลังอ่าน point_id จากรูป...")
         pid_results = []  # [{name, pid, bytes}]
         
         for i, it in enumerate(images, start=1):
             img_name = it["name"]
             img_bytes = it["bytes"]
             
-            status_container.text(f"📍 อ่าน point_id: {i}/{len(images)} - {img_name[:40]}")
-            progress_container.progress(i / len(images))
+            status_text.text(f"📍 อ่าน point_id: {i}/{len(images)} - {img_name[:40]}")
+            progress_bar.progress(i / len(images))
             
             pid, _pid_text = extract_point_id_from_image(img_bytes, norm_map)
             pid_u = str(pid).strip().upper() if pid else ""
@@ -4646,15 +4655,15 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
             })
         
         # ⚡ Phase 2: OCR ค่ามิเตอร์ (เฉพาะรูปที่มี point_id)
-        stage_container.info("🔢 Phase 2/2: กำลังอ่านค่ามิเตอร์...")
+        st.info("🔢 Phase 2/2: กำลังอ่านค่ามิเตอร์...")
         
         for i, pr in enumerate(pid_results, start=1):
             img_name = pr["name"]
             img_bytes = pr["bytes"]
             pid_u = pr["pid"]
             
-            status_container.text(f"🔢 อ่านค่ามิเตอร์: {i}/{len(pid_results)} - {img_name[:40]}")
-            progress_container.progress(i / len(pid_results))
+            status_text.text(f"🔢 อ่านค่ามิเตอร์: {i}/{len(pid_results)} - {img_name[:40]}")
+            progress_bar.progress(i / len(pid_results))
             
             cfg = get_meter_config(pid_u) if pid_u else None
             ai_val = None
@@ -4707,12 +4716,12 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                 "image_bytes": img_bytes_small,  # ✅ เก็บรูปขนาดเล็ก
             })
         
-        progress_container.empty()
-        status_container.empty()
-        stage_container.empty()
+        progress_bar.empty()
+        status_text.empty()
         
         st.session_state["bulk_rows"] = rows
         st.session_state["bulk_candidates_storage"] = {rows[i]["file"]: rows[i].get("candidates", []) for i in range(len(rows))}
+        st.session_state["bulk_processing"] = False  # 🔓 ปลดล็อก
         st.success(f"✅ ประมวลผลเสร็จ {len(rows)} รูป")
         # ⚠️ ไม่ rerun() เพราะจะทำให้วนกลับไป phase 1
 
