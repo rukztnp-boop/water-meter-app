@@ -4150,6 +4150,64 @@ def apply_history_guard(point_id: str, best_val: float, candidates: list, config
     
     return picked, msg
 
+def apply_history_guard_fast(point_id: str, best_val: float, candidates: list, config: dict, selected_date, daily_df):
+    """
+    ⚡ Version เร็วกว่า: รับ daily_df มาจากข้างนอกแทนการโหลดใหม่ทุกครั้ง
+    คืนค่า: (final_value, message)
+    """
+    if not is_cumulative_meter(config):
+        return best_val, ""
+    
+    prev = get_last_good_value_fast(point_id, selected_date - timedelta(days=1), daily_df)
+    if prev is None:
+        return best_val, "ℹ️ ไม่มีข้อมูลประวัติ (วันแรกจึงใช้ค่า AI ตรง ๆ)"
+    
+    max_delta = estimate_max_delta(point_id, selected_date - timedelta(days=1), fallback=20000)
+    picked, msg, _changed = pick_by_history(best_val, candidates, prev_val=prev, max_delta=max_delta)
+    
+    if msg.startswith("✅"):
+        msg += f" (เมื่อวาน={prev:.0f})"
+    
+    return picked, msg
+
+def get_last_good_value_fast(point_id: str, upto_date, daily_df):
+    """
+    ⚡ Version เร็วกว่า: รับ daily_df มาจากข้างนอกแทนการโหลดใหม่
+    คืนค่า Manual_Value ล่าสุด (ไม่ใช่ FLAGGED) ที่ timestamp <= upto_date
+    """
+    if daily_df.empty:
+        return None
+    
+    # Normalize column names
+    if "point_id" not in daily_df.columns:
+        return None
+    
+    pid = _norm_pid(point_id)
+    daily_df_norm = daily_df.copy()
+    daily_df_norm["point_id_norm"] = daily_df_norm["point_id"].astype(str).map(_norm_pid)
+    daily_df_norm["Status"] = daily_df_norm.get("Status", "").astype(str).str.strip().str.upper()
+    
+    df_sub = daily_df_norm[daily_df_norm["point_id_norm"] == pid]
+    df_sub = df_sub[~df_sub["Status"].str.contains("FLAGGED", na=False)]
+    
+    if df_sub.empty:
+        return None
+    
+    df_sub["timestamp_dt"] = pd.to_datetime(df_sub["timestamp"], errors="coerce")
+    df_sub = df_sub.dropna(subset=["timestamp_dt"])
+    
+    cutoff = pd.to_datetime(str(upto_date) + " 23:59:59")
+    df_sub = df_sub[df_sub["timestamp_dt"] <= cutoff]
+    
+    if df_sub.empty:
+        return None
+    
+    df_sub = df_sub.sort_values("timestamp_dt")
+    last = pd.to_numeric(df_sub.iloc[-1].get("Manual_Value", None), errors="coerce")
+    if pd.isna(last):
+        return None
+    return float(last)
+
 # =========================================================
 # --- UI LOGIC ---
 # =========================================================
@@ -4577,32 +4635,56 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
         st.info("🔄 กำลังประมวลผลรูป...")
         rows = []
         
+        # ⚡ โหลด DailyReadings 1 ครั้งก่อนเริ่ม loop (ลดเวลามาก)
+        daily_df = load_dailyreadings_tail(limit=4000)
+        
         # สร้าง progress bar ด้านนอก loop เพื่อให้เห็น realtime
         progress_container = st.empty()
         status_container = st.empty()
+        stage_container = st.empty()
+        
+        # ⚡ Phase 1: OCR point_id เท่านั้น (เร็วกว่า)
+        stage_container.info("📍 Phase 1/2: กำลังอ่าน point_id จากรูป...")
+        pid_results = []  # [{name, pid, bytes}]
         
         for i, it in enumerate(images, start=1):
             img_name = it["name"]
             img_bytes = it["bytes"]
-
-            # Update progress text
-            status_container.text(f"📍 กำลังประมวลผล: {i}/{len(images)} - {img_name[:40]}")
+            
+            status_container.text(f"📍 อ่าน point_id: {i}/{len(images)} - {img_name[:40]}")
             progress_container.progress(i / len(images))
-
+            
             pid, _pid_text = extract_point_id_from_image(img_bytes, norm_map)
             pid_u = str(pid).strip().upper() if pid else ""
-
+            
+            pid_results.append({
+                "name": img_name,
+                "pid": pid_u,
+                "bytes": img_bytes
+            })
+        
+        # ⚡ Phase 2: OCR ค่ามิเตอร์ (เฉพาะรูปที่มี point_id)
+        stage_container.info("🔢 Phase 2/2: กำลังอ่านค่ามิเตอร์...")
+        
+        for i, pr in enumerate(pid_results, start=1):
+            img_name = pr["name"]
+            img_bytes = pr["bytes"]
+            pid_u = pr["pid"]
+            
+            status_container.text(f"🔢 อ่านค่ามิเตอร์: {i}/{len(pid_results)} - {img_name[:40]}")
+            progress_container.progress(i / len(pid_results))
+            
             cfg = get_meter_config(pid_u) if pid_u else None
             ai_val = None
             msg = ""
             stt = "NO_PID"
             candidates_list = []
-
+            
             if pid_u and cfg:
                 try:
                     best, cand = ocr_process(img_bytes, cfg, return_candidates=True)
-                    # ✅ ใช้ History Guard + candidates
-                    best2, hmsg = apply_history_guard(pid_u, best, cand, cfg, report_date)
+                    # ✅ ใช้ History Guard + candidates (ใช้ daily_df ที่โหลดไว้แล้ว)
+                    best2, hmsg = apply_history_guard_fast(pid_u, best, cand, cfg, report_date, daily_df)
                     ai_val = float(best2)
                     msg = hmsg or ""
                     stt = "OK"
@@ -4614,7 +4696,24 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
             elif pid_u and not cfg:
                 stt = "NO_CONFIG"
                 msg = "ไม่พบ config ของจุดนี้ใน PointsMaster"
-
+            
+            # ⚡ ลดขนาดรูปก่อนเก็บ (thumbnail 800px) - ประหยัด memory มาก
+            try:
+                from PIL import Image
+                img_pil = Image.open(io.BytesIO(img_bytes))
+                # Resize เป็น thumbnail ถ้ากว้างเกิน 800px
+                if img_pil.width > 800:
+                    ratio = 800 / img_pil.width
+                    new_size = (800, int(img_pil.height * ratio))
+                    img_pil = img_pil.resize(new_size, Image.Resampling.LANCZOS)
+                
+                # แปลงกลับเป็น bytes
+                buf = io.BytesIO()
+                img_pil.save(buf, format="JPEG", quality=85)
+                img_bytes_small = buf.getvalue()
+            except Exception:
+                img_bytes_small = img_bytes  # fallback ใช้รูปเดิม
+            
             rows.append({
                 "file": img_name,
                 "point_id": pid_u or "",
@@ -4623,11 +4722,12 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                 "status": stt,
                 "note": msg,
                 "candidates": candidates_list,
-                "image_bytes": img_bytes,  # ✅ เก็บรูปไว้
+                "image_bytes": img_bytes_small,  # ✅ เก็บรูปขนาดเล็ก
             })
-
+        
         progress_container.empty()
         status_container.empty()
+        stage_container.empty()
         
         st.session_state["bulk_rows"] = rows
         st.session_state["bulk_candidates_storage"] = {rows[i]["file"]: rows[i].get("candidates", []) for i in range(len(rows))}
