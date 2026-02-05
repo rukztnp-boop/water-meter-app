@@ -185,7 +185,12 @@ def get_file_hash(filepath):
         return hashlib.md5(f.read()).hexdigest()
 
 def find_new_files():
-    """หาไฟล์ Excel ใหม่ในโฟลเดอร์ watch"""
+    """
+    หาไฟล์ Excel ใหม่ในโฟลเดอร์ watch
+    
+    Returns:
+        list of tuples: [(file_path, target_date), ...]
+    """
     watch_folder = Path(CONFIG["WATCH_FOLDER"])
     found_files = []
     
@@ -209,23 +214,31 @@ def find_new_files():
             # ประมวลผล folder ล่าสุด (หรือทั้งหมดถ้าต้องการ)
             for folder in date_folders[:3]:  # เอา 3 folder ล่าสุด
                 logger.info(f"   Scanning: {folder.name}")
+                
+                # แปลง folder name → target_date
+                target_date = parse_date_from_folder_name(folder.name)
+                
                 for pattern in CONFIG["FILE_PATTERNS"]:
                     files = list(folder.glob(pattern))
-                    found_files.extend(files)
+                    # เก็บ tuple ของ (file_path, target_date)
+                    for f in files:
+                        found_files.append((f, target_date))
         else:
             logger.warning("⚠️ No date folders found! Looking in main folder...")
             # Fallback: หาในโฟลเดอร์หลัก
             for pattern in CONFIG["FILE_PATTERNS"]:
                 files = list(watch_folder.glob(pattern))
-                found_files.extend(files)
+                for f in files:
+                    found_files.append((f, None))  # ใช้วันที่ปัจจุบัน
     else:
         # โหมด: หาในโฟลเดอร์เดียว
         for pattern in CONFIG["FILE_PATTERNS"]:
             files = list(watch_folder.glob(pattern))
-            found_files.extend(files)
+            for f in files:
+                found_files.append((f, None))  # ใช้วันที่ปัจจุบัน
     
     # เอาแค่ไฟล์ที่ไม่ได้ซ่อน (ไม่ขึ้นต้นด้วย ~)
-    found_files = [f for f in found_files if not f.name.startswith('~')]
+    found_files = [(f, d) for f, d in found_files if not f.name.startswith('~')]
     
     logger.info(f"🔍 Found {len(found_files)} file(s) total")
     return found_files
@@ -403,18 +416,31 @@ def process_manual():
     logger.info("=" * 60)
     
     create_folders()
-    files = find_new_files()
+    files_with_dates = find_new_files()  # [(file_path, target_date), ...]
     
-    if not files:
+    if not files_with_dates:
         logger.info("ℹ️ No files to process. Exiting.")
         return
     
-    stats = process_files_batch([str(f) for f in files])
+    # Group files by target_date
+    from collections import defaultdict
+    files_by_date = defaultdict(list)
+    for file_path, target_date in files_with_dates:
+        files_by_date[target_date].append(file_path)
     
-    if stats.get("success", 0) > 0:
-        # อัพเดท history ก่อนย้ายไฟล์ (เพื่อเก็บ hash)
+    # Process each date group
+    all_files = []
+    for target_date, files in files_by_date.items():
+        stats = process_files_batch([str(f) for f in files], target_date=target_date)
+        all_files.extend(files)
+        
+        if stats.get("success", 0) > 0:
+            logger.info(f"   ✅ {stats.get('success', 0)} records saved for {target_date}")
+    
+    # อัพเดท history และย้ายไฟล์
+    if all_files:
         history = load_processed_history()
-        unique_files = list(set([str(f) for f in files]))
+        unique_files = list(set([str(f) for f in all_files]))
         
         for file_path in unique_files:
             if os.path.exists(file_path):  # เช็คว่าไฟล์ยังอยู่
@@ -427,7 +453,7 @@ def process_manual():
         save_processed_history(history)
         
         # ย้ายไฟล์หลังจาก save history แล้ว
-        move_to_processed([str(f) for f in files])
+        move_to_processed([str(f) for f in all_files])
     
     logger.info("=" * 60)
     logger.info(f"✅ Processing complete!")
@@ -470,24 +496,35 @@ def process_watch():
     
     while True:
         try:
-            files = find_new_files()
-            new_files = [f for f in files if not is_file_processed(str(f), history)]
+            files_with_dates = find_new_files()  # [(file_path, target_date), ...]
+            new_files = [(f, d) for f, d in files_with_dates if not is_file_processed(str(f), history)]
             
             if new_files:
                 logger.info(f"🆕 Found {len(new_files)} new file(s)")
-                stats = process_files_batch([str(f) for f in new_files])
+                
+                # Group by date and process
+                from collections import defaultdict
+                files_by_date = defaultdict(list)
+                for file_path, target_date in new_files:
+                    files_by_date[target_date].append(file_path)
+                
+                all_files = []
+                for target_date, files in files_by_date.items():
+                    stats = process_files_batch([str(f) for f in files], target_date=target_date)
+                    all_files.extend(files)
                 
                 if stats.get("success", 0) > 0:
-                    move_to_processed([str(f) for f in new_files])
+                    move_to_processed([str(f) for f in all_files])
                     
                     # อัพเดท history
-                    for file_path in new_files:
-                        filename = os.path.basename(file_path)
-                        history[filename] = {
-                            "hash": get_file_hash(str(file_path)),
-                            "processed_at": datetime.now().isoformat(),
-                            "records": stats.get("success", 0)
-                        }
+                    for file_path in all_files:
+                        if os.path.exists(str(file_path)):
+                            filename = os.path.basename(str(file_path))
+                            history[filename] = {
+                                "hash": get_file_hash(str(file_path)),
+                                "processed_at": datetime.now().isoformat(),
+                                "records": stats.get("success", 0)
+                            }
                     save_processed_history(history)
             
             time.sleep(CONFIG["WATCH_INTERVAL"])
