@@ -638,6 +638,79 @@ def append_rows_dailyreadings_batch(rows: list):
         return True, f"APPENDED {len(rows)}"
     except Exception as e:
         return False, str(e)
+
+def export_scada_to_waterreport(scada_results: list, target_date, mode="scada_auto"):
+    """
+    Wrapper function สำหรับบันทึกข้อมูล SCADA ลง WaterReport
+    
+    Args:
+        scada_results: list[dict] มี keys: point_id, value, status
+        target_date: datetime.date วันที่ต้องการบันทึก
+        mode: str ("scada_auto" หรืออื่นๆ)
+    
+    Returns:
+        tuple: (success_message, fail_message)
+    """
+    if not scada_results:
+        return None, "No data to export"
+    
+    # โหลด PointsMaster เพื่อเอา report_col
+    try:
+        sh = gc.open(DB_SHEET_NAME)
+        ws_pm = sh.worksheet("PointsMaster")
+        pm_rows = ws_pm.get_all_records()
+    except Exception as e:
+        return None, f"ไม่สามารถโหลด PointsMaster: {e}"
+    
+    # สร้าง mapping point_id -> report_col
+    pm_map = {}
+    for row in pm_rows:
+        pid = str(row.get("point_id", "")).strip().upper()
+        report_col = str(row.get("report_col", "")).strip()
+        if pid and report_col and report_col not in ("-", "—", "–", ""):
+            pm_map[pid] = report_col
+    
+    # เตรียมข้อมูลสำหรับ export_many_to_real_report_batch
+    items = []
+    for result in scada_results:
+        pid = str(result.get("point_id", "")).strip().upper()
+        val = result.get("value")
+        status = result.get("status")
+        
+        if status == "OK" and val is not None:
+            report_col = pm_map.get(pid)
+            if report_col:
+                items.append({
+                    "point_id": pid,
+                    "value": val,
+                    "report_col": report_col
+                })
+    
+    if not items:
+        return None, "ไม่มีจุดที่มี report_col ให้บันทึก"
+    
+    # เรียก export_many_to_real_report_batch
+    try:
+        ok_pids, fail_list = export_many_to_real_report_batch(
+            items=items,
+            target_date=target_date,
+            debug=False,
+            write_mode="overwrite"
+        )
+        
+        success_msg = None
+        fail_msg = None
+        
+        if ok_pids:
+            success_msg = f"ส่งค่าไป {REAL_REPORT_SHEET} สำเร็จ: {len(ok_pids)} จุด"
+        
+        if fail_list:
+            fail_msg = f"ส่งไม่สำเร็จ: {len(fail_list)} จุด"
+        
+        return success_msg, fail_msg
+        
+    except Exception as e:
+        return None, f"Error exporting to WaterReport: {e}"
         
 # =========================================================
 # --- ✅ WATERREPORT PROGRESS (92 จุด) ---
