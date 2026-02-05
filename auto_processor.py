@@ -37,18 +37,38 @@ import pandas as pd
 # ใช้ functions จาก app.py
 sys.path.insert(0, os.path.dirname(__file__))
 
-try:
-    from app import (
-        load_scada_excel_mapping,
-        extract_values_from_excel_exports,
-        gc,
-        DB_SHEET_NAME,
-        get_thai_time
-    )
-except ImportError as e:
-    print(f"❌ Error importing from app.py: {e}")
-    print("ตรวจสอบว่าไฟล์ app.py อยู่ในโฟลเดอร์เดียวกัน")
-    sys.exit(1)
+# Lazy import to avoid triggering Streamlit UI code
+load_scada_excel_mapping = None
+extract_scada_values_from_exports = None
+gc = None
+DB_SHEET_NAME = None
+get_thai_time = None
+
+def _lazy_import():
+    """Import functions from app.py only when needed"""
+    global load_scada_excel_mapping, extract_scada_values_from_exports
+    global gc, DB_SHEET_NAME, get_thai_time
+    
+    if load_scada_excel_mapping is not None:
+        return  # Already imported
+    
+    try:
+        from app import (
+            load_scada_excel_mapping as _load_mapping,
+            extract_scada_values_from_exports as _extract_values,
+            gc as _gc,
+            DB_SHEET_NAME as _db_name,
+            get_thai_time as _get_time
+        )
+        load_scada_excel_mapping = _load_mapping
+        extract_scada_values_from_exports = _extract_values
+        gc = _gc
+        DB_SHEET_NAME = _db_name
+        get_thai_time = _get_time
+    except ImportError as e:
+        print(f"❌ Error importing from app.py: {e}")
+        print("ตรวจสอบว่าไฟล์ app.py อยู่ในโฟลเดอร์เดียวกัน")
+        sys.exit(1)
 
 # ==================== Configuration ====================
 
@@ -259,6 +279,7 @@ def process_files_batch(files, target_date=None):
     Returns:
         dict: สถิติการประมวลผล
     """
+    _lazy_import()  # Import functions only when needed
     if not files:
         logger.warning("⚠️ No files to process")
         return {"success": 0, "failed": 0, "total": 0}
@@ -300,11 +321,11 @@ def process_files_batch(files, target_date=None):
     # 3. Extract values
     try:
         logger.info("🔄 Extracting values from Excel files...")
-        results, missing = extract_values_from_excel_exports(
+        results, missing = extract_scada_values_from_exports(
             uploaded_exports=uploaded_exports,
             mapping_rows=mapping,
             target_date=target_date,
-            max_scan_rows=CONFIG["MAX_SCAN_ROWS"]
+            custom_max_scan_rows=CONFIG["MAX_SCAN_ROWS"]
         )
         logger.info(f"✅ Extracted {len(results)} point values")
     except Exception as e:
