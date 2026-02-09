@@ -2615,7 +2615,13 @@ def _join_adjacent_numeric_tokens(num_tokens, gap_px: int = 14):
     cur = dict(num_tokens[0])
     for t in num_tokens[1:]:
         gap = t["x1"] - cur["x2"]
-        if gap >= 0 and gap <= gap_px:
+        # If the next token is a comma or period and is close, treat as part of the number
+        is_comma = t["text"] in {",", "."}
+        # If the current text ends with a digit and the next token is a comma or period, or vice versa, join
+        if (gap >= 0 and gap <= gap_px) and (
+            is_comma or
+            (cur["text"].replace(",","").replace(".","").isdigit() and t["text"].replace(",","").replace(".","").isdigit())
+        ):
             cur["text"] = f"{cur['text']}{t['text']}"
             cur["x2"] = max(cur["x2"], t["x2"])
             cur["y1"] = min(cur.get("y1", 0), t.get("y1", 0))
