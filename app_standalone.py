@@ -101,11 +101,38 @@ class MockStreamlit:
 # Inject mock before importing app
 sys.modules['streamlit'] = MockStreamlit()
 
+# Mock heavy packages ที่ไม่จำเป็นสำหรับ SCADA collector
+from unittest.mock import MagicMock
+
+# mock google.cloud chain (vision, storage ไม่ได้ใช้ แต่ app.py import)
+_mock_cloud = MagicMock()
+for mod_name in [
+    'google.cloud',
+    'google.cloud.vision',
+    'google.cloud.storage',
+]:
+    if mod_name not in sys.modules:
+        sys.modules[mod_name] = _mock_cloud
+
+# mock อื่นๆ ที่ไม่ได้ติดตั้ง
+for mod_name in ['cv2', 'pandas', 'inference_sdk']:
+    if mod_name not in sys.modules:
+        sys.modules[mod_name] = MagicMock()
+
+# mock numpy เฉพาะถ้ายังไม่ได้ติดตั้ง
+try:
+    import numpy
+except ImportError:
+    sys.modules['numpy'] = MagicMock()
+
 # Now import from app.py
 from app import (
     load_scada_excel_mapping,
     extract_scada_values_from_exports,
-    export_scada_to_waterreport,
+    export_many_to_real_report_batch,
+    append_rows_dailyreadings_batch,
+    get_meter_config,
+    infer_meter_type,
     gc,
     DB_SHEET_NAME,
     REAL_REPORT_SHEET,

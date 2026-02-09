@@ -2427,7 +2427,8 @@ def ocr_process(image_bytes, config, debug=False, return_candidates=False):
                 all_candidates = all_candidates[:TOPK]
                 
             # ถ้าเจอคะแนนสูงมากแล้ว ก็พอ (กันเรียก Vision หลายรอบ)
-            if best_score >= 980:
+            # ✅ ลด threshold จาก 980 → 850 เพื่อ early exit เร็วขึ้น (ลด API calls)
+            if best_score >= 850:
                 break
 
     final_val = float(best_val) if best_val is not None else 0.0
@@ -2818,28 +2819,26 @@ def extract_point_id_from_image(image_bytes: bytes, norm_map: dict):
     """คืนค่า (point_id หรือ None, ocr_text ที่ใช้)
     
     ลำดับการหา point_id (จากเร็วไปช้า):
-    1. Crop bottom 40% (กรณีปกติ - เทปเหลืองด้านล่าง)
-    2. Crop top 40% (กรณี point_id อยู่บนสุด เช่น VSD screens)
-    3. Full image (fallback)
+    1. Crop bottom 50% (กรณีปกติ - เทปเหลืองด้านล่าง) — ขยายจาก 40% เพื่อจับได้มากขึ้นในรอบแรก
+    2. Crop top 50% (กรณี point_id อยู่บนสุด เช่น VSD screens)
+    ⚡ ไม่ต้อง Full image pass เพราะ bottom 50% + top 50% = ครบทั้งรูปแล้ว
     """
-    # Pass 1: OCR เฉพาะช่วงล่างก่อน (กรณีปกติ)
-    btm = _crop_bottom_bytes(image_bytes, frac=0.40)
+    # Pass 1: OCR เฉพาะช่วงล่าง (ขยายเป็น 50% เพื่อลดโอกาสที่ต้อง pass 2)
+    btm = _crop_bottom_bytes(image_bytes, frac=0.50)
     txt, _err = _vision_read_text(btm)
     pid = find_point_id_from_text(txt, norm_map)
     if pid:
         return pid, txt
 
-    # Pass 2: OCR เฉพาะช่วงบน (กรณี point_id อยู่บนสุด)
-    top = _crop_top_bytes(image_bytes, frac=0.40)
+    # Pass 2: OCR เฉพาะช่วงบน (50% — overlap กับ pass 1 = ครบทั้งรูป ไม่ต้อง full image)
+    top = _crop_top_bytes(image_bytes, frac=0.50)
     txt_top, _err_top = _vision_read_text(top)
     pid_top = find_point_id_from_text(txt_top, norm_map)
     if pid_top:
         return pid_top, txt_top
 
-    # Pass 3: Fallback OCR ทั้งภาพ
-    txt2, _err2 = _vision_read_text(image_bytes)
-    pid2 = find_point_id_from_text(txt2, norm_map)
-    return pid2, txt2
+    # ⚡ ไม่ต้อง Pass 3 (full image) — bottom 50% + top 50% overlap ตรงกลาง ครอบคลุมทั้งภาพแล้ว
+    return None, txt_top or txt or ""
 
     
 # =========================================================
@@ -3541,22 +3540,50 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
         st.info("🔄 กำลังประมวลผลรูป...")
         rows = []
         
+        # ✅ Pre-load config ทั้งหมดครั้งเดียว (ไม่ต้องเรียก Google Sheets ทุกรูป)
+        _all_pm = load_points_master() or []
+        _config_cache = {}
+        for _it in _all_pm:
+            _pid_key = str(_it.get('point_id', '')).strip().upper()
+            if _pid_key:
+                _it['decimals'] = safe_int(_it.get('decimals'), 0)
+                _it['keyword'] = str(_it.get('keyword', '')).strip()
+                _exp = safe_int(_it.get('expected_digits'), 0)
+                if _exp == 0: _exp = safe_int(_it.get('int_digits'), 0)
+                _it['expected_digits'] = _exp
+                _it['report_col'] = str(_it.get('report_col', '')).strip()
+                _it['ignore_red'] = parse_bool(_it.get('ignore_red'))
+                _it['roi_x1'] = safe_float(_it.get('roi_x1'), 0.0)
+                _it['roi_y1'] = safe_float(_it.get('roi_y1'), 0.0)
+                _it['roi_x2'] = safe_float(_it.get('roi_x2'), 0.0)
+                _it['roi_y2'] = safe_float(_it.get('roi_y2'), 0.0)
+                _it['type'] = str(_it.get('type', '')).strip()
+                _it['name'] = str(_it.get('name', '')).strip()
+                _config_cache[_pid_key] = _it
+        
         # สร้าง progress bar ด้านนอก loop เพื่อให้เห็น realtime
         progress_container = st.empty()
         status_container = st.empty()
+        time_container = st.empty()
+        _bulk_start_time = pytime.time()
         
         for i, it in enumerate(images, start=1):
             img_name = it["name"]
             img_bytes = it["bytes"]
 
-            # Update progress text
+            # Update progress text + ETA
+            _elapsed = pytime.time() - _bulk_start_time
+            _avg_per_img = _elapsed / i if i > 1 else 0
+            _remaining = _avg_per_img * (len(images) - i)
             status_container.text(f"📍 กำลังประมวลผล: {i}/{len(images)} - {img_name[:40]}")
             progress_container.progress(i / len(images))
+            if i > 1:
+                time_container.caption(f"⏱️ ผ่านไป {_elapsed:.0f}s | เหลือประมาณ {_remaining:.0f}s ({_avg_per_img:.1f}s/รูป)")
 
             pid, _pid_text = extract_point_id_from_image(img_bytes, norm_map)
             pid_u = str(pid).strip().upper() if pid else ""
 
-            cfg = get_meter_config(pid_u) if pid_u else None
+            cfg = _config_cache.get(pid_u) if pid_u else None
             ai_val = None
             msg = ""
             stt = "NO_PID"
@@ -3588,10 +3615,15 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
                 "note": msg,
                 "candidates": candidates_list,
                 "image_bytes": img_bytes,  # ✅ เก็บรูปไว้
+                "decimals": int(cfg.get('decimals', 0) or 0) if cfg else 0,  # ✅ cache decimals
             })
 
         progress_container.empty()
         status_container.empty()
+        time_container.empty()
+        
+        _total_time = pytime.time() - _bulk_start_time
+        st.toast(f"✅ ประมวลผลเสร็จ {len(rows)} รูป ใน {_total_time:.1f} วินาที")
         
         st.session_state["bulk_rows"] = rows
         st.session_state["bulk_candidates_storage"] = {rows[i]["file"]: rows[i].get("candidates", []) for i in range(len(rows))}
@@ -3653,8 +3685,7 @@ elif mode == "📸 อัปโหลดรูปทั้งวัน (มี p
         with col3:
             # ✅ แสดงค่า 0 ได้ (เช่นค่าเริ่มต้น) + format ตามจำนวนทศนิยม
             if val is not None and str(val).strip() != "":
-                cfg = get_meter_config(pid)
-                decimals = int(cfg.get('decimals', 0) or 0) if cfg else 0
+                decimals = int(r.get('decimals', 0) or 0)  # ✅ ใช้ค่าที่ cache ไว้แล้ว
                 fmt = f"{{:.{decimals}f}}"
                 st.caption(f"ค่า: **{fmt.format(val)}**")
             else:
