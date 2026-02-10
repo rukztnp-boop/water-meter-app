@@ -85,21 +85,24 @@ if mode == "📝 พนักงานจดมิเตอร์":
         label = f"{m.get('point_id')} : {m.get('name')}"
         option_map[label] = m
 
+
     # 3. ฟอร์มกรอกข้อมูล
     st.write("---")
-    c1, c2 = st.columns([2, 1])
-    
+    c1, c2, c3 = st.columns([2, 1, 1])
+
     with c1:
         selected_label = st.selectbox("📍 เลือกจุดตรวจ", list(option_map.keys()))
         meter_data = option_map[selected_label]
         point_id = meter_data.get('point_id')
         report_col = meter_data.get('report_col', '-')
-        
         # แสดงข้อมูล Report Column ให้ User เห็น
         st.markdown(f"💾 บันทึกลงคอลัมน์: <span class='report-badge'>{report_col}</span>", unsafe_allow_html=True)
 
     with c2:
         manual_val = st.number_input("👁️ ค่าจริง", min_value=0.0, step=0.1, format="%.2f")
+
+    with c3:
+        target_date = st.date_input("📅 วันที่บันทึก", value=datetime.today())
 
     # 4. รูปภาพ (ถ่าย/อัปโหลด)
     tab_cam, tab_up = st.tabs(["📷 ถ่ายรูป", "📂 อัปโหลด"])
@@ -128,9 +131,9 @@ if mode == "📝 พนักงานจดมิเตอร์":
                             "inspector": inspector,
                             "meter_type": "Water" if "ประปา" in cat_select else "Electric",
                             "manual_value": manual_val,
-                            "confirm_mismatch": False
+                            "confirm_mismatch": False,
+                            "target_date": str(target_date) if target_date else ""
                         }
-                        
                         response = requests.post(f"{API_URL}/scan", data=data, files=files)
                         res = response.json()
 
@@ -138,7 +141,6 @@ if mode == "📝 พนักงานจดมิเตอร์":
                             st.balloons()
                             st.success(f"✅ บันทึกสำเร็จ! (Status: {res['data']['status']})")
                             st.json(res['data'])
-                            
                         elif res['status'] == 'WARNING':
                             st.session_state.confirm_mode = True
                             st.session_state.warning_msg = res['message']
@@ -146,7 +148,6 @@ if mode == "📝 พนักงานจดมิเตอร์":
                             st.rerun()
                         else:
                             st.error(f"❌ Error: {res.get('message')}")
-
                     except Exception as e:
                         st.error(f"Connect Error: {e}")
             else:
@@ -174,7 +175,8 @@ if mode == "📝 พนักงานจดมิเตอร์":
                             "inspector": inspector,
                             "meter_type": "Water" if "ประปา" in cat_select else "Electric",
                             "manual_value": st.session_state.last_manual_val,
-                            "confirm_mismatch": True
+                            "confirm_mismatch": True,
+                            "target_date": str(target_date) if target_date else ""
                         }
                         requests.post(f"{API_URL}/scan", data=data, files=files)
                         st.success("✅ ส่งเรื่องแล้ว (ข้อมูลถูก Flag รอตรวจสอบ)")
