@@ -95,25 +95,29 @@ def get_meter_config(point_id):
         print(f"❌ DB Error: {e}")
         return None
 
-def export_to_real_report(point_id, read_value, inspector, report_col):
+def export_to_real_report(point_id, read_value, inspector, report_col, target_date=None):
+    """
+    เพิ่ม target_date (datetime.date) เพื่อรองรับบันทึกย้อนหลัง
+    ถ้าไม่ระบุ target_date จะใช้วันที่ปัจจุบัน
+    """
     if not report_col: return False
     try:
         sh = gc.open(REAL_REPORT_SHEET)
         sheet_name = get_thai_sheet_name(sh)
         ws = sh.worksheet(sheet_name) if sheet_name else sh.get_worksheet(0)
 
-        today_day = datetime.now().day
+        day = target_date.day if target_date else datetime.now().day
         try:
-            cell = ws.find(str(today_day), in_column=1)
+            cell = ws.find(str(day), in_column=1)
             target_row = cell.row
         except:
-            target_row = 6 + today_day # ✅ Offset 6
-            
+            target_row = 6 + day # ✅ Offset 6
+
         target_col = col_to_index(report_col)
         if target_col == 0: return False
 
         ws.update_cell(target_row, target_col, read_value)
-        print(f"✅ Exported to {ws.title} | R{target_row}, C{target_col} : {read_value}")
+        print(f"✅ Exported to {ws.title} | R{target_row}, C{target_col} : {read_value} (day={day})")
         return True
     except Exception as e:
         print(f"❌ Export Error: {e}")
