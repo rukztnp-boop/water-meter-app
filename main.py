@@ -77,19 +77,29 @@ def get_thai_sheet_name(sh):
     return None 
 
 def get_meter_config(point_id):
+    def normalize_meter_name(name):
+        # ตัดเว้นวรรค, |, , ออก และแปลงเป็นตัวพิมพ์เล็ก
+        return re.sub(r'[\s|,]+', '', str(name).lower())
+
     try:
         sh = gc.open(DB_SHEET_NAME)
         ws = sh.worksheet("PointsMaster")
         records = ws.get_all_records()
+        norm_point_id = normalize_meter_name(point_id)
         for item in records:
-            if str(item.get('point_id', '')).strip().upper() == str(point_id).strip().upper():
+            # ใช้ทั้ง point_id และ name ในการ match
+            item_point_id = normalize_meter_name(item.get('point_id', ''))
+            item_name = normalize_meter_name(item.get('name', ''))
+            if norm_point_id == item_point_id or norm_point_id in item_name or item_point_id in norm_point_id:
                 try: item['decimals'] = int(item.get('decimals') or 0)
                 except: item['decimals'] = 0
                 item['keyword'] = str(item.get('keyword', '')).strip()
                 try: item['expected_digits'] = int(item.get('expected_digits') or 0)
                 except: item['expected_digits'] = 0
                 item['report_column'] = str(item.get('report_col', '')).strip() 
+                print(f"🔎 Match meter: point_id={point_id} | DB={item.get('point_id','')} | name={item.get('name','')}")
                 return item
+        print(f"❌ No match for meter: {point_id}")
         return None
     except Exception as e:
         print(f"❌ DB Error: {e}")
@@ -277,21 +287,32 @@ async def scan_meter(
     meter_type: str = Form(...), 
     manual_value: float = Form(...), 
     confirm_mismatch: bool = Form(False),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    target_date: str = Form(None)  # เพิ่มรับวันที่ย้อนหลัง
 ):
     config = get_meter_config(point_id)
-    if not config: return {"status": "ERROR", "message": "Point ID not found"}
-    
+    if not config:
+        return {"status": "ERROR", "message": "Point ID not found"}
+
     image_bytes = await file.read()
     # เรียกใช้ OCR ตัวเทพ
     ai_value, _ = ocr_process(image_bytes, config['decimals'], config['keyword'], config['expected_digits'])
-    
-    is_match = abs(manual_value - ai_value) <= 1.0 
+
+    is_match = abs(manual_value - ai_value) <= 1.0
     report_col = config.get('report_col', '')
+
+    # แปลง target_date เป็น date object ถ้ามี
+    date_obj = None
+    if target_date:
+        try:
+            from datetime import datetime
+            date_obj = datetime.strptime(target_date, "%Y-%m-%d").date()
+        except Exception:
+            date_obj = None
 
     if is_match:
         if save_to_db(point_id, inspector, meter_type, manual_value, ai_value, "VERIFIED"):
-            export_to_real_report(point_id, manual_value, inspector, report_col)
+            export_to_real_report(point_id, manual_value, inspector, report_col, target_date=date_obj)
             return {"status": "SUCCESS", "message": "Matched", "data": {"manual": manual_value, "ai": ai_value, "status": "VERIFIED"}}
         return {"status": "ERROR", "message": "Save failed"}
     else:
