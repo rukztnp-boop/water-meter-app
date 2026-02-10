@@ -1441,6 +1441,18 @@ def extract_scada_values_from_exports(
 
     # helper: หาไฟล์ที่ตรงกับ file_key
     def pick_file_for_key(file_key: str):
+        print("\n[DEBUG] ========== FILE MATCH DEBUG ==========")
+        print(f"[DEBUG] uploaded_exports.keys(): {list(uploaded_exports.keys())}")
+        print(f"[DEBUG] file_key: {file_key}")
+        key_norm = _strip_date_prefix(file_key)
+        key_norm2 = _norm_filekey(key_norm)
+        key_norm_full = _norm_filekey(file_key)
+        print(f"[DEBUG] key_norm: {key_norm}")
+        print(f"[DEBUG] key_norm2: {key_norm2}")
+        print(f"[DEBUG] key_norm_full: {key_norm_full}")
+        fnames = list(uploaded_exports.keys())
+        print(f"[DEBUG] fnames: {fnames}")
+        # ...existing code...
         if not uploaded_exports:
             return None
 
@@ -1465,26 +1477,34 @@ def extract_scada_values_from_exports(
             or file_key_map.get(key_norm_full)
         )
         if forced and forced in uploaded_exports:
+            print(f"[DEBUG] [MATCH] forced: {forced}")
             return forced
 
         # 1) match แบบ "ตรงชื่อเป๊ะ" ก่อน (แก้เคส Daily_Report ชนกับ SMMT_Daily_Report)
         if key_norm:
             exact = [f for f in fnames if _strip(f) == key_norm]
+            print(f"[DEBUG] [MATCH] exact: {exact}")
             if exact:
-                # ถ้า key ไม่ใช่ SMMT ให้เลี่ยงไฟล์ที่มี smmt
                 if "smmt" not in key_norm2:
                     non_smmt = [f for f in exact if "smmt" not in _norm(f)]
+                    print(f"[DEBUG] [MATCH] non_smmt: {non_smmt}")
                     if non_smmt:
+                        print(f"[DEBUG] [MATCH] exact-non_smmt: {non_smmt[0]}")
                         return non_smmt[0]
+                print(f"[DEBUG] [MATCH] exact: {exact[0]}")
                 return exact[0]
 
         if key_norm2:
             exact2 = [f for f in fnames if _norm(f) == key_norm2]
+            print(f"[DEBUG] [MATCH] exact2: {exact2}")
             if exact2:
                 if "smmt" not in key_norm2:
                     non_smmt = [f for f in exact2 if "smmt" not in _norm(f)]
+                    print(f"[DEBUG] [MATCH] exact2-non_smmt: {non_smmt}")
                     if non_smmt:
+                        print(f"[DEBUG] [MATCH] exact2-non_smmt: {non_smmt[0]}")
                         return non_smmt[0]
+                print(f"[DEBUG] [MATCH] exact2: {exact2[0]}")
                 return exact2[0]
 
         # 2) UF_System → (สำคัญ) อย่าเปิดไฟล์ทุกตัวเพื่อเดา เพราะไฟล์ใหญ่มากจะช้า
@@ -1492,11 +1512,12 @@ def extract_scada_values_from_exports(
             for fname in fnames:
                 fn = _norm_filekey(fname)
                 if "uf_system" in fn or "ufsystem" in fn:
+                    print(f"[DEBUG] [MATCH] uf_system: {fname}")
                     return fname
-            # fallback: ถ้ามี AF_Report/Report_Gen ให้ใช้แทน UF_System
             for fname in fnames:
                 fn = _norm_filekey(fname)
                 if "af_report" in fn or "report_gen" in fn or "reportgen" in fn:
+                    print(f"[DEBUG] [MATCH] fallback AF_Report: {fname}")
                     return fname
 
         # 3) match แบบ contains + scoring (กรณีชื่อไม่ตรงเป๊ะ)
@@ -1532,14 +1553,18 @@ def extract_scada_values_from_exports(
             if (key_norm and key_norm in s) or (key_norm2 and key_norm2 in n) or (key_norm_full and key_norm_full in _norm_filekey(fname)):
                 cand.append(fname)
 
+        print(f"[DEBUG] [MATCH] candidates: {cand}")
         if cand:
             cand.sort(key=_score, reverse=True)
+            print(f"[DEBUG] [MATCH] best candidate: {cand[0]}")
             return cand[0]
 
         # 4) fallback: ถ้ามีไฟล์เดียว ให้คืนไฟล์นั้น (ปิดได้เพื่อกัน match ผิดตอนประมวลผลไฟล์ใหม่แค่ไฟล์เดียว)
         if allow_single_file_fallback and len(fnames) == 1:
+            print(f"[DEBUG] [MATCH] fallback single file: {fnames[0]}")
             return fnames[0]
 
+        print(f"[DEBUG] [MATCH] NOT FOUND for file_key: {file_key}")
         return None
 
     # ===== Scan time rows ต่อ sheet แค่ครั้งเดียว =====
