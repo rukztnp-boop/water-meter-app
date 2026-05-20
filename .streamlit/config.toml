@@ -1,0 +1,5 @@
+[server]
+# SCADA Excel exports can be larger than Streamlit's 200 MB default.
+# Value is in megabytes and is shown in the file uploader UI.
+maxUploadSize = 1024
+maxMessageSize = 1024
