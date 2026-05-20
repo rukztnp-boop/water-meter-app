@@ -23,8 +23,8 @@ gcloud run deploy water-meter-app \
   --platform managed \
   --region asia-southeast1 \
   --allow-unauthenticated \
-  --memory 1Gi \
-  --cpu 1 \
+  --memory 4Gi \
+  --cpu 2 \
   --timeout 3600 \
   --max-instances 10
 
