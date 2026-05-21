@@ -24,9 +24,6 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Streamlit
-.streamlit/config.toml
-
 # Test & Debug files
 test_*.py
 debug_*.py

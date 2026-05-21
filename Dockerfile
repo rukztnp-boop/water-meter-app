@@ -35,5 +35,7 @@ CMD streamlit run app.py \
     --server.port=$PORT \
     --server.address=0.0.0.0 \
     --server.headless=true \
+    --server.maxUploadSize=1024 \
+    --server.maxMessageSize=1024 \
     --browser.serverAddress="0.0.0.0" \
     --browser.gatherUsageStats=false
